@@ -65,6 +65,12 @@ import {
   serializePkgFps,
 } from '../src/parsers/per-game';
 import {
+  scanThermalUnlock,
+  applyThermalUnlock,
+  liftTempGroupsInString,
+  findTempGroups,
+} from '../src/parsers/thermal-unlock';
+import {
   scanFpsLock,
   applyUnlockFps,
   applyLiftThermalFps,
@@ -137,6 +143,7 @@ async function main() {
   await runSourcePickTest();
   await runFpsLockPrefixTest();
   await runLiftThermalTest();
+  await runThermalUnlockTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1155,6 +1162,70 @@ async function runLiftThermalTest() {
     if (s.totalKeys !== 2) throw new Error('total wrong: ' + s.totalKeys);
     if (s.entries.length !== 1 || s.entries[0].name !== 'g') throw new Error('entry wrong');
     return 'scan OK';
+  });
+}
+
+async function runThermalUnlockTest() {
+  console.log('\n=== thermal unlock regressions ===');
+  const STANDARD =
+    'com.tencent.mf.uam_49#144#48,144,1,0x2012,0,0,1,0x535#45#43#43#41_0#0#0,0,0,0,1,2,1,0x535,1,1,0,0,0x22#45#43#43#41_49#144#48,144,1,0x2012,1,2,1,0x535,1,1,0,0,0x22#45#43#43#41';
+  const WANT =
+    'com.tencent.mf.uam_49#144#48,144,1,0x2012,0,0,1,0x535#95#93#93#91_0#0#0,0,0,0,1,2,1,0x535,1,1,0,0,0x22#95#93#93#91_49#144#48,144,1,0x2012,1,2,1,0x535,1,1,0,0,0x22#95#93#93#91';
+  await check('thermal: standard novatek never touches next-set minFps (49 stays 49)', () => {
+    const { out } = liftTempGroupsInString(STANDARD);
+    if (out !== WANT) throw new Error('unexpected: ' + out.slice(0, 130));
+    return 'all 3 sets lifted, 49#144 preserved';
+  });
+  await check('thermal: FRC / MIFISR / GPU delimiters lift without fps drift', () => {
+    const frc = liftTempGroupsInString('com.x_45_90_30_60_47_46.5_43_41_0x0_1_1').out;
+    if (!frc.includes('_97_96.5_93_91')) throw new Error('frc miss: ' + frc);
+    const mif = liftTempGroupsInString('com.x_-1#-1#45,60#47#45#44#42').out;
+    if (!mif.includes('#97#95#94#92')) throw new Error('mifisr miss: ' + mif);
+    const gpu = liftTempGroupsInString('com.x_0#0#0,0,0,0,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41').out;
+    if (!gpu.includes('#96.7#95#93#91')) throw new Error('gpu set lift miss: ' + gpu);
+    return 'delimiters handled';
+  });
+  await check('thermal: complex |49#144 boundary preserved', () => {
+    const src = 'com.x_49#144#48,144,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#45#43#41.5#40&41#120#40,120,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41|49#144#48,144,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41';
+    const { out } = liftTempGroupsInString(src);
+    if (out.includes('|99#144')) throw new Error('|49 became 99');
+    if (!out.includes('#95#93#91.5#') || !out.includes('#96.7#')) throw new Error('temps not lifted');
+    return '|49#144 preserved, temps lifted';
+  });
+  await check('thermal: &-suffixed minFps preserved (40&41 -> 90&41, 120 untouched)', () => {
+    const src = 'com.x_a#1#2#45#43#41.5#40&41#120#40,120,1,0x1#46.7#45#43#41';
+    const want = 'com.x_a#1#2#95#93#91.5#90&41#120#40,120,1,0x1#96.7#95#93#91';
+    const { out } = liftTempGroupsInString(src);
+    if (out !== want) throw new Error('got: ' + out);
+    return '& minFps preserved';
+  });
+  await check('thermal: idempotent (second run no-op)', () => {
+    const { out, count } = liftTempGroupsInString(WANT);
+    if (count !== 0 || out !== WANT) throw new Error('not idempotent');
+    return 'idempotent';
+  });
+  await check('thermal: findTempGroups only groups >=2 same-delimiter atoms', () => {
+    const g = findTempGroups('a#45#43#41_b#120');
+    if (g.length !== 1 || g[0].delim !== '#' || g[0].temps.length !== 3) {
+      throw new Error('grouping wrong: ' + JSON.stringify(g));
+    }
+    if (findTempGroups('a#45_b#43').length !== 0) throw new Error('crossed section boundary');
+    return 'grouping OK';
+  });
+  await check('thermal: scan + apply round trip on a synthetic tree', () => {
+    const tree: any = {
+      game_booster: {
+        novatek_game_params: ['com.a_49#144#48,144,1,0x2114#45#43#43#41_0#0#0,0,0,0,1#45#43#43#41_49#144#48,144,1,0x2114#45#43#43#41'],
+        frc_game_params: [{ pkg: 'com.b', raw: 'com.b_45_90_30_60_47_46.5_43_41' }],
+      },
+    };
+    const scan = scanThermalUnlock(tree);
+    if (scan.fieldsAffected < 2) throw new Error('scan missed fields: ' + scan.fieldsAffected);
+    const r = applyThermalUnlock(tree);
+    if (!r.changed || r.groupsTotal === 0) throw new Error('apply did nothing');
+    if (!tree.game_booster.frc_game_params[0].raw.includes('_96.5_93_91')) throw new Error('frc not lifted');
+    if (applyThermalUnlock(tree).changed) throw new Error('second apply changed something');
+    return `lifted ${r.groupsTotal} groups across ${r.fieldsAffected} fields`;
   });
 }
 

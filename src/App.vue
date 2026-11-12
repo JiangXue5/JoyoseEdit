@@ -136,6 +136,7 @@ const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
   overview: () => Promise.resolve(OverviewView),
   lock: () => import('@/ui/LockView.vue'),
   unlockfps: () => import('@/ui/UnlockFpsView.vue'),
+  thermal: () => import('@/ui/ThermalUnlockView.vue'),
   gamelist: () => import('@/ui/GameListView.vue'),
   frc: () => import('@/ui/FrcView.vue'),
   mifisr: () => import('@/ui/MifisrView.vue'),
@@ -148,6 +149,7 @@ const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
 
 const LockView = asyncView(viewLoaders.lock);
 const UnlockFpsView = asyncView(viewLoaders.unlockfps);
+const ThermalUnlockView = asyncView(viewLoaders.thermal);
 const GameListView = asyncView(viewLoaders.gamelist);
 const FrcView = asyncView(viewLoaders.frc);
 const MifisrView = asyncView(viewLoaders.mifisr);
@@ -161,6 +163,7 @@ const VIEW_META: Record<ViewId, { title: string; desc: string }> = {
   overview: { title: '概览', desc: '设备上的 Joyose 数据库状态、可用增强通路与备份入口。' },
   lock: { title: '云控锁定', desc: '冻结 teg 云控版本，避免云端下发覆盖本地修改。' },
   unlockfps: { title: '去除锁帧', desc: '清除或推迟 Joyose 的帧率限制，两种力度可选。' },
+  thermal: { title: '温度解锁', desc: '抬高插帧 / 超分的温控降档阈值。' },
   gamelist: { title: '游戏列表', desc: 'Joyose 依据这两个名单决定是否为某个应用应用游戏策略。' },
   frc: { title: '高通 GPU', desc: '骁龙 8 Elite 机型的 AFME / FRC / FSR 通路（未实机验证）。' },
   mifisr: { title: 'MIFISR 画质增强', desc: '小米 17 系列的插帧 + 超分配置，逐游戏维护。' },
@@ -216,6 +219,7 @@ const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
 
   const tuning: NavItem[] = [
     { id: 'unlockfps', label: '去除锁帧', icon: 'gauge', badge: fpsLockBadge.value || undefined, badgeTone: 'warn' },
+    { id: 'thermal', label: '温度解锁', icon: 'thermo' },
   ];
 
   const other: NavItem[] = [
@@ -239,6 +243,7 @@ const currentView = computed<Component>(() => {
     case 'overview': return OverviewView;
     case 'lock': return LockView;
     case 'unlockfps': return UnlockFpsView;
+    case 'thermal': return ThermalUnlockView;
     case 'gamelist': return GameListView;
     case 'frc': return FrcView;
     case 'mifisr': return MifisrView;
