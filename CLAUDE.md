@@ -1238,6 +1238,8 @@ src/
     FrcView.vue               骁龙老通路编辑面板（未实测）
     NovatekView.vue           红米独显编辑面板（未实测）
     MivkView.vue              MIVK / MIGL 编辑
+    UnlockFpsView.vue         去除锁帧 / 抬高降帧阈值
+    ThermalUnlockView.vue     插帧 / 超分温控阈值抬升
     ...
   main.ts                     createApp(App).mount('#app')
   App.vue                     外壳 + 按 activeBackend 条件渲染对应面板 nav
@@ -1245,7 +1247,11 @@ src/
 module/                       KernelSU 模块载荷
   bin/joyose-edit.sh          **所有**特权操作唯一入口
                               · DB: pull/push/backup/revert/history-*
+                              · 校验: stat / digest (sha256 冲突检测)
                               · 进程: restart (am force-stop Joyose)
+                              · 清理: prune-backups <n> / reset-cloud
+                              · 导出: save-dl-from-stage → /sdcard/Download/joyose-edit
+                              · 安装标记: install-ts
                               · 属性只读: vision-status
                               · teg SDK SP: teg-status / teg-freeze / teg-unfreeze
   customize.sh                安装钩子
@@ -1253,7 +1259,7 @@ module/                       KernelSU 模块载荷
   module.prop
 
 scripts/package-module.mjs    打包 dist/ + module/ 成 release/*.zip
-tests/run.mts                 npm test 主体，120 项对五台样本 DB 的端到端校验
+tests/run.mts                 npm test 主体，159 项对五台样本 DB 的端到端校验
 ```
 
 ---

@@ -29,8 +29,17 @@
   云端不再下发规则。辅以 DB 里 `version` 字段的 2099 年份锁作旁路保护。
 - **全量备份 / 任意回滚**：每次提交自动写一次 DB 二进制备份 + 一条累积历史
   （before / after JSON + diff）；任何历史点都能回滚，回滚本身也追加为新历史。
-- **安全护栏**：所有 root 操作走 `bin/joyose-edit.sh` 子命令白名单；写入前比对 DB
-  磁盘指纹防冲突；所有解析器的 `serialize(parse(s)) === s` 都在 `npm test` 里校验。
+- **安全护栏**：所有 root 操作走 `bin/joyose-edit.sh` 子命令白名单；写入前用 sha256
+  比对 DB 摘要，冲突时自动把你的改动 rebase 到云端新版本上重试；所有解析器的
+  `serialize(parse(s)) === s` 都在 `npm test` 里校验。
+- **数据源可选**：SmartP.db 与 teg_config.db 各存一份云控，可让工具自动取版本较新
+  的一份，也可指定只写其中一份（覆写逻辑），或让 SmartP 缺失时用 teg 兜底。
+- **一键解除帧率限制**：关闭 `cgame_enable`、清掉 `dynamic_fps*` / `PID_*`，或只把
+  降帧温度抬到 90 ℃+（保留曲线）。
+- **一键抬高插帧温控**：novatek / frc / mifisr 里的温度组 `45#43#43#41` → `95#93#93#91`，
+  帧率数字不动。
+- **直写 JSON**：四个固定目标（SmartP / teg × booster / common），写一行、重启 Joyose、
+  自动备份，不走全局提交。
 
 ## 安装
 
@@ -44,12 +53,14 @@
 | ------------ | ----------------------------------------------------------------------- |
 | 概览         | DB 状态 / 路径探测 / 快速备份                                           |
 | 云控锁定     | 冻结 teg SDK（推荐） + DB version 2099 锁（辅助）                       |
+| 去除锁帧     | 清 `cgame_enable` / `dynamic_fps*` / `PID_*`，或只抬降帧温度            |
+| 温度解锁     | 把插帧 / 超分的温控降档阈值抬到 90 ℃+（逐组预览再执行）                 |
 | 游戏列表     | 编辑 `common_config.params.game_list` / `support_app`                   |
 | MIFISR       | 17 系列插帧 + 超分面板（`game_mifisr_config` + `fisr_config` 路由）     |
 | 高通 GPU     | `frc_game_params` 表单 + `fisr_config` 预设                             |
 | Novatek 独显 | 三段字符串（独显 A / GPU 方案 / 独显 B）结构化编辑                      |
 | MIVK / MIGL  | 渲染 module 细化（`mifi` / `misr` / `vrs` / `hsre` / `drr` / `gmem` …） |
-| JSON 编辑    | 兜底：直接改 `params` / `rule_content`（CodeMirror 6）                  |
+| JSON 编辑    | 四个固定目标直写 `params` / 信封（CodeMirror 6，带导入导出）            |
 | 编辑历史     | 全量历史 + diff + 回滚                                                  |
 | 导入 / 导出  | 跨设备分享 JSON 配置包                                                  |
 
@@ -95,8 +106,14 @@ CLAUDE.md                 反编译笔记 + 维护者手册
 - DB 格式基于四台实机样本 + jadx 反编译 Joyose 推断，未覆盖的机型可能有新字段，
   UI 会通过"JSON 编辑"兜底暴露，不阻塞使用。
 - 本模块**不向云端发起任何请求**，所有处理都在本地完成。
-- 写入前自动备份到 `/data/adb/joyose-edit/backup/`；可在"概览"里回滚最近备份，
-  或 `sh bin/joyose-edit.sh revert-latest` 命令行回滚。
+- 写入前自动备份到 `/data/adb/joyose-edit/backup/`；备份与历史都只保留最新 10 份。
+  可在"概览"里回滚最近备份，或 `sh bin/joyose-edit.sh revert-latest` 命令行回滚。
+- 写入顺序是"停 Joyose → 换库 → 清 journal → quick_check → 重启"，因为进程活着时
+  换库会让旧 inode 的 rollback journal 在下次打开时把旧页盖回新文件（表现为"要开
+  两遍游戏才生效"）。
+- 导出文件写到 `/sdcard/Download/joyose-edit/`，不依赖 WebView 的下载行为。
+- 升级检查走仓库根目录的 `update.json`；打包时 `module.prop` 里的 `versionCode`
+  优先于 commit 数，保证 zip 与清单一致。
 - 云端下发新版时若未冻结 teg SDK，你的修改可能被覆盖；想稳就用"云控锁定"页的冻结。
 - 小米 17 Pro Max 原厂未声明 `ro.vendor.gpp.frc.support` / `ro.vendor.xiaomi.sr.support`，
   即便 DB 配好游戏助手也不会显示画质增强面板；MifisrView 顶部 banner 会提示，并给出
