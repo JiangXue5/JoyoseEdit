@@ -159,6 +159,16 @@ async function copyDir(src, dest) {
 }
 
 // Minimal zip writer — avoids an external dep. Stores files with DEFLATE.
+
+// MS-DOS date 1980-01-01. Writing 0 is an invalid DOS date (month 0, day 0)
+// that some tools display as 1980-00-00; a fixed valid date keeps the archive
+// byte-for-byte reproducible while staying legal.
+const DOS_DATE_1980 = (1 << 5) | 1;
+const UNIX_OS = 3;
+
+function unixMode(relPath) {
+  return /\.sh$/.test(relPath) ? 0o100755 : 0o100644;
+}
 async function zipDirectory(srcDir, zipPath) {
   const files = [];
   await collect(srcDir, '', files);
@@ -180,7 +190,7 @@ async function zipDirectory(srcDir, zipPath) {
     lh.writeUInt16LE(0, 6); // flags
     lh.writeUInt16LE(8, 8); // DEFLATE
     lh.writeUInt16LE(0, 10); // mod time
-    lh.writeUInt16LE(0, 12); // mod date
+    lh.writeUInt16LE(DOS_DATE_1980, 12); // mod date
     lh.writeUInt32LE(crc, 14);
     lh.writeUInt32LE(compressed.length, 18);
     lh.writeUInt32LE(data.length, 22);
@@ -191,12 +201,12 @@ async function zipDirectory(srcDir, zipPath) {
 
     const ch = Buffer.alloc(46 + nameBuf.length);
     ch.writeUInt32LE(0x02014b50, 0);
-    ch.writeUInt16LE(20, 4); // version made by
+    ch.writeUInt16LE((UNIX_OS << 8) | 20, 4); // version made by: Unix + spec 2.0
     ch.writeUInt16LE(20, 6); // version needed
     ch.writeUInt16LE(0, 8); // flags
     ch.writeUInt16LE(8, 10); // DEFLATE
     ch.writeUInt16LE(0, 12); // mod time
-    ch.writeUInt16LE(0, 14); // mod date
+    ch.writeUInt16LE(DOS_DATE_1980, 14); // mod date
     ch.writeUInt32LE(crc, 16);
     ch.writeUInt32LE(compressed.length, 20);
     ch.writeUInt32LE(data.length, 24);
@@ -205,7 +215,10 @@ async function zipDirectory(srcDir, zipPath) {
     ch.writeUInt16LE(0, 32);
     ch.writeUInt16LE(0, 34);
     ch.writeUInt16LE(0, 36);
-    ch.writeUInt32LE(0, 38); // external attrs
+    // External attributes carry the Unix mode in the high 16 bits. Leaving it
+    // at 0 is why the installer had to guess whether service.sh / customize.sh
+    // were executable; declare 0755 for scripts and 0644 for everything else.
+    ch.writeUInt32LE((unixMode(f) << 16) >>> 0, 38);
     ch.writeUInt32LE(offset, 42);
     nameBuf.copy(ch, 46);
     central.push(ch);
