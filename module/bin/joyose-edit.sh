@@ -7,6 +7,7 @@
 #   stat                           prints schema/version fingerprints as JSON
 #   digest                         prints sha256 of both DBs (conflict detection)
 #   install-ts                     timestamp of the last fresh install ("" when none)
+#   save-dl-from-stage <name> <st> decode a staged blob into /sdcard/Download/joyose-edit/<name>
 #   pull smartp|teg                emits base64 of the DB file
 #   push smartp|teg <b64>          decodes <b64> and writes back atomically
 #   backup [label]                 snapshot both DBs into /data/adb/joyose-edit/backup/<epoch>[-label]/
@@ -486,6 +487,24 @@ cmd_history_save_from_stage() {
   printf '{"ok":true,"path":"%s"}\n' "$f"
 }
 
+# Export a staged payload into the shared Download folder. The WebView cannot
+# be trusted to honour a Blob download (KernelSU's WebView often ignores it, and
+# the file lands nowhere), so the export is written by root at a fixed path.
+cmd_save_dl_from_stage() {
+  safe_name "$1" || die "invalid download name"
+  safe_name "$2" || die "invalid stage name"
+  local dir=/sdcard/Download/joyose-edit
+  local f="$dir/$1"
+  local stage_file="$STAGE_DIR/$2"
+  [ -f "$stage_file" ] || die "stage file missing: $2"
+  mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
+  umask 022
+  base64 -d < "$stage_file" > "$f" 2>/dev/null || { rm -f "$f"; die "base64 decode failed"; }
+  chmod 644 "$f" 2>/dev/null || true
+  rm -f "$stage_file"
+  printf '{"ok":true,"path":"%s"}\n' "$f"
+}
+
 cmd_install_ts() {
   local f=/data/adb/modules/joyose-edit/.install_ts
   if [ -f "$f" ]; then cat "$f"; else printf '0'; fi
@@ -500,6 +519,7 @@ case "$cmd" in
   stat)           cmd_stat ;;
   digest)         cmd_digest ;;
   install-ts)     cmd_install_ts ;;
+  save-dl-from-stage) cmd_save_dl_from_stage "${1:?}" "${2:?}" ;;
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
   backup)         cmd_backup "${1:-}" ;;

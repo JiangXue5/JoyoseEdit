@@ -25,8 +25,11 @@
       </div>
 
       <div class="btn-row" style="margin-top: var(--space-3)">
-        <button class="primary" @click="doExport" :disabled="selectedDomains.size === 0">下载 JSON</button>
+        <button class="primary" @click="doExport" :disabled="selectedDomains.size === 0">导出到 Download</button>
         <button class="ghost" @click="copyExport" :disabled="selectedDomains.size === 0">复制到剪贴板</button>
+      </div>
+      <div class="hint" style="margin-top: var(--space-2)">
+        导出文件写入 <code class="mono">/sdcard/Download/joyose-edit/</code>，可在文件管理器的 Download 目录里找到。
       </div>
     </div>
 
@@ -101,6 +104,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import * as bridge from '@/root/bridge';
 import { state, markDirty } from '@/state/session';
 import { toast } from '@/state/toast';
 import PageHeader from './PageHeader.vue';
@@ -266,19 +270,19 @@ function downloadName(pkg: ExportFile): string {
   return `joyose-${backend}-${ts}${slug ? '-' + slug : ''}.json`;
 }
 
-function doExport() {
+/** Export through the root helper into /sdcard/Download/joyose-edit — the
+ *  WebView's Blob download silently does nothing on several KernelSU builds,
+ *  which looked like "导出成功" followed by an empty Download folder. */
+async function doExport() {
   const pkg = buildExportPackage();
   const body = serializePackage(pkg);
-  const blob = new Blob([body], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = downloadName(pkg);
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  toast.success('已生成导出文件', downloadName(pkg));
+  const fname = downloadName(pkg);
+  try {
+    const res = await bridge.exportFile(fname, body);
+    toast.success('已导出', res.path);
+  } catch (err) {
+    toast.fromError(err, '导出失败');
+  }
 }
 
 async function copyExport() {

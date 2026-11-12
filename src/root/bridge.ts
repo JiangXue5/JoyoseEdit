@@ -213,6 +213,21 @@ export async function historySave(name: string, body: string): Promise<{ ok: tru
   return JSON.parse(await runKsu(`sh ${HELPER} history-save-from-stage ${safeName} ${stage}`));
 }
 
+/** Write a text payload to the fixed export folder
+ *  `/sdcard/Download/joyose-edit/<name>` and return the exact path. Goes
+ *  through the root helper instead of a Blob download, because KernelSU's
+ *  WebView does not reliably honour `a.download`. */
+export async function exportFile(
+  name: string,
+  body: string,
+): Promise<{ ok: true; path: string }> {
+  const safeName = sanitizeLabel(name, true);
+  const b64 = utf8ToBase64(body);
+  const stage = `dl-${Date.now().toString(36)}`;
+  await stageUpload(stage, b64);
+  return JSON.parse(await runKsu(`sh ${HELPER} save-dl-from-stage ${safeName} ${stage}`));
+}
+
 /**
  * Upload a base64 blob to the module's staging area in bounded-size chunks.
  * A single shell `argv` is capped by the kernel's ARG_MAX (as little as
