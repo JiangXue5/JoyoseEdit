@@ -1,6 +1,6 @@
 {
-  "version": "v1.1.2",
-  "versionCode": 11200,
-  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.2/joyose-edit-v1.1.2.zip",
-  "changelog": "v1.1.2 — 修复「来源 / 写入目标选完又跳回默认」：偏好改为保存在模块目录的 settings.json，不再依赖 WebView 的 localStorage（换管理器、清 WebView 数据都不会丢）；写入失败会给出提示。"
+  "version": "v1.1.3",
+  "versionCode": 11300,
+  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.3/joyose-edit-v1.1.3.zip",
+  "changelog": "v1.1.3 — 页头折叠改为连续动画：操作按钮归到页面内容里跟着一起滑走，介绍文字平滑收拢，不再一帧塌 70px；修复 common_config 选「自动」后重启回退成具体条目（读取白名单漏了 auto）；来源选项改为直接标出两边可比较的版本号，只给严格更新的一侧加「较新」，不再把旧的那份标成最新。"
 }
