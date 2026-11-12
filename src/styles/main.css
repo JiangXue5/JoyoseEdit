@@ -635,6 +635,12 @@ pre {
   position: relative;
   overflow-y: auto;
   overflow-x: hidden;
+  /* The sticky page header collapses on scroll, which removes ~70px of
+     content above everything else. With scroll anchoring on, the browser
+     "compensates" by rewinding scrollTop — the page snaps back to the top and
+     the collapse threshold flips back and forth. Opt out; the header is part
+     of the scroll flow, not an anchor. */
+  overflow-anchor: none;
   padding: 0 0 40px;
   background-image: radial-gradient(var(--grid-dot) 0.8px, transparent 0.8px);
   background-size: 22px 22px;
@@ -1290,7 +1296,9 @@ pre {
   top: 84px;
   max-height: calc(100dvh - 120px);
   overflow-y: auto;
-  overscroll-behavior: contain;
+  /* Chain to the page once the list hits its end — `contain` used to trap the
+     gesture here, so most of the viewport simply stopped responding. */
+  overscroll-behavior: auto;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -1425,7 +1433,9 @@ pre {
 
 .cm-shell .cm-scroller {
   overflow: auto;
-  overscroll-behavior: contain;
+  /* Same reasoning as .twopane .list: the editor owns most of the viewport, so
+     it must hand the gesture back to the page at its first/last line. */
+  overscroll-behavior: auto;
 }
 
 /* =========================================================================

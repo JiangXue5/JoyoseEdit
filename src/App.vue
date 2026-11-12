@@ -38,7 +38,7 @@
       </div>
     </nav>
 
-    <main class="main" :class="{ scrolled, 'has-pending': state.dirty }" @scroll.passive="onScroll">
+    <main ref="mainEl" class="main" :class="{ scrolled, 'has-pending': state.dirty }" @scroll.passive="onScroll">
       <div class="progress-line" :class="{ on: state.loading }" aria-hidden="true" />
 
       <!-- full-screen state when the KernelSU bridge is missing: nothing on the
@@ -178,19 +178,38 @@ const version = __APP_VERSION__;
 
 // Collapse the sticky page header on mobile once the user scrolls: title bar
 // stays, description + action row fold away so the form gets the viewport.
+//
+// Two details keep this from flapping:
+//  * the thresholds are asymmetric (collapse late, expand only at the very
+//    top), so a 1–2px jitter around a single value can't toggle the state;
+//  * `.main` opts out of scroll anchoring (see main.css) — folding the header
+//    removes ~70px of content *above* everything else, and the browser's
+//    anchoring compensation used to drag scrollTop back to 0, which both
+//    undid the scroll and re-triggered the "expand" branch.
+const mainEl = ref<HTMLElement | null>(null);
+const COLLAPSE_AT = 64;
+const EXPAND_AT = 8;
 const scrolled = ref(false);
 let scrollTick = false;
 
-function onScroll(event: Event) {
-  const top = (event.target as HTMLElement).scrollTop;
+function onScroll() {
   if (scrollTick) return;
   scrollTick = true;
   requestAnimationFrame(() => {
     scrollTick = false;
-    const next = top > 48;
+    const top = mainEl.value?.scrollTop ?? 0;
+    const next = scrolled.value ? top > EXPAND_AT : top > COLLAPSE_AT;
     if (next !== scrolled.value) scrolled.value = next;
   });
 }
+
+// Views start at the top: swapping the component leaves `.main` scrollTop
+// where the previous page left it, which reads as a broken page header (it
+// would still be collapsed on a page you have not scrolled yet).
+watch(view, () => {
+  scrolled.value = false;
+  if (mainEl.value) mainEl.value.scrollTop = 0;
+});
 
 interface NavItem {
   id: ViewId;

@@ -111,7 +111,9 @@ function dedupe() {
 .pkg-list-scroll {
   max-height: 48dvh;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  /* Not `contain`: this box covers half the screen on a phone, and trapping
+     the gesture here is why scrolling past its end did nothing. */
+  overscroll-behavior: auto;
   border-top: 1px solid var(--hairline);
 }
 
@@ -138,7 +140,9 @@ function dedupe() {
 
 @media (max-width: 860px) {
   .pkg-list-scroll {
-    max-height: 52dvh;
+    /* Was 52dvh — more than half the screen turned into an inner scrollbox,
+       so the page itself looked frozen wherever the finger landed. */
+    max-height: 42dvh;
   }
 }
 </style>
