@@ -90,6 +90,10 @@ import {
   latestEnvelopeVersion,
   getCommonSourcePref,
   getWriteTarget,
+  getBoosterSourcePref,
+  setWriteTarget,
+  setCommonSourcePref,
+  resetAllPrefs,
 } from '../src/state/source';
 import {
   buildRecord,
@@ -148,6 +152,7 @@ async function main() {
   await runActiveBackendEdgeCases();
   await runEnvelopeTest();
   await runSourcePickTest();
+  await runPrefsTest();
   await runFpsLockPrefixTest();
   await runLiftThermalTest();
   await runThermalUnlockTest();
@@ -1406,6 +1411,54 @@ async function runSourcePickTest() {
     if (pickBoosterParams(undefined, tegRows, 'auto') !== null) throw new Error('expected null');
     return 'null when SmartP has no row';
   });
+}
+
+async function runPrefsTest() {
+  console.log('\n=== preference persistence ===');
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+    clear: () => store.clear(),
+  };
+  try {
+    await check('prefs: setters are readable back immediately', () => {
+      setWriteTarget('teg');
+      setCommonSourcePref('teg');
+      if (getWriteTarget() !== 'teg') throw new Error('write target not applied');
+      if (getCommonSourcePref() !== 'teg') throw new Error('common source not applied');
+      return 'teg / teg';
+    });
+
+    await check('prefs: value survives clearing the WebView storage', () => {
+      // The in-memory cache is what every getter reads, so a wiped
+      // localStorage cannot drag the pickers back to the defaults.
+      store.clear();
+      if (getWriteTarget() !== 'teg') throw new Error('write target lost after storage clear');
+      if (getCommonSourcePref() !== 'teg') throw new Error('common source lost after storage clear');
+      return 'cache keeps teg / teg';
+    });
+
+    await check('prefs: every write also mirrors into localStorage', () => {
+      setWriteTarget('smartp');
+      if (store.get('joyose-edit.writeTarget') !== 'smartp') {
+        throw new Error('localStorage copy missing: ' + JSON.stringify([...store.keys()]));
+      }
+      return 'mirrored';
+    });
+
+    await check('prefs: resetAllPrefs restores the documented defaults', () => {
+      resetAllPrefs();
+      if (getWriteTarget() !== 'both') throw new Error('write target not reset');
+      if (getCommonSourcePref() !== 'smartp') throw new Error('common source not reset');
+      if (getBoosterSourcePref() !== 'auto') throw new Error('booster source not reset');
+      if (store.size !== 0) throw new Error('localStorage entries left: ' + [...store.keys()].join(','));
+      return 'both / smartp / auto';
+    });
+  } finally {
+    delete (globalThis as any).localStorage;
+  }
 }
 
 main().catch((err) => {

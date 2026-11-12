@@ -1,6 +1,7 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 import { initTheme } from '@/state/theme';
+import { hydratePrefs } from '@/state/source';
 import './styles/main.css';
 
 // Ask KernelSU WebView to draw behind the status / navigation bars.
@@ -22,4 +23,10 @@ async function enableEdgeToEdge(): Promise<void> {
 
 enableEdgeToEdge();
 initTheme();
-createApp(App).mount('#app');
+// Load the settings file before the first render: every picker is initialised
+// synchronously from the preference cache, so mounting first would paint the
+// defaults and leave them there. Each runner is a `cat` of a tiny file, and
+// hydratePrefs swallows failures, so this cannot hold the UI hostage.
+hydratePrefs()
+  .catch(() => undefined)
+  .finally(() => createApp(App).mount('#app'));

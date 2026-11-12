@@ -7,6 +7,8 @@
 #   stat                           prints schema/version fingerprints as JSON
 #   digest                         prints sha256 of both DBs (conflict detection)
 #   install-ts                     timestamp of the last fresh install ("" when none)
+#   prefs-read                     print the user's WebUI settings as JSON
+#   prefs-write <b64>              replace the settings file (base64 JSON, atomic)
 #   save-dl-from-stage <name> <st> decode a staged blob into /sdcard/Download/joyose-edit/<name>
 #   reset-cloud                    pm clear com.xiaomi.joyose + wake its cloud services
 #                                  (DESTRUCTIVE: every Joyose setting is wiped)
@@ -528,6 +530,32 @@ cmd_install_ts() {
   if [ -f "$f" ]; then cat "$f"; else printf '0'; fi
 }
 
+# ---- WebUI preferences ----------------------------------------------------
+# Stored next to the backups instead of in the WebView's localStorage: the
+# per-manager WebUI origin (and its storage) is not stable across manager
+# switches / WebView data resets, which silently reset the source and
+# write-target pickers back to their defaults.
+PREFS_FILE="$DATA_ROOT/settings.json"
+
+cmd_prefs_read() {
+  if [ -f "$PREFS_FILE" ]; then cat "$PREFS_FILE"; else printf '{}'; fi
+}
+
+cmd_prefs_write() {
+  local b64="${1:?}"
+  local tmp="$PREFS_FILE.tmp.$$"
+  mkdir -p "$DATA_ROOT"
+  # Decode into a sibling temp file and rename: a half-written settings file
+  # would make every later read fall back to the defaults.
+  if ! printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "prefs-write: base64 decode failed"
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$PREFS_FILE"
+  printf 'ok'
+}
+
 # ---- dispatch -------------------------------------------------------------
 cmd="${1:-}"
 [ -n "$cmd" ] || die "missing subcommand"
@@ -537,6 +565,8 @@ case "$cmd" in
   stat)           cmd_stat ;;
   digest)         cmd_digest ;;
   install-ts)     cmd_install_ts ;;
+  prefs-read)     cmd_prefs_read ;;
+  prefs-write)    cmd_prefs_write "${1:?}" ;;
   save-dl-from-stage) cmd_save_dl_from_stage "${1:?}" "${2:?}" ;;
   reset-cloud)    cmd_reset_cloud ;;
   pull)           cmd_pull "${1:?}" ;;

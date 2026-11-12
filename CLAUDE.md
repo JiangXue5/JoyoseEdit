@@ -1232,7 +1232,7 @@ src/
     dialog.ts                 Promise 化的应用内 modal（替代 window.prompt/confirm）
     toast.ts                  应用内 toast 队列
     theme.ts                  light/dark/auto 主题
-    prefs.ts                  UI 偏好（暂未启用）
+    source.ts                 数据源 / 写入目标偏好（内存缓存 + settings.json 落盘）
   ui/                         Vue 3 SFC
     MifisrView.vue            ★ 17 系列 MIFISR 编辑面板
     FrcView.vue               骁龙老通路编辑面板（未实测）
@@ -1252,6 +1252,7 @@ module/                       KernelSU 模块载荷
                               · 清理: prune-backups <n> / reset-cloud
                               · 导出: save-dl-from-stage → /sdcard/Download/joyose-edit
                               · 安装标记: install-ts
+                              · UI 设置: prefs-read / prefs-write <b64>
                               · 属性只读: vision-status
                               · teg SDK SP: teg-status / teg-freeze / teg-unfreeze
   customize.sh                安装钩子
@@ -1259,7 +1260,7 @@ module/                       KernelSU 模块载荷
   module.prop
 
 scripts/package-module.mjs    打包 dist/ + module/ 成 release/*.zip
-tests/run.mts                 npm test 主体，159 项对五台样本 DB 的端到端校验
+tests/run.mts                 npm test 主体，163 项对五台样本 DB 的端到端校验
 ```
 
 ---

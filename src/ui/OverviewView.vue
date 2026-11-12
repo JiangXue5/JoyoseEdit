@@ -162,8 +162,8 @@
         </div>
       </div>
       <div class="hint" style="margin-top: 10px">
-        写入目标对所有页面生效（结构化编辑、云控锁定、去锁帧、温度解锁）。全新安装会回到默认「同时写」，
-        升级则保留你的选择。
+        写入目标对所有页面生效（结构化编辑、云控锁定、去锁帧、温度解锁）。这些选择保存在模块目录
+        <code>settings.json</code> 里，重开 WebUI、切换管理器都不会丢；只有全新安装会回到默认「同时写」。
       </div>
     </section>
 
@@ -218,6 +218,8 @@ import {
   setDataSourcePref,
   getWriteTarget,
   setWriteTarget,
+  getPersistError,
+  whenPrefsPersisted,
   PREF_LABELS,
   WRITE_TARGET_LABELS,
   type BoosterSourcePref,
@@ -318,12 +320,22 @@ const showDataSource = computed(
 
 async function onBoosterSource() {
   setBoosterSourcePref(boosterPref.value);
+  await reportPersist();
   await applyPull(PREF_LABELS[boosterPref.value]);
 }
 
 async function onCommonSource() {
   setCommonSourcePref(commonPref.value);
+  await reportPersist();
   await applyPull(PREF_LABELS[commonPref.value]);
+}
+
+/** Settings go to /data/adb/joyose-edit/settings.json; say so when the write
+ *  failed instead of letting the picker quietly revert on the next launch. */
+async function reportPersist() {
+  await whenPrefsPersisted();
+  const err = getPersistError();
+  if (err) toast.warn('设置没能写入模块目录，重开 WebUI 后会恢复默认', err);
 }
 
 async function applyPull(label: string) {
@@ -339,11 +351,18 @@ async function onDataSource(v: DataSourcePref) {
   if (dataSource.value === v) return;
   dataSource.value = v;
   setDataSourcePref(v);
+  await reportPersist();
   await applyPull(v === 'teg-fallback' ? '允许 teg 兜底' : '仅 SmartP');
 }
 
-function onWriteTargetChange() {
+async function onWriteTargetChange() {
   setWriteTarget(writeTarget.value);
+  await whenPrefsPersisted();
+  const err = getPersistError();
+  if (err) {
+    toast.warn('写入目标没能保存到模块目录', err);
+    return;
+  }
   toast.info('写入目标已更新', WRITE_TARGET_LABELS[writeTarget.value]);
 }
 const isLocked = computed(() => {

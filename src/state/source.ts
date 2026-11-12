@@ -28,24 +28,134 @@ const WRITE_KEY = 'joyose-edit.writeTarget';
 const DATA_SOURCE_KEY = 'joyose-edit.dataSource';
 const INSTALL_TS_KEY = 'joyose-edit.installTs';
 
-function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
-  if (typeof localStorage === 'undefined') return fallback;
+const ALL_KEYS = [BOOSTER_KEY, COMMON_KEY, WRITE_KEY, DATA_SOURCE_KEY, INSTALL_TS_KEY];
+
+// Preferences live in /data/adb/joyose-edit/settings.json (see prefs-read /
+// prefs-write in the helper), *not* only in localStorage.
+//
+// The WebUI runs inside whatever WebView the manager provides, and that storage
+// is keyed by origin: Magisk's embedded server hands out a fresh port every
+// launch, KSU's asset loader domain has changed between versions, and any
+// "clear WebView data" wipes it. When that happened the pickers silently fell
+// back to the defaults — the settings looked like they never applied.
+//
+// The in-memory cache is what every getter reads, so callers stay synchronous;
+// hydratePrefs() seeds it from the file once at boot and each setter writes the
+// whole object back through the helper.
+const cache = new Map<string, string>();
+let hydratePromise: Promise<void> | null = null;
+let writeChain: Promise<void> = Promise.resolve();
+/** Why the last settings write failed, or null when it went through. */
+let persistError: string | null = null;
+/** Whether the settings file had any content at boot — see prefsFileExisted. */
+let fileExisted = false;
+
+function lsGet(key: string): string | null {
+  if (typeof localStorage === 'undefined') return null;
   try {
-    const v = localStorage.getItem(key) as T | null;
-    if (v && (allowed as readonly string[]).includes(v)) return v;
+    return localStorage.getItem(key);
   } catch {
-    /* storage unavailable */
+    return null;
   }
-  return fallback;
 }
 
-function writePref(key: string, value: string): void {
+function lsSet(key: string, value: string): void {
   if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(key, value);
   } catch {
+    /* storage unavailable — the file copy is authoritative */
+  }
+}
+
+function lsRemove(key: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(key);
+  } catch {
     /* ignore */
   }
+}
+
+function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  const v = cache.get(key) ?? lsGet(key);
+  if (v && (allowed as readonly string[]).includes(v)) return v as T;
+  return fallback;
+}
+
+function writePref(key: string, value: string): void {
+  cache.set(key, value);
+  lsSet(key, value);
+  queuePersist();
+}
+
+async function persistNow(): Promise<void> {
+  try {
+    const bridge = await import('@/root/bridge');
+    await bridge.writePrefs(JSON.stringify(Object.fromEntries(cache)));
+    persistError = null;
+  } catch (err) {
+    // Non-KSU host: nothing to write to, and localStorage still works.
+    persistError = (err as Error)?.message ?? String(err);
+  }
+}
+
+/** Why the last settings write failed, or null when it went through. */
+export function getPersistError(): string | null {
+  return persistError;
+}
+
+/** Serialise the writes so two quick changes cannot land out of order. */
+function queuePersist(): void {
+  writeChain = writeChain.then(persistNow, persistNow);
+}
+
+/** Load the settings file into the cache. Call once before the app mounts (and
+ *  before comparing the install marker). Concurrent callers share the same
+ *  promise, so nobody reads the cache while it is still being filled. */
+export function hydratePrefs(): Promise<void> {
+  if (!hydratePromise) hydratePromise = loadPrefs();
+  return hydratePromise;
+}
+
+async function loadPrefs(): Promise<void> {
+  let fromFile: Record<string, unknown> = {};
+  try {
+    const bridge = await import('@/root/bridge');
+    const parsed = JSON.parse(await bridge.readPrefs());
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      fromFile = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* keep whatever localStorage still holds */
+  }
+  for (const [k, v] of Object.entries(fromFile)) {
+    if (typeof v === 'string') {
+      cache.set(k, v);
+      lsSet(k, v);
+    }
+  }
+  // Migrate: a user upgrading from a build that only had localStorage keeps
+  // their choice, and the first write then persists the whole object.
+  for (const key of ALL_KEYS) {
+    if (cache.has(key)) continue;
+    const v = lsGet(key);
+    if (v) cache.set(key, v);
+  }
+  fileExisted = Object.keys(fromFile).length > 0;
+}
+
+/** True when settings.json already carried values at boot. The install-marker
+ *  reset only applies to an *existing* file: on the first run of a build that
+ *  introduced the file, a cleared WebView must not count as "fresh install"
+ *  and wipe the choices the user is about to make. */
+export function prefsFileExisted(): boolean {
+  return fileExisted;
+}
+
+/** Flush any queued write. Exported for tests / shutdown paths. */
+export function whenPrefsPersisted(): Promise<void> {
+  return writeChain;
 }
 
 // ----- booster_config source -------------------------------------------------
@@ -105,14 +215,11 @@ export function setDataSourcePref(v: DataSourcePref): void {
 // ----- install marker -------------------------------------------------------
 
 /** Timestamp stamped by customize.sh on a fresh install / reinstall, consumed
- *  once by the WebUI to reset per-device preferences (an upgrade keeps them). */
+ *  once by the WebUI to reset per-device preferences (an upgrade keeps them).
+ *  Kept in the settings file too, so it cannot outlive the preferences it
+ *  guards (or vice versa) after the WebView storage is cleared. */
 export function getStoredInstallTs(): string {
-  if (typeof localStorage === 'undefined') return '';
-  try {
-    return localStorage.getItem(INSTALL_TS_KEY) ?? '';
-  } catch {
-    return '';
-  }
+  return cache.get(INSTALL_TS_KEY) ?? lsGet(INSTALL_TS_KEY) ?? '';
 }
 
 export function storeInstallTs(ts: string): void {
@@ -122,16 +229,9 @@ export function storeInstallTs(ts: string): void {
 /** Reset every local preference so a reinstall starts from the defaults:
  *  write target = both, booster source = auto, common source = smartp. */
 export function resetAllPrefs(): void {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.removeItem(WRITE_KEY);
-    localStorage.removeItem(BOOSTER_KEY);
-    localStorage.removeItem(COMMON_KEY);
-    localStorage.removeItem(INSTALL_TS_KEY);
-    localStorage.removeItem(DATA_SOURCE_KEY);
-  } catch {
-    /* ignore */
-  }
+  cache.clear();
+  for (const key of ALL_KEYS) lsRemove(key);
+  queuePersist();
 }
 
 // ----- labels ---------------------------------------------------------------

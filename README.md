@@ -34,6 +34,7 @@
   `serialize(parse(s)) === s` 都在 `npm test` 里校验。
 - **数据源可选**：SmartP.db 与 teg_config.db 各存一份云控，可让工具自动取版本较新
   的一份，也可指定只写其中一份（覆写逻辑），或让 SmartP 缺失时用 teg 兜底。
+  这些选择存在模块目录的 `settings.json` 里，重开 WebUI / 换管理器都不会被重置。
 - **一键解除帧率限制**：关闭 `cgame_enable`、清掉 `dynamic_fps*` / `PID_*`，或只把
   降帧温度抬到 90 ℃+（保留曲线）。
 - **一键抬高插帧温控**：novatek / frc / mifisr 里的温度组 `45#43#43#41` → `95#93#93#91`，

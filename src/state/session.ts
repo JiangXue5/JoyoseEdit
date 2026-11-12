@@ -52,6 +52,9 @@ import {
   getStoredInstallTs,
   storeInstallTs,
   resetAllPrefs,
+  hydratePrefs,
+  prefsFileExisted,
+  whenPrefsPersisted,
 } from '@/state/source';
 
 /** "Empty config": params null / not an object / no keys at all (the cloud
@@ -127,14 +130,25 @@ export async function initialize(): Promise<void> {
   }
   state.connected = true;
   await refreshStat();
+  // Preferences come from the module's settings file (localStorage is only a
+  // cache and a WebView data reset — or a manager switch, which changes the
+  // WebUI origin — used to wipe them back to the defaults).
+  await hydratePrefs();
   // A fresh flash / reinstall / upgrade stamps a marker; when it moved, drop
   // the per-device preferences (write target back to `both`, …) so a WebView
   // localStorage left over from the previous install cannot silently persist.
   try {
     const ts = await bridge.moduleInstallTs();
     if (ts && ts !== '0' && ts !== getStoredInstallTs()) {
-      resetAllPrefs();
+      if (prefsFileExisted()) {
+        resetAllPrefs();
+      }
+      // Always record the marker: on the first run of this build the file is
+      // still being created, and resetting here would throw away the choices
+      // the user made a minute ago in a WebView whose storage has since been
+      // cleared.
       storeInstallTs(ts);
+      await whenPrefsPersisted();
     }
   } catch {
     /* probe unavailable — keep the stored preferences */

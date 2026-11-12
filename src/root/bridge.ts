@@ -121,6 +121,24 @@ export async function moduleInstallTs(): Promise<string> {
   }
 }
 
+/** Read the WebUI settings file the helper keeps under /data/adb. Returns '{}'
+ *  when the module was installed before the subcommand existed. Unlike
+ *  localStorage this survives a WebView data reset or a manager switch. */
+export async function readPrefs(): Promise<string> {
+  try {
+    return (await runKsu(`sh ${HELPER} prefs-read`)).trim() || '{}';
+  } catch {
+    return '{}';
+  }
+}
+
+/** Replace the settings file atomically. The payload is a small JSON object, so
+ *  it travels as an argv-safe base64 string like every other write. */
+export async function writePrefs(json: string): Promise<void> {
+  const b64 = bytesToBase64(new TextEncoder().encode(json));
+  await runKsu(`sh ${HELPER} prefs-write ${b64}`);
+}
+
 /** Wipe Joyose's app data and wake its cloud services so the config is
  *  re-downloaded. Destructive: every local Joyose setting goes with it, so the
  *  caller must confirm first. */
