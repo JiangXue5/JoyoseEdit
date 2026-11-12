@@ -459,6 +459,10 @@ function rewriteYear(version: number): number {
   return Number(`2099${s.slice(4)}`);
 }
 
+/** How many history files / backup directories to keep on the device. */
+export const HISTORY_KEEP = 10;
+export const BACKUP_KEEP = 10;
+
 export interface PushOptions {
   note?: string;
   source?: HistorySource;
@@ -597,6 +601,9 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     });
     const fname = buildHistoryFilename(ts, seq);
     await bridge.historySave(fname, JSON.stringify(rec));
+    // Keep the timeline short: one delta record per commit adds up on a phone
+    // with a 1 MB cloud config, and ten entries is plenty to walk back.
+    await bridge.historyClear(HISTORY_KEEP).catch(() => null);
 
     // Restart Joyose so it re-reads the DB. Report the result instead of
     // swallowing it: a silent failure here looks like "the edit did nothing".
@@ -690,6 +697,7 @@ export async function recordBackupCheckpoint(backupName: string): Promise<void> 
     delta: [],
   });
   await bridge.historySave(buildHistoryFilename(ts, seq), JSON.stringify(rec));
+  await bridge.historyClear(HISTORY_KEEP).catch(() => null);
 }
 
 export function buildHistoryStore() {

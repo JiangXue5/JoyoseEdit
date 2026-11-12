@@ -26,6 +26,9 @@ chmod 700 "$DATA_ROOT/history"
 # Ensure the root helper is executable.
 if [ -f "$MODDIR/bin/joyose-edit.sh" ]; then
   set_perm "$MODDIR/bin/joyose-edit.sh" 0 0 0700
+  # Trim leftovers from previous installs too: the WebUI can only prune while
+  # it is open, so a device that never reopened it would keep growing.
+  sh "$MODDIR/bin/joyose-edit.sh" prune-backups 10 2>/dev/null || true
 fi
 
 if [ "$INSTALL_FRESH" = 1 ]; then

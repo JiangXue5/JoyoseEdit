@@ -10,6 +10,7 @@
 #   pull smartp|teg                emits base64 of the DB file
 #   push smartp|teg <b64>          decodes <b64> and writes back atomically
 #   backup [label]                 snapshot both DBs into /data/adb/joyose-edit/backup/<epoch>[-label]/
+#                                  (keeps only the newest 10 backup dirs)
 #   revert <epoch-label>           restore a specific backup
 #   revert-latest                  restore most recent backup
 #   restart                        am force-stop com.xiaomi.joyose
@@ -245,8 +246,22 @@ cmd_backup() {
       fi
     done
   fi
-  printf '{"ok":true,"dir":"%s","name":"%s","stopped":%s}\n' \
+  prune_backups 10
+  printf '{"ok":true,"dir":"%s","name":"%s","stopped":%s,"kept":10}\n' \
     "$dir" "$(basename "$dir")" "$stopped"
+}
+
+# Keep only the newest N backup directories (default 10). Covers every backup
+# (initial-*, labelled, plain epoch) so the count cannot creep up over months.
+# The pipe-based loop works on Android's mksh/dash, where `read` in the parent
+# shell of a pipeline would not persist.
+prune_backups() {
+  local keep="${1:-10}" i=0 d
+  case "$keep" in ''|*[!0-9]*) keep=10 ;; esac
+  ls -dt "$DATA_ROOT/backup"/*/ 2>/dev/null | while IFS= read -r d; do
+    i=$((i+1))
+    if [ "$i" -gt "$keep" ]; then rm -rf "$d"; fi
+  done
 }
 
 _revert_from_dir() {
@@ -488,6 +503,7 @@ case "$cmd" in
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
   backup)         cmd_backup "${1:-}" ;;
+  prune-backups)  prune_backups "${1:-10}" ;;
   revert)         cmd_revert "${1:?}" ;;
   revert-latest)  cmd_revert_latest ;;
   restart)        cmd_restart ;;
