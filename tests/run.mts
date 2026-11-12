@@ -64,6 +64,13 @@ import {
   parsePkgFps,
   serializePkgFps,
 } from '../src/parsers/per-game';
+import {
+  scanFpsLock,
+  applyUnlockFps,
+  applyLiftThermalFps,
+  liftDynamicFpsTemps,
+  isFpsLockKey,
+} from '../src/parsers/fpslock';
 import { detectActiveBackend, detectPaths, parseParams, stringifyParams } from '../src/db/schema';
 import {
   pickBoosterParams,
@@ -128,6 +135,8 @@ async function main() {
   await runActiveBackendEdgeCases();
   await runEnvelopeTest();
   await runSourcePickTest();
+  await runFpsLockPrefixTest();
+  await runLiftThermalTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1031,6 +1040,121 @@ async function runEnvelopeTest() {
     const fresh = refreshEnvelope(null, { a: 1 }, 100);
     if (fresh.version !== 100) throw new Error('version wrong');
     if ((fresh.params as any).a !== 1) throw new Error('params wrong');
+  });
+}
+
+function collectAllKeys(node: unknown, acc: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    for (const item of node) collectAllKeys(item, acc);
+    return acc;
+  }
+  if (node && typeof node === 'object') {
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      acc.push(k);
+      collectAllKeys(v, acc);
+    }
+  }
+  return acc;
+}
+
+async function runFpsLockPrefixTest() {
+  console.log('\n=== fpslock prefix matching ===');
+  await check('fpslock: prefix matcher covers official PID_* / dynamic_fps* variants', () => {
+    const match = ['PID_T', 'PID_M', 'PID_HQ2_T', 'PID_HQ2_M', 'PID_RE2_T', 'PID_RE3_M', 'PID_RE4_T', 'PID_RE5_T', 'dynamic_fps', 'dynamic_fps_M', 'dynamic_fps_T', 'dynamic_fps_RE2'];
+    for (const k of match) if (!isFpsLockKey(k)) throw new Error(k + ' should match');
+    const noMatch = ['cgame_enable', 'boost_policy', 'scene_ovrride', 'perflock', 'migt', 'start_scene', 'end_scene', 'badfps_thresh1', 'badfps_thresh2', 'PID'];
+    for (const k of noMatch) if (isFpsLockKey(k)) throw new Error(k + ' should NOT match');
+    return 'prefix matching OK';
+  });
+  await check('fpslock: apply removes only lock keys and is idempotent', () => {
+    const tree: any = {
+      game_booster: {
+        cgame_enable: true,
+        dynamic_fps_global: '10:0,46.5:90,48:60',
+        booster_config: { ovrride_config: [{ game_name: 'a.b.c', PID_T: 1, dynamic_fps: 'x' }] },
+        mifisr_settings: { untouched: true },
+      },
+    };
+    const before = collectAllKeys(tree);
+    const r = applyUnlockFps(tree);
+    const after = collectAllKeys(tree);
+    const removed = before.filter((k) => !after.includes(k));
+    const unexpected = removed.filter(
+      (k) => !isFpsLockKey(k) && k !== 'cgame_enable' && k !== 'dynamic_fps_global',
+    );
+    if (unexpected.length) throw new Error('removed non-lock keys: ' + unexpected.join(','));
+    if (after.some((k) => isFpsLockKey(k))) throw new Error('lock keys remain');
+    if (!r.changed || r.entriesAffected !== 1) throw new Error('stats wrong');
+    if (tree.game_booster.mifisr_settings?.untouched !== true) throw new Error('unrelated key touched');
+    if (tree.game_booster.cgame_enable !== false) throw new Error('cgame not disabled');
+    if (applyUnlockFps(tree).changed) throw new Error('second apply reported a change');
+    return `removed ${removed.length} key(s), idempotent`;
+  });
+}
+
+async function runLiftThermalTest() {
+  console.log('\n=== dynamic_fps threshold lift ===');
+  await check('lift: 46.5/48 -> 96.5/98', () => {
+    const out = liftDynamicFpsTemps('10:0,46.5:90,48:60');
+    if (out !== '10:0,96.5:90,98:60') throw new Error(out);
+    return out;
+  });
+  await check('lift: 42.5/44 -> 92.5/94', () => {
+    const out = liftDynamicFpsTemps('10:0,42.5:90,44:60');
+    if (out !== '10:0,92.5:90,94:60') throw new Error(out);
+    return out;
+  });
+  await check('lift: already 9x is idempotent', () => {
+    const v = '10:0,98:90,99:60';
+    if (liftDynamicFpsTemps(v) !== v) throw new Error('not idempotent');
+    return 'idempotent';
+  });
+  await check('lift: non 3x-5x temperatures (10/12) preserved', () => {
+    if (liftDynamicFpsTemps('10:0') !== '10:0') throw new Error('10 changed');
+    if (liftDynamicFpsTemps('12:0') !== '12:0') throw new Error('12 changed');
+    if (liftDynamicFpsTemps('') !== '') throw new Error('empty changed');
+    if (liftDynamicFpsTemps('abc') !== 'abc') throw new Error('no-colon changed');
+    return 'preserved';
+  });
+  await check('lift: removes PID_*, lifts dynamic_fps*, leaves cgame_enable alone', () => {
+    const tree: any = {
+      game_booster: {
+        cgame_enable: true,
+        dynamic_fps_global: '10:0,46.5:90,48:60',
+        booster_config: {
+          ovrride_config: [
+            { game_name: 'a.b.c', dynamic_fps: '10:0,42.5:90,44:60', dynamic_fps_M: '10:0,40:90,41:60', PID_T: 1, PID_M: 2 },
+          ],
+        },
+        mifisr_settings: { untouched: true },
+      },
+    };
+    const r = applyLiftThermalFps(tree);
+    const gb = tree.game_booster;
+    if (gb.booster_config.ovrride_config[0].dynamic_fps !== '10:0,92.5:90,94:60') throw new Error('dynamic_fps not lifted');
+    if (gb.booster_config.ovrride_config[0].dynamic_fps_M !== '10:0,90:90,91:60') throw new Error('dynamic_fps_M not lifted');
+    if (gb.dynamic_fps_global !== '10:0,96.5:90,98:60') throw new Error('global not lifted');
+    if ('PID_T' in gb.booster_config.ovrride_config[0] || 'PID_M' in gb.booster_config.ovrride_config[0]) throw new Error('PID not removed');
+    if (gb.cgame_enable !== true) throw new Error('cgame_enable should stay');
+    if (gb.mifisr_settings?.untouched !== true) throw new Error('unrelated key touched');
+    if (!r.changed || !r.liftedKeys.includes('dynamic_fps') || r.removedByKey['PID_T'] !== 1) throw new Error('stats wrong');
+    return 'lift-only scope confirmed';
+  });
+  await check('lift: no content -> changed=false', () => {
+    if (applyLiftThermalFps({ game_booster: { cgame_enable: true, frc_game_params: [] } }).changed !== false) {
+      throw new Error('should be no-op');
+    }
+    return 'no-op';
+  });
+  await check('scan: reports cgame / global / totals from a booster tree', () => {
+    const s = scanFpsLock({
+      game_booster: { cgame_enable: false, dynamic_fps_global: 'x', booster_config: { ovrride_config: [{ game_name: 'g', PID_T: 1 }] } },
+    });
+    if (s.cgameEnables !== false) throw new Error('cgame wrong');
+    if (!s.hasDynamicFpsGlobal) throw new Error('global wrong');
+    if (s.totalKeys !== 2) throw new Error('total wrong: ' + s.totalKeys);
+    if (s.entries.length !== 1 || s.entries[0].name !== 'g') throw new Error('entry wrong');
+    return 'scan OK';
   });
 }
 

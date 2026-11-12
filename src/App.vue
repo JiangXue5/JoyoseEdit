@@ -66,7 +66,7 @@
           </div>
         </div>
 
-        <KeepAlive :max="10">
+        <KeepAlive :max="14">
           <component :is="currentView" />
         </KeepAlive>
       </div>
@@ -97,6 +97,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
 import { state, initialize, pullAll, pushAll } from '@/state/session';
+import { scanFpsLock } from '@/parsers/fpslock';
 import { toast } from '@/state/toast';
 import OverviewView from '@/ui/OverviewView.vue';
 import ToastStack from '@/ui/ToastStack.vue';
@@ -134,6 +135,7 @@ function asyncView(loader: () => Promise<unknown>) {
 const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
   overview: () => Promise.resolve(OverviewView),
   lock: () => import('@/ui/LockView.vue'),
+  unlockfps: () => import('@/ui/UnlockFpsView.vue'),
   gamelist: () => import('@/ui/GameListView.vue'),
   frc: () => import('@/ui/FrcView.vue'),
   mifisr: () => import('@/ui/MifisrView.vue'),
@@ -145,6 +147,7 @@ const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
 };
 
 const LockView = asyncView(viewLoaders.lock);
+const UnlockFpsView = asyncView(viewLoaders.unlockfps);
 const GameListView = asyncView(viewLoaders.gamelist);
 const FrcView = asyncView(viewLoaders.frc);
 const MifisrView = asyncView(viewLoaders.mifisr);
@@ -157,6 +160,7 @@ const ImportExportView = asyncView(viewLoaders.importexport);
 const VIEW_META: Record<ViewId, { title: string; desc: string }> = {
   overview: { title: '概览', desc: '设备上的 Joyose 数据库状态、可用增强通路与备份入口。' },
   lock: { title: '云控锁定', desc: '冻结 teg 云控版本，避免云端下发覆盖本地修改。' },
+  unlockfps: { title: '去除锁帧', desc: '清除或推迟 Joyose 的帧率限制，两种力度可选。' },
   gamelist: { title: '游戏列表', desc: 'Joyose 依据这两个名单决定是否为某个应用应用游戏策略。' },
   frc: { title: '高通 GPU', desc: '骁龙 8 Elite 机型的 AFME / FRC / FSR 通路（未实机验证）。' },
   mifisr: { title: 'MIFISR 画质增强', desc: '小米 17 系列的插帧 + 超分配置，逐游戏维护。' },
@@ -210,6 +214,10 @@ const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
   }
   enhance.push({ id: 'mivk', label: '渲染模块', icon: 'layers', badge: `${pathCount('mivk')}·${pathCount('migl')}` });
 
+  const tuning: NavItem[] = [
+    { id: 'unlockfps', label: '去除锁帧', icon: 'gauge', badge: fpsLockBadge.value || undefined, badgeTone: 'warn' },
+  ];
+
   const other: NavItem[] = [
     { id: 'json', label: 'JSON 编辑', icon: 'braces' },
     { id: 'history', label: '编辑历史', icon: 'clock' },
@@ -219,6 +227,7 @@ const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
   return [
     { label: 'Dashboard', items: main },
     { label: '画质增强', items: enhance },
+    { label: '帧率与温控', items: tuning },
     { label: '工具', items: other },
   ];
 });
@@ -229,6 +238,7 @@ const currentView = computed<Component>(() => {
   switch (view.value) {
     case 'overview': return OverviewView;
     case 'lock': return LockView;
+    case 'unlockfps': return UnlockFpsView;
     case 'gamelist': return GameListView;
     case 'frc': return FrcView;
     case 'mifisr': return MifisrView;
@@ -273,6 +283,13 @@ const pathsActive = computed(() => state.paths.filter((p) => p.active).length);
 const isLocked = computed(() => {
   const v = state.cloudConfig.booster_config?.meta.version;
   return typeof v === 'number' && String(v).startsWith('2099');
+});
+
+const fpsLockBadge = computed(() => {
+  const booster = state.cloudConfig.booster_config?.params;
+  if (!booster) return '';
+  const n = scanFpsLock(booster).totalKeys;
+  return n > 0 ? String(n) : '';
 });
 
 const gameListCount = computed(() => {

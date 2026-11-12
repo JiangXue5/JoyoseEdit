@@ -11,6 +11,7 @@ import { ref, watch } from 'vue';
 export type ViewId =
   | 'overview'
   | 'lock'
+  | 'unlockfps'
   | 'gamelist'
   | 'frc'
   | 'mifisr'
@@ -25,8 +26,9 @@ const STORAGE_KEY = 'joyose-edit:view';
 function restore(): ViewId {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v === 'overview' || v === 'lock' || v === 'gamelist' || v === 'frc' || v === 'mifisr'
-      || v === 'novatek' || v === 'mivk' || v === 'json' || v === 'history' || v === 'importexport') {
+    if (v === 'overview' || v === 'lock' || v === 'unlockfps'
+      || v === 'gamelist' || v === 'frc' || v === 'mifisr' || v === 'novatek'
+      || v === 'mivk' || v === 'json' || v === 'history' || v === 'importexport') {
       return v;
     }
   } catch {
