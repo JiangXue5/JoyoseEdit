@@ -6,6 +6,7 @@
 # Subcommands:
 #   stat                           prints schema/version fingerprints as JSON
 #   digest                         prints sha256 of both DBs (conflict detection)
+#   install-ts                     timestamp of the last fresh install ("" when none)
 #   pull smartp|teg                emits base64 of the DB file
 #   push smartp|teg <b64>          decodes <b64> and writes back atomically
 #   backup [label]                 snapshot both DBs into /data/adb/joyose-edit/backup/<epoch>[-label]/
@@ -470,6 +471,11 @@ cmd_history_save_from_stage() {
   printf '{"ok":true,"path":"%s"}\n' "$f"
 }
 
+cmd_install_ts() {
+  local f=/data/adb/modules/joyose-edit/.install_ts
+  if [ -f "$f" ]; then cat "$f"; else printf '0'; fi
+}
+
 # ---- dispatch -------------------------------------------------------------
 cmd="${1:-}"
 [ -n "$cmd" ] || die "missing subcommand"
@@ -478,6 +484,7 @@ shift
 case "$cmd" in
   stat)           cmd_stat ;;
   digest)         cmd_digest ;;
+  install-ts)     cmd_install_ts ;;
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
   backup)         cmd_backup "${1:-}" ;;

@@ -41,6 +41,25 @@ import {
 } from '@/history/store';
 import { diff, applyDelta, invertDelta } from '@/history/diff';
 import { refreshEnvelope } from '@/history/envelope';
+import {
+  pickBoosterParams,
+  latestEnvelopeVersion,
+  getDataSourcePref,
+  getBoosterSourcePref,
+  getCommonSourcePref,
+  getStoredInstallTs,
+  storeInstallTs,
+  resetAllPrefs,
+} from '@/state/source';
+
+/** "Empty config": params null / not an object / no keys at all (the cloud
+ *  did ship a row but only `{}`). Treated as "not yet delivered" — no version
+ *  shown, not lockable, not written back. */
+function isEmptyCloudParams(p: unknown): boolean {
+  return (
+    !p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p as object).length === 0
+  );
+}
 
 export interface SessionState {
   connected: boolean;
@@ -52,6 +71,10 @@ export interface SessionState {
   baselineTeg: string | null;
   /** Parsed cloud_config rows by name. Each value is the parsed `params` JSON. */
   cloudConfig: Record<string, any>;
+  /** Raw deep copy of SmartP's cloud_config.params, untouched by the
+   *  source-selection / teg-fallback reconciliation. The JSON editor's
+   *  SmartP_* targets read and write this: the target really is SmartP. */
+  smartpRaw: Record<string, any>;
   /** Parsed rule_content JSON arrays grouped by rule_module. */
   rulesByModule: Record<string, any[]>;
   /** V3 path detection result (refreshed whenever booster_config is re-parsed). */
@@ -76,6 +99,7 @@ export const state = reactive<SessionState>({
   baselineSmartp: null,
   baselineTeg: null,
   cloudConfig: {},
+  smartpRaw: {},
   rulesByModule: {},
   paths: [],
   activeBackend: null,
@@ -97,7 +121,21 @@ export async function initialize(): Promise<void> {
   }
   state.connected = true;
   await refreshStat();
-  if (state.stat?.smartp.exists) {
+  // A fresh flash / reinstall / upgrade stamps a marker; when it moved, drop
+  // the per-device preferences (write target back to `both`, …) so a WebView
+  // localStorage left over from the previous install cannot silently persist.
+  try {
+    const ts = await bridge.moduleInstallTs();
+    if (ts && ts !== '0' && ts !== getStoredInstallTs()) {
+      resetAllPrefs();
+      storeInstallTs(ts);
+    }
+  } catch {
+    /* probe unavailable — keep the stored preferences */
+  }
+  // Pull whenever either database has content: a device whose SmartP is
+  // missing / empty can still be driven from the teg mirror.
+  if (state.stat?.smartp.exists || state.stat?.teg.exists) {
     await pullAll();
   }
 }
@@ -115,20 +153,24 @@ export async function pullAll(): Promise<void> {
   state.loading = true;
   try {
     const [smartpBytes, tegBytes] = await Promise.all([
-      bridge.pull('smartp'),
-      bridge.pull('teg'),
+      state.stat?.smartp?.exists ? bridge.pull('smartp') : Promise.resolve<null>(null),
+      state.stat?.teg?.exists ? bridge.pull('teg') : Promise.resolve<null>(null),
     ]);
 
-    // open + extract
-    const dbS = await openDb(smartpBytes);
-    const dbT = await openDb(tegBytes);
+    // open + extract (a missing database becomes null, not an error)
+    const dbS = smartpBytes ? await openDb(smartpBytes) : null;
+    const dbT = tegBytes ? await openDb(tegBytes) : null;
     try {
       readIntoState(dbS, dbT);
     } finally {
-      closeDb(dbS);
-      closeDb(dbT);
+      if (dbS) closeDb(dbS);
+      if (dbT) closeDb(dbT);
     }
 
+    // Refresh stat before snapshotting the baseline: a direct write (JSON
+    // editor) has just changed mtime/size, and keeping the pre-write stat
+    // would make the next commit's conflict check fail every time.
+    await refreshStat();
     // set baseline digest
     await refreshBaseline();
     state.pristineSnapshot = snapshotFromMaps({
@@ -145,32 +187,142 @@ export async function pullAll(): Promise<void> {
   }
 }
 
-function readIntoState(dbS: Database, dbT: Database) {
+function readIntoState(dbS: Database | null, dbT: Database | null) {
   const cc: Record<string, any> = {};
-  for (const row of listCloudConfig(dbS)) {
-    cc[row.config_name] = {
-      meta: row,
-      params: parseParams(row.params),
-    };
+  const smartpRaw: Record<string, any> = {};
+  if (dbS) {
+    for (const row of listCloudConfig(dbS)) {
+      const params = parseParams(row.params);
+      // `{}` is not "never delivered": keep the row, flag it empty, and let the
+      // UI / lock / push treat it as "nothing to work with" explicitly.
+      const empty = isEmptyCloudParams(params);
+      cc[row.config_name] = { meta: { ...row, _real: true, empty }, params };
+      smartpRaw[row.config_name] = JSON.parse(JSON.stringify(params));
+    }
   }
   state.cloudConfig = cc;
+  state.smartpRaw = smartpRaw;
 
   const byModule: Record<string, any[]> = {};
-  for (const row of listRules(dbT)) {
-    const mod = row.rule_module ?? 'unknown';
-    if (!byModule[mod]) byModule[mod] = [];
-    try {
-      byModule[mod].push({ meta: row, content: parseParams(row.rule_content) });
-    } catch {
-      // keep the raw row even if JSON is malformed
-      byModule[mod].push({ meta: row, content: row.rule_content });
+  if (dbT) {
+    for (const row of listRules(dbT)) {
+      const mod = row.rule_module ?? 'unknown';
+      if (!byModule[mod]) byModule[mod] = [];
+      try {
+        const content = parseParams(row.rule_content);
+        const envParams =
+          content && typeof content === 'object' && !Array.isArray(content)
+            ? (content as any).params
+            : null;
+        byModule[mod].push({
+          meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
+          content,
+        });
+      } catch {
+        // keep the raw row even if JSON is malformed
+        byModule[mod].push({ meta: { ...row, _real: true, empty: false }, content: row.rule_content });
+      }
     }
   }
   state.rulesByModule = byModule;
 
+  // ---- fallback: SmartP has no row (or an empty one) but teg does ----
+  // Lets a device whose SmartP was never populated keep working instead of
+  // showing an empty dashboard for every page.
+  for (const [name, rows] of Object.entries(byModule)) {
+    const cur = cc[name];
+    if (cur && !cur.meta?.empty) continue;
+    if (getDataSourcePref() !== 'teg-fallback') continue;
+    const env = rows.find((r) => {
+      const e = r.content;
+      return (
+        e && typeof e === 'object' && !Array.isArray(e) && !isEmptyCloudParams((e as any).params)
+      );
+    })?.content;
+    if (env) {
+      cc[name] = {
+        // fromTeg: nothing of this config exists in SmartP — the content is
+        // entirely from teg, so never label it "SmartP" or show SmartP's version.
+        meta: {
+          version: Number((env as any).version ?? 0),
+          rule_version: null,
+          fromTeg: true,
+          _real: true,
+        },
+        params: parseParams(JSON.stringify((env as any).params)),
+      };
+    }
+  }
+
+  // ---- version source selection ----
+  // booster_config exists in both DBs and the cloud may update them out of
+  // sync (teg is usually fresher and keeps several historical rows). Honour the
+  // user's preference; common_config defaults to SmartP because its teg mirror
+  // is frequently incomplete. Comparison uses envelope.version (same
+  // YYYYMMDDxx scheme as SmartP.version), never the internal rule_version.
+  {
+    const booster = cc['booster_config'];
+    if (booster) {
+      booster.meta.smartpVersion = booster.meta.fromTeg ? 0 : Number(booster.meta.version ?? 0);
+      booster.meta.tegVersion = latestEnvelopeVersion(byModule['booster_config']);
+      if (booster.meta.fromTeg) {
+        booster.meta.source = 'teg';
+        booster.meta.version =
+          booster.meta.tegVersion > 0 ? booster.meta.tegVersion : undefined;
+      } else {
+        const picked = pickBoosterParams(
+          booster,
+          byModule['booster_config'],
+          getBoosterSourcePref(),
+        );
+        if (picked) {
+          booster.params = picked.params;
+          booster.meta.version = picked.version;
+          booster.meta.source = picked.source;
+        }
+      }
+    }
+  }
+
+  {
+    const common = cc['common_config'];
+    if (common) {
+      common.meta.smartpVersion = common.meta.fromTeg ? 0 : Number(common.meta.version ?? 0);
+      common.meta.tegVersion = latestEnvelopeVersion(byModule['common_config']);
+      if (common.meta.fromTeg) {
+        common.meta.source = 'teg';
+        common.meta.version = common.meta.tegVersion > 0 ? common.meta.tegVersion : undefined;
+      } else {
+        const picked = pickBoosterParams(
+          common,
+          byModule['common_config'],
+          getCommonSourcePref(),
+        );
+        if (picked) {
+          common.params = picked.params;
+          common.meta.source = picked.source;
+          // common_config's official version lives in SmartP's version column;
+          // only an explicit teg choice follows the envelope version.
+          common.meta.version = picked.version > 0 ? picked.version : undefined;
+        }
+      }
+    }
+  }
+
   const booster = cc.booster_config?.params ?? {};
   state.paths = detectPaths(booster);
   state.activeBackend = detectActiveBackend(booster);
+}
+
+/** Whether a config page has usable content under the current data-source
+ *  policy: SmartP always counts; teg only when the user allowed the fallback. */
+export function sourceUsable(configName: string): boolean {
+  if (state.smartpRaw[configName] && !isEmptyCloudParams(state.smartpRaw[configName])) return true;
+  if (getDataSourcePref() === 'teg-fallback') {
+    const cur = state.cloudConfig[configName];
+    return !!cur && !isEmptyCloudParams(cur.params);
+  }
+  return false;
 }
 
 /** Mark a mutation to booster_config / common_config / rules as pending.
@@ -265,8 +417,26 @@ export function syncRuleContent(configName: string, newVersion?: number): void {
 export function lockCloudVersion(configName: string): number {
   const cc = state.cloudConfig[configName];
   if (!cc) throw new Error(`no config named ${configName}`);
+  if (cc.meta?.empty) {
+    throw new Error(`${configName}: 空配置，没有可锁定的版本号`);
+  }
   const current = Number(cc.meta.version ?? cc.params?.header?.version ?? 0);
-  const locked = rewriteYear(current);
+  // Lock base: booster takes the newer of "current" and the latest teg
+  // envelope; common_config stays on the official SmartP version so a stale
+  // teg mirror cannot drag the lock year onto the wrong digits.
+  const latestTeg = latestEnvelopeVersion(state.rulesByModule[configName]);
+  const base = configName === 'common_config' ? current : Math.max(current, latestTeg);
+  if (!(base > 0)) {
+    throw new Error(
+      `${configName}: SmartP 与 teg 都没有可用版本号，无法锁定`,
+    );
+  }
+  const locked = rewriteYear(base);
+  // Remember the pre-lock version so "unlock" restores the real one instead of
+  // guessing a 2024 prefix.
+  if (cc.meta.originalVersion === undefined) {
+    cc.meta.originalVersion = current;
+  }
   cc.meta.version = locked;
   if (cc.params.header) cc.params.header.version = String(locked);
   syncRuleContent(configName, locked);

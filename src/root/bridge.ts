@@ -109,6 +109,18 @@ export async function stat(): Promise<StatResult> {
   return JSON.parse(out);
 }
 
+/** Timestamp stamped by customize.sh on a fresh install / reinstall. The WebUI
+ *  compares it against its own localStorage copy to decide whether to drop the
+ *  per-device preferences. Returns "0" when the helper is too old to know the
+ *  subcommand. */
+export async function moduleInstallTs(): Promise<string> {
+  try {
+    return (await runKsu(`sh ${HELPER} install-ts`)).trim();
+  } catch {
+    return '0';
+  }
+}
+
 export interface DigestResult {
   ok: true;
   /** sha256 of the DB file, or null when it does not exist. */

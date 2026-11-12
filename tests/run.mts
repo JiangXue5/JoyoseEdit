@@ -66,6 +66,12 @@ import {
 } from '../src/parsers/per-game';
 import { detectActiveBackend, detectPaths, parseParams, stringifyParams } from '../src/db/schema';
 import {
+  pickBoosterParams,
+  latestEnvelopeVersion,
+  getCommonSourcePref,
+  getWriteTarget,
+} from '../src/state/source';
+import {
   buildRecord,
   DriverBackedStore,
   snapshotFromMaps,
@@ -121,6 +127,7 @@ async function main() {
   await runMifisrStringTest();
   await runActiveBackendEdgeCases();
   await runEnvelopeTest();
+  await runSourcePickTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1024,6 +1031,66 @@ async function runEnvelopeTest() {
     const fresh = refreshEnvelope(null, { a: 1 }, 100);
     if (fresh.version !== 100) throw new Error('version wrong');
     if ((fresh.params as any).a !== 1) throw new Error('params wrong');
+  });
+}
+
+async function runSourcePickTest() {
+  console.log('\n=== booster source pick ===');
+  const smart = { meta: { version: 2025090351 }, params: { src: 'smartp', v: 2025090351 } };
+  const tegRows = [
+    { meta: { rule_version: 483381 }, content: { version: 2025031801, params: { src: 'teg', v: 2025031801 } } },
+    { meta: { rule_version: 505464 }, content: { version: 2025041601, params: { src: 'teg', v: 2025041601 } } },
+    { meta: { rule_version: 649438 }, content: { version: 2025120301, params: { src: 'teg', v: 2025120301 } } },
+  ];
+  await check('source: auto picks the higher envelope.version (latest teg row wins)', () => {
+    const p = pickBoosterParams(smart, tegRows, 'auto');
+    if (!p || p.source !== 'teg') throw new Error('expected teg, got ' + (p && p.source));
+    if (p.version !== 2025120301) throw new Error('expected 2025120301, got ' + p.version);
+    return 'teg latest envelope.version selected';
+  });
+  await check('source: smartp pref always keeps smartp', () => {
+    const p = pickBoosterParams(smart, tegRows, 'smartp');
+    if (!p || p.source !== 'smartp' || p.version !== 2025090351) throw new Error('smartp pref failed');
+    return 'smartp forced';
+  });
+  await check('source: teg pref forces teg even when older', () => {
+    const older = [{ meta: { rule_version: 1 }, content: { version: 2023010101, params: { x: 1 } } }];
+    const p = pickBoosterParams(smart, older, 'teg');
+    if (!p || p.source !== 'teg' || p.version !== 2023010101) throw new Error('teg forced failed');
+    return 'teg forced (even when older)';
+  });
+  await check('source: auto picks smartp when smartp is newer', () => {
+    const p = pickBoosterParams({ meta: { version: 2026012351 }, params: { src: 'smartp' } }, tegRows, 'auto');
+    if (!p || p.source !== 'smartp') throw new Error('expected smartp, got ' + (p && p.source));
+    return 'smartp newer -> smartp';
+  });
+  await check('source: common_config defaults to smartp', () => {
+    if (getCommonSourcePref() !== 'smartp') throw new Error('common default should be smartp');
+    return 'common_config source defaults to smartp';
+  });
+  await check('source: write target defaults to both', () => {
+    if (getWriteTarget() !== 'both') throw new Error('write target should default to both');
+    return 'write target defaults to both';
+  });
+  await check('source: teg rows without envelope.version never leak rule_version', () => {
+    const rows = [
+      { meta: { rule_version: 706918 }, content: { params: { x: 1 } } },
+      { meta: { rule_version: 467472 }, content: { params: { y: 2 } } },
+    ];
+    const v = latestEnvelopeVersion(rows);
+    if (v !== 0) throw new Error('rule_version leaked as version: ' + v);
+    return 'rule_version isolated (0)';
+  });
+  await check('source: falls back to smartp when teg has no valid version', () => {
+    const s = { meta: { version: 2026042590 }, params: { src: 'smartp' } };
+    const rows = [{ meta: { rule_version: 706918 }, content: { params: { x: 1 } } }];
+    const p = pickBoosterParams(s, rows, 'auto');
+    if (!p || p.source !== 'smartp') throw new Error('expected smartp fallback, got ' + (p && p.source));
+    return 'smartp fallback OK';
+  });
+  await check('source: missing smartp row yields null', () => {
+    if (pickBoosterParams(undefined, tegRows, 'auto') !== null) throw new Error('expected null');
+    return 'null when SmartP has no row';
   });
 }
 
