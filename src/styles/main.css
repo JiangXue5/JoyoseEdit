@@ -657,13 +657,17 @@ pre {
   gap: var(--space-3);
 }
 
-/* sticky page header inside the scroll area */
-.page-head {
+/* Sticky page header. The wrapper is the sticky box on desktop and lays the
+   title column out next to the action row; on mobile it turns into
+   `display: contents`, so `.page-head` itself sticks while `.page-actions`
+   stays in the page flow and scrolls away with the cards. */
+.page-head-wrap {
   position: sticky;
   top: 0;
   z-index: 12;
-  display: flex;
-  align-items: flex-end;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
   gap: var(--space-3);
   margin: 0 0 var(--space-1);
   padding: 22px 0 14px;
@@ -673,7 +677,14 @@ pre {
   background: var(--bg);
 }
 
-.page-head::after {
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.page-head-wrap::after {
   content: '';
   position: absolute;
   left: 0;
@@ -708,8 +719,21 @@ pre {
   line-height: 1.2;
 }
 
-.page-desc {
+/* The description folds away instead of `display:none`: 1fr → 0fr lets the
+   header give back its height over ~220ms instead of snapping the page up by
+   ~60px in a single frame. */
+.page-desc-wrap {
+  display: grid;
+  grid-template-rows: 1fr;
   margin-top: 5px;
+  transition: grid-template-rows 0.22s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.18s ease,
+    margin-top 0.22s ease;
+}
+
+.page-desc {
+  margin: 0;
+  min-height: 0;
+  overflow: hidden;
   font-size: 13px;
   color: var(--text-muted);
   max-width: 62ch;
@@ -1781,8 +1805,17 @@ pre {
   }
 
   .main-inner {
-    padding: 12px calc(14px + var(--safe-area-inset-right, 0px)) 96px calc(14px + var(--safe-area-inset-left, 0px));
+    /* one source of truth for the side gutter: the sticky header has to bleed
+       by exactly the same amount the page is padded by */
+    --page-gutter: 14px;
+    padding: 12px calc(var(--page-gutter) + var(--safe-area-inset-right, 0px)) 96px calc(var(--page-gutter) + var(--safe-area-inset-left, 0px));
     gap: 10px;
+  }
+
+  /* Wrapper steps aside so `.page-head` can stick on its own and the action
+     row stays a normal child of the page stack. */
+  .page-head-wrap {
+    display: contents;
   }
 
   .page-head {
@@ -1793,34 +1826,49 @@ pre {
     grid-template-columns: auto minmax(0, 1fr);
     align-items: center;
     gap: 4px 10px;
-    margin: 0 calc(-1 * (14px + var(--safe-area-inset-right, 0px))) 2px calc(-1 * (14px + var(--safe-area-inset-left, 0px)));
-    padding: calc(10px + var(--safe-area-inset-top, 0px)) calc(14px + var(--safe-area-inset-right, 0px)) 10px calc(14px + var(--safe-area-inset-left, 0px));
+    margin: 0 calc(-1 * (var(--page-gutter, 14px) + var(--safe-area-inset-right, 0px))) 0 calc(-1 * (var(--page-gutter, 14px) + var(--safe-area-inset-left, 0px)));
+    padding: calc(10px + var(--safe-area-inset-top, 0px)) calc(var(--page-gutter, 14px) + var(--safe-area-inset-right, 0px)) 10px calc(var(--page-gutter, 14px) + var(--safe-area-inset-left, 0px));
     background: var(--bg);
     border-bottom: 1px solid var(--border);
+    transition: padding-top 0.22s ease, padding-bottom 0.22s ease;
+  }
+
+  /* wrapper is `display: contents` here, so the fade under the bar hangs off
+     the header itself. It fades in with scroll progress: at rest the action
+     row sits right below the bar and must stay crisp; while scrolling it
+     softens whatever is sliding underneath. */
+  .page-head::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    height: 14px;
+    background: linear-gradient(180deg, var(--bg), color-mix(in srgb, var(--bg) 0%, transparent));
+    opacity: var(--sy-p, 0);
+    pointer-events: none;
   }
 
   .page-kicker {
     display: none;
   }
 
+  /* Actions are part of the page body, not the bar: they slide under it as you
+     scroll and are clipped by it, exactly like the cards below. They wrap
+     instead of scrolling sideways — a nested horizontal scroller in the middle
+     of the page would eat vertical swipes. */
   .page-actions {
-    grid-column: 1 / -1;
     justify-content: flex-start;
     gap: 6px;
-    overflow-x: auto;
-    scrollbar-width: none;
+    flex-wrap: wrap;
     padding-bottom: 2px;
-    margin-top: 2px;
-  }
-
-  .page-actions::-webkit-scrollbar {
-    display: none;
   }
 
   /* once scrolled, keep only a slim title bar */
-  .main.scrolled .page-desc,
-  .main.scrolled .page-actions {
-    display: none;
+  .main.scrolled .page-desc-wrap {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    margin-top: 0;
   }
 
   .main.scrolled .page-head {
@@ -1844,6 +1892,7 @@ pre {
 
   .page-title {
     font-size: 19px;
+    transition: font-size 0.18s ease;
   }
 
   .page-desc {
@@ -1993,8 +2042,9 @@ pre {
 
 @media (max-width: 400px) {
   .main-inner {
-    padding-left: calc(10px + var(--safe-area-inset-left, 0px));
-    padding-right: calc(10px + var(--safe-area-inset-right, 0px));
+    --page-gutter: 10px;
+    padding-left: calc(var(--page-gutter) + var(--safe-area-inset-left, 0px));
+    padding-right: calc(var(--page-gutter) + var(--safe-area-inset-right, 0px));
   }
 
   .panel {

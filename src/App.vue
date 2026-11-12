@@ -189,6 +189,10 @@ const version = __APP_VERSION__;
 const mainEl = ref<HTMLElement | null>(null);
 const COLLAPSE_AT = 64;
 const EXPAND_AT = 8;
+// Distance over which the mobile header's soft edge under the title bar fades
+// in. Exposed as `--sy-p` (0 → 1) so the gradient tracks the gesture instead
+// of appearing all at once at a threshold.
+const HEAD_FADE_PX = 56;
 const scrolled = ref(false);
 let scrollTick = false;
 
@@ -198,6 +202,11 @@ function onScroll() {
   requestAnimationFrame(() => {
     scrollTick = false;
     const top = mainEl.value?.scrollTop ?? 0;
+    // Continuous 0→1 progress for the header edge: a scroll-linked value
+    // instead of a boolean class, so the fade under the bar grows with the
+    // gesture and nothing pops at the collapse threshold.
+    const p = Math.min(Math.max(top / HEAD_FADE_PX, 0), 1);
+    mainEl.value?.style.setProperty('--sy-p', p.toFixed(3));
     const next = scrolled.value ? top > EXPAND_AT : top > COLLAPSE_AT;
     if (next !== scrolled.value) scrolled.value = next;
   });
@@ -208,6 +217,7 @@ function onScroll() {
 // would still be collapsed on a page you have not scrolled yet).
 watch(view, () => {
   scrolled.value = false;
+  mainEl.value?.style.setProperty('--sy-p', '0');
   if (mainEl.value) mainEl.value.scrollTop = 0;
 });
 
