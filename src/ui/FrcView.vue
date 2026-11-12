@@ -5,19 +5,19 @@
       <span class="hint">当前机型不走此后端，改动不会生效。请到对应面板操作，或通过 JSON 编辑页直接改底层数据。</span>
     </div>
 
-    <div class="panel">
-      <h2>小米 15 / 15 Pro 高通 GPU 插帧 <small>未实机验证</small></h2>
-      <div class="hint">
-        适用于无独显的小米机型。小米 15 / 15 Pro 会被云控下发相关配置；
-        小米 17 未下发，可通过本编辑器手动创建条目让设备尝试启用插帧 / 超分。
-      </div>
-    </div>
+    <PageHeader title="高通 GPU 插帧" kicker="AFME / FRC / FSR · 未实机验证"
+      desc="适用于无独显的小米机型。小米 15 / 15 Pro 会被云控下发相关配置；小米 17 未下发，可手动建条目让设备尝试启用插帧 / 超分。">
+      <button class="ghost" @click="addFromPreset">
+        <AppIcon name="list" /> 从预设
+      </button>
+      <button class="primary" @click="addBlank">+ 新建条目</button>
+    </PageHeader>
 
     <div class="twopane">
       <div class="list">
-        <div class="row" style="padding: 8px">
-          <button class="primary" @click="addBlank">+ 新建条目</button>
-          <button class="ghost" @click="addFromPreset">从预设</button>
+        <div class="list-head">
+          <span class="tiny muted">{{ entries.length }} 条</span>
+          <button class="ghost sm" @click="addFromPreset">预设</button>
         </div>
         <button v-for="(s, i) in entries" :key="i" class="item" :class="{ active: selected === i }"
           @click="selected = i">
@@ -140,8 +140,8 @@
             <tbody>
               <tr v-for="p in routedPolicies" :key="p.feature">
                 <td><strong class="mono">{{ p.feature }}</strong></td>
-                <td class="mono">{{ p.strategy }}</td>
-                <td class="mono">{{ p.support_max_refresh ?? '—' }}</td>
+                <td class="mono" data-label="策略">{{ p.strategy }}</td>
+                <td class="mono" data-label="最高刷新率">{{ p.support_max_refresh ?? '—' }}</td>
               </tr>
             </tbody>
           </table>
@@ -176,6 +176,9 @@ import {
 
 import frcPresets from '@/presets/frc/index.json';
 import { dialog } from '@/state/dialog';
+import PageHeader from './PageHeader.vue';
+import AppIcon from './AppIcon.vue';
+import { rafThrottle } from '@/utils/raf';
 
 const entries = computed<string[]>({
   get: () => {
@@ -255,7 +258,7 @@ function detectSupportedRefreshRates(): number[] | undefined {
   return Array.isArray(rates) ? rates.map(Number).filter(Number.isFinite) : undefined;
 }
 
-function rewrite() {
+function rewriteNow() {
   const p = currentParsed.value;
   if (!p) return;
   // Skip while the user is mid-edit (cleared a numeric field → NaN). Writing
@@ -274,6 +277,8 @@ function rewrite() {
   }
 }
 
+
+const rewrite = rafThrottle(rewriteNow);
 function addBlank() {
   const gb = ensureGameBooster();
   if (!Array.isArray(gb.frc_game_params)) gb.frc_game_params = [];

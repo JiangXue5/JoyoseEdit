@@ -1,23 +1,14 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>渲染模块强度 <small>MIVK / MIGL</small></h2>
-      <div class="hint">
-        配置每个渲染模块的开启等级。<strong>0 = 关闭</strong>、<strong>1–7 = 分级启用</strong>、<strong>31 = 强制开启</strong>。
-        这里只是渲染层开关；MIFISR 策略层配置请去 MIFISR 面板。
-      </div>
-      <div class="row">
-        <label class="row" style="gap: var(--space-1)">
-          <span class="hint">通道</span>
-          <select v-model="channel">
-            <option value="mivk">MIVK（Vulkan）</option>
-            <option value="migl">MIGL（OpenGL）</option>
-          </select>
-        </label>
-        <button class="primary" @click="addBlank">+ 新建条目</button>
-        <button class="ghost" @click="addFromPreset">从预设</button>
-      </div>
-    </div>
+    <PageHeader title="渲染模块" kicker="MIVK / MIGL"
+      desc="配置每个渲染模块的开启等级：0 = 关闭，1–7 分级启用，31 强制开启。这里只是渲染层开关，MIFISR 策略层请去对应面板。">
+      <select v-model="channel" aria-label="通道">
+        <option value="mivk">MIVK（Vulkan）</option>
+        <option value="migl">MIGL（OpenGL）</option>
+      </select>
+      <button class="ghost" @click="addFromPreset">从预设</button>
+      <button class="primary" @click="addBlank">+ 新建条目</button>
+    </PageHeader>
 
     <div class="twopane">
       <div class="list">
@@ -58,26 +49,24 @@
 
         <div class="panel" style="margin: 0; background: var(--bg-elevated)">
           <h2 style="font-size: 14px">模块开关 <small>support_module</small></h2>
-          <table class="table">
-            <tbody>
-              <tr v-for="m in modules" :key="m.name">
-                <td><strong class="mono">{{ m.name }}</strong></td>
-                <td>
-                  <select :value="m.level"
-                    @change="(e: Event) => setLevel(m.name, Number(((e.target as HTMLSelectElement)).value))">
-                    <option v-for="lv in [0, 1, 2, 3, 4, 5, 6, 7, 31]" :key="lv" :value="lv">{{ lv === 0 ? '0 (关)' : lv
-                      === 31 ?
-                      '31 (强制)' : `${lv}` }}</option>
-                  </select>
-                </td>
-                <td style="width: 1px; white-space: nowrap; text-align: right">
-                  <button class="danger ghost" @click="dropModule(m.name)">删除</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+          <div class="module-list">
+            <div v-for="m in modules" :key="m.name" class="module-row">
+              <span class="mono module-name">{{ m.name }}</span>
+              <select :value="m.level" aria-label="等级"
+                @change="(e: Event) => setLevel(m.name, Number(((e.target as HTMLSelectElement)).value))">
+                <option v-for="lv in [0, 1, 2, 3, 4, 5, 6, 7, 31]" :key="lv" :value="lv">{{ lv === 0 ? '0 (关)' : lv
+                  === 31 ?
+                  '31 (强制)' : `${lv}` }}</option>
+              </select>
+              <button class="icon-btn" @click="dropModule(m.name)" title="删除模块">
+                <AppIcon name="close" />
+              </button>
+            </div>
+            <div v-if="modules.length === 0" class="hint" style="padding: 8px 0">还没有模块，从下方添加。</div>
+          </div>
           <div class="row" style="margin-top: var(--space-2)">
-            <select v-model="newModuleName">
+            <select v-model="newModuleName" aria-label="模块">
+              <option value="" disabled>选择模块…</option>
               <option v-for="n in availableModuleNames" :key="n" :value="n">{{ n }}</option>
             </select>
             <select v-model.number="newModuleLevel">
@@ -115,6 +104,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { state, markDirty } from '@/state/session';
+import PageHeader from './PageHeader.vue';
+import AppIcon from './AppIcon.vue';
 import {
   getEntries,
   setEntries,

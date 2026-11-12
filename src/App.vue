@@ -1,127 +1,114 @@
 <template>
-  <div class="app-shell" :class="{ 'sidebar-open': navOpen }">
-    <div class="mobile-bar">
-      <button class="hamburger" @click="navOpen = !navOpen" :aria-expanded="navOpen" aria-label="菜单">
-        ☰
-      </button>
-      <h1>Joyose<span>Edit</span></h1>
-      <span class="tiny muted">{{ activeViewLabel }}</span>
-    </div>
-    <div class="sidebar-scrim" v-show="navOpen" @click="navOpen = false" aria-hidden="true" />
+  <div class="app-shell" :class="{ 'sidebar-open': drawerOpen }">
+    <div class="sidebar-scrim" v-show="drawerOpen" @click="drawerOpen = false" aria-hidden="true" />
+
     <nav class="sidebar" @click="onNavClick">
-      <h1>Joyose<span>Edit</span></h1>
-      <div class="sidebar-version">v{{ version }} · KernelSU WebUI</div>
-
-      <button class="nav-btn" :class="{ active: view === 'overview' }" @click="view = 'overview'">
-        <span>概览</span>
-        <span class="badge" v-if="state.stat">{{ pathsActive }}/4</span>
-      </button>
-
-      <button class="nav-btn" :class="{ active: view === 'lock' }" @click="view = 'lock'">
-        <span>云控锁定</span>
-        <span class="badge" v-if="isLocked">已锁</span>
-      </button>
-
-      <button class="nav-btn" :class="{ active: view === 'gamelist' }" @click="view = 'gamelist'">
-        <span>游戏列表</span>
-        <span class="badge" v-if="gameListCount">{{ gameListCount }}</span>
-      </button>
-
-      <div class="nav-divider">插帧 / 超分</div>
-
-      <button v-if="state.activeBackend === 'mifisr'" class="nav-btn" :class="{ active: view === 'mifisr' }"
-        @click="view = 'mifisr'">
-        <span>MIFISR</span>
-        <span class="badge">{{ pathCount('mifisr') }}</span>
-      </button>
-
-      <button v-if="state.activeBackend === 'qualcomm'" class="nav-btn" :class="{ active: view === 'frc' }"
-        @click="view = 'frc'">
-        <span>高通 GPU</span>
-        <span class="badge">{{ pathCount('qualcomm') }}</span>
-      </button>
-
-      <button v-if="state.activeBackend === 'novatek'" class="nav-btn" :class="{ active: view === 'novatek' }"
-        @click="view = 'novatek'">
-        <span>Novatek 独显</span>
-        <span class="badge">{{ pathCount('novatek') }}</span>
-      </button>
-
-      <div v-if="state.stat && state.activeBackend === null" class="tiny muted" style="padding: 6px 12px">
-        未检测到 Joyose 插帧配置
+      <div class="brand">
+        <div class="brand-mark">J</div>
+        <div class="brand-text">
+          <b>Joyose<em>Edit</em></b>
+          <span>v{{ version }} · KernelSU</span>
+        </div>
       </div>
 
-      <button class="nav-btn" :class="{ active: view === 'mivk' }" @click="view = 'mivk'">
-        <span>MIVK / MIGL</span>
-        <span class="badge">{{ pathCount('mivk') }} / {{ pathCount('migl') }}</span>
-      </button>
+      <template v-for="group in navGroups" :key="group.label">
+        <div class="nav-group">{{ group.label }}</div>
+        <button v-for="item in group.items" :key="item.id" class="nav-btn" :class="{ active: view === item.id }"
+          @click="view = item.id">
+          <AppIcon :name="item.icon" />
+          <span class="nav-label">{{ item.label }}</span>
+          <span v-if="item.badge" class="badge" :class="item.badgeTone">{{ item.badge }}</span>
+        </button>
+      </template>
 
-      <div class="nav-divider">其他</div>
-
-      <button class="nav-btn" :class="{ active: view === 'json' }" @click="view = 'json'">
-        <span>JSON 编辑</span>
-      </button>
-
-      <button class="nav-btn" :class="{ active: view === 'history' }" @click="view = 'history'">
-        <span>编辑历史</span>
-      </button>
-
-      <button class="nav-btn" :class="{ active: view === 'importexport' }" @click="view = 'importexport'">
-        <span>导入 / 导出</span>
-      </button>
-
-      <button class="nav-btn theme-btn" @click="cycleTheme" :title="themeTitle">
-        <span>主题</span>
-        <span class="badge">{{ themeLabel }}</span>
-      </button>
+      <div class="sidebar-foot">
+        <div class="foot-row">
+          <span class="dot" :class="state.connected ? 'ok' : 'warn'" />
+          <span>{{ state.connected ? 'KernelSU 已连接' : '等待 KernelSU 环境' }}</span>
+        </div>
+        <div class="foot-row" v-if="state.stat">
+          <span class="dot" :class="state.dirty ? 'warn' : 'ok'" />
+          <span>{{ state.dirty ? '有未提交修改' : '与设备一致' }}</span>
+        </div>
+        <button class="nav-btn theme-btn" @click="cycleTheme" :title="themeTitle">
+          <AppIcon :name="themeIcon" />
+          <span class="nav-label">外观</span>
+          <span class="badge">{{ themeLabel }}</span>
+        </button>
+      </div>
     </nav>
 
-    <main class="main">
-      <div v-if="!state.connected" class="banner error">
-        <strong>未检测到 KernelSU</strong>
-        <span>{{ state.lastError ?? '请在 KernelSU 管理器内打开本模块的 WebUI。' }}</span>
-      </div>
-      <div v-else-if="state.lastError" class="banner error">
-        <strong>错误</strong>
-        <span>{{ state.lastError }}</span>
-        <button class="ghost" @click="dismissError">知道了</button>
-      </div>
-      <div v-if="state.dirty" class="banner warn">
-        <strong>有未提交修改</strong>
-        <span>前往"云控锁定"或"提交"按钮完成写入；或切到"编辑历史"回滚。</span>
-        <button @click="handlePush" :disabled="state.loading">提交到设备</button>
-        <button class="ghost" @click="handleDiscard" :disabled="state.loading">丢弃</button>
+    <main class="main" :class="{ scrolled, 'has-pending': state.dirty }" @scroll.passive="onScroll">
+      <div class="progress-line" :class="{ on: state.loading }" aria-hidden="true" />
+
+      <!-- full-screen state when the KernelSU bridge is missing: nothing on the
+           dashboard can work, so don't tease an empty UI -->
+      <div v-if="!state.connected" class="app-empty">
+        <div class="empty-card">
+          <div class="empty-mark">
+            <AppIcon name="warn" />
+          </div>
+          <h1>未连接到 KernelSU</h1>
+          <p>{{ state.lastError ?? '本页面需要以模块 WebUI 的形式在 KernelSU 管理器内打开，才能读写 /data 下的数据库。' }}</p>
+          <div class="empty-actions">
+            <button class="primary" @click="retryConnect">重新检测</button>
+          </div>
+          <p class="tiny faint">如果你是在浏览器里直接打开的，看到这个提示是正常的。</p>
+        </div>
       </div>
 
-      <Suspense>
-        <template #default>
+      <div v-else class="main-inner">
+        <div v-if="state.lastError" class="banner error">
+          <strong>操作失败</strong>
+          <span>{{ state.lastError }}</span>
+          <div class="banner-actions">
+            <button class="ghost sm" @click="dismissError">知道了</button>
+          </div>
+        </div>
+
+        <KeepAlive :max="10">
           <component :is="currentView" />
-        </template>
-        <template #fallback>
-          <div class="muted">加载中…</div>
-        </template>
-      </Suspense>
+        </KeepAlive>
+      </div>
+
+      <!-- dirty commit bar: fixed so edits never shift the page -->
+      <transition name="commit">
+        <div v-if="state.dirty" class="commit-bar">
+          <span class="commit-dot" />
+          <div class="commit-text">
+            <b>有未提交的修改</b>
+            <span>写入设备后才会生效，提交前会自动备份。</span>
+          </div>
+          <div class="commit-actions">
+            <button class="ghost sm" @click="handleDiscard" :disabled="state.loading">丢弃</button>
+            <button class="primary sm" @click="handlePush" :disabled="state.loading">
+              {{ state.loading ? '写入中…' : '提交到设备' }}
+            </button>
+          </div>
+        </div>
+      </transition>
     </main>
+
     <ToastStack />
     <DialogStack />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, h, onMounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
 import { state, initialize, pullAll, pushAll } from '@/state/session';
 import { toast } from '@/state/toast';
 import OverviewView from '@/ui/OverviewView.vue';
 import ToastStack from '@/ui/ToastStack.vue';
 import DialogStack from '@/ui/DialogStack.vue';
+import AppIcon from '@/ui/AppIcon.vue';
 import { dialog } from '@/state/dialog';
 import { theme, cycleTheme } from '@/state/theme';
+import { activeView as view, drawerOpen, type ViewId } from '@/state/nav';
 
-// Async view chunks can fail silently in WebView (stale cache hitting a new
-// content-hash 404, or MIME rejection of .js chunks on certain KernelSU
-// manager builds). Without an errorComponent + timeout, <Suspense> just
-// parks the fallback "加载中…" forever. The wrapper surfaces a real error
-// instead so the user knows to refresh.
+// Async chunks can fail inside the WebView (stale cache → 404 on a hashed
+// chunk, or MIME rejection). Rather than parking the UI on "加载中…" forever,
+// surface a real error with a reload hint.
 const AsyncErrorView = {
   setup: () => () =>
     h('div', { class: 'banner error' }, [
@@ -129,57 +116,116 @@ const AsyncErrorView = {
       h('span', '资源请求超时或被 WebView 拒绝 — 刷新页面或重装模块后重试。'),
     ]),
 };
+
+const LOADING_STUB = {
+  setup: () => () => h('div', { class: 'panel', style: 'color: var(--text-faint); font-size: 13px' }, '加载中…'),
+};
+
 function asyncView(loader: () => Promise<unknown>) {
   return defineAsyncComponent({
     loader: loader as () => Promise<any>,
     errorComponent: AsyncErrorView,
+    loadingComponent: LOADING_STUB,
     timeout: 15000,
-    delay: 200,
+    delay: 120,
   });
 }
 
-const LockView = asyncView(() => import('@/ui/LockView.vue'));
-const GameListView = asyncView(() => import('@/ui/GameListView.vue'));
-const FrcView = asyncView(() => import('@/ui/FrcView.vue'));
-const MifisrView = asyncView(() => import('@/ui/MifisrView.vue'));
-const NovatekView = asyncView(() => import('@/ui/NovatekView.vue'));
-const MivkView = asyncView(() => import('@/ui/MivkView.vue'));
-const JsonEditorView = asyncView(() => import('@/ui/JsonEditorView.vue'));
-const HistoryView = asyncView(() => import('@/ui/HistoryView.vue'));
-const ImportExportView = asyncView(() => import('@/ui/ImportExportView.vue'));
-
-type ViewId =
-  | 'overview'
-  | 'lock'
-  | 'gamelist'
-  | 'frc'
-  | 'mifisr'
-  | 'novatek'
-  | 'mivk'
-  | 'json'
-  | 'history'
-  | 'importexport';
-
-const view = ref<ViewId>('overview');
-const navOpen = ref(false);
-const version = __APP_VERSION__;
-
-const VIEW_LABELS: Record<ViewId, string> = {
-  overview: '概览',
-  lock: '云控锁定',
-  gamelist: '游戏列表',
-  frc: '高通 GPU',
-  mifisr: 'MIFISR',
-  novatek: 'Novatek 独显',
-  mivk: 'MIVK / MIGL',
-  json: 'JSON 编辑',
-  history: '编辑历史',
-  importexport: '导入 / 导出',
+const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
+  overview: () => Promise.resolve(OverviewView),
+  lock: () => import('@/ui/LockView.vue'),
+  gamelist: () => import('@/ui/GameListView.vue'),
+  frc: () => import('@/ui/FrcView.vue'),
+  mifisr: () => import('@/ui/MifisrView.vue'),
+  novatek: () => import('@/ui/NovatekView.vue'),
+  mivk: () => import('@/ui/MivkView.vue'),
+  json: () => import('@/ui/JsonEditorView.vue'),
+  history: () => import('@/ui/HistoryView.vue'),
+  importexport: () => import('@/ui/ImportExportView.vue'),
 };
 
-const activeViewLabel = computed(() => VIEW_LABELS[view.value]);
+const LockView = asyncView(viewLoaders.lock);
+const GameListView = asyncView(viewLoaders.gamelist);
+const FrcView = asyncView(viewLoaders.frc);
+const MifisrView = asyncView(viewLoaders.mifisr);
+const NovatekView = asyncView(viewLoaders.novatek);
+const MivkView = asyncView(viewLoaders.mivk);
+const JsonEditorView = asyncView(viewLoaders.json);
+const HistoryView = asyncView(viewLoaders.history);
+const ImportExportView = asyncView(viewLoaders.importexport);
 
-const currentView = computed(() => {
+const VIEW_META: Record<ViewId, { title: string; desc: string }> = {
+  overview: { title: '概览', desc: '设备上的 Joyose 数据库状态、可用增强通路与备份入口。' },
+  lock: { title: '云控锁定', desc: '冻结 teg 云控版本，避免云端下发覆盖本地修改。' },
+  gamelist: { title: '游戏列表', desc: 'Joyose 依据这两个名单决定是否为某个应用应用游戏策略。' },
+  frc: { title: '高通 GPU', desc: '骁龙 8 Elite 机型的 AFME / FRC / FSR 通路（未实机验证）。' },
+  mifisr: { title: 'MIFISR 画质增强', desc: '小米 17 系列的插帧 + 超分配置，逐游戏维护。' },
+  novatek: { title: 'Novatek 独显', desc: '红米独显机型的 NT# 策略与温控参数。' },
+  mivk: { title: '渲染模块', desc: 'MIVK / MIGL 渲染 hook 的模块开关与等级。' },
+  json: { title: 'JSON 编辑', desc: '直接编辑云控参数树，适合排查与专家级调整。' },
+  history: { title: '编辑历史', desc: '每次提交产生一条增量记录，可随时回到任意节点。' },
+  importexport: { title: '导入 / 导出', desc: '把配置打包成 JSON，用于备份或跨设备迁移。' },
+};
+
+const version = __APP_VERSION__;
+
+// Collapse the sticky page header on mobile once the user scrolls: title bar
+// stays, description + action row fold away so the form gets the viewport.
+const scrolled = ref(false);
+let scrollTick = false;
+
+function onScroll(event: Event) {
+  const top = (event.target as HTMLElement).scrollTop;
+  if (scrollTick) return;
+  scrollTick = true;
+  requestAnimationFrame(() => {
+    scrollTick = false;
+    const next = top > 48;
+    if (next !== scrolled.value) scrolled.value = next;
+  });
+}
+
+interface NavItem {
+  id: ViewId;
+  label: string;
+  icon: string;
+  badge?: string;
+  badgeTone?: string;
+}
+
+const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
+  const main: NavItem[] = [
+    { id: 'overview', label: '概览', icon: 'overview', badge: state.stat ? `${pathsActive.value}/4` : undefined },
+    { id: 'lock', label: '云控锁定', icon: 'lock', badge: isLocked.value ? '已冻结' : undefined, badgeTone: 'warn' },
+    { id: 'gamelist', label: '游戏列表', icon: 'list', badge: gameListCount.value ? String(gameListCount.value) : undefined },
+  ];
+
+  const enhance: NavItem[] = [];
+  if (state.activeBackend === 'mifisr') {
+    enhance.push({ id: 'mifisr', label: 'MIFISR', icon: 'spark', badge: pathCount('mifisr') });
+  } else if (state.activeBackend === 'qualcomm') {
+    enhance.push({ id: 'frc', label: '高通 GPU', icon: 'cpu', badge: pathCount('qualcomm') });
+  } else if (state.activeBackend === 'novatek') {
+    enhance.push({ id: 'novatek', label: 'Novatek 独显', icon: 'monitor', badge: pathCount('novatek') });
+  }
+  enhance.push({ id: 'mivk', label: '渲染模块', icon: 'layers', badge: `${pathCount('mivk')}·${pathCount('migl')}` });
+
+  const other: NavItem[] = [
+    { id: 'json', label: 'JSON 编辑', icon: 'braces' },
+    { id: 'history', label: '编辑历史', icon: 'clock' },
+    { id: 'importexport', label: '导入 / 导出', icon: 'swap' },
+  ];
+
+  return [
+    { label: 'Dashboard', items: main },
+    { label: '画质增强', items: enhance },
+    { label: '工具', items: other },
+  ];
+});
+
+const meta = computed(() => VIEW_META[view.value]);
+
+const currentView = computed<Component>(() => {
   switch (view.value) {
     case 'overview': return OverviewView;
     case 'lock': return LockView;
@@ -194,8 +240,8 @@ const currentView = computed(() => {
   }
 });
 
-// If the user's selected view no longer matches the device's active backend
-// (e.g. they re-pulled from a different phone), bounce back to overview.
+// Bounce back to overview if the selected backend-specific editor no longer
+// matches the device (e.g. re-pulled from a different phone).
 watch(
   () => state.activeBackend,
   (backend) => {
@@ -205,14 +251,22 @@ watch(
   },
 );
 
-// On mobile, clicking any nav button should collapse the drawer.
 function onNavClick(event: Event) {
   const target = event.target as HTMLElement | null;
-  if (target?.closest('.nav-btn')) navOpen.value = false;
+  if (target?.closest('.nav-btn')) drawerOpen.value = false;
 }
 
 onMounted(async () => {
   await initialize();
+  // Warm the remaining view chunks while the device is idle so tab switches
+  // paint immediately instead of waiting on a 20–80 KB parse.
+  const idle = (window as any).requestIdleCallback ?? ((cb: any) => setTimeout(cb, 800));
+  idle(() => {
+    for (const [id, load] of Object.entries(viewLoaders)) {
+      if (id === view.value) continue;
+      load().catch(() => null);
+    }
+  });
 });
 
 const pathsActive = computed(() => state.paths.filter((p) => p.active).length);
@@ -227,21 +281,23 @@ const gameListCount = computed(() => {
 });
 
 function pathCount(id: string): string {
-  const p = state.paths.find((p) => p.id === id);
+  const p = state.paths.find((x) => x.id === id);
   return p ? String(p.count) : '—';
 }
 
+const themeIcon = computed(() => (theme.mode === 'auto' ? 'auto' : theme.mode === 'light' ? 'sun' : 'moon'));
 const themeLabel = computed(() => {
   if (theme.mode === 'auto') return `跟随系统 · ${theme.effective === 'light' ? '浅' : '深'}`;
   return theme.mode === 'light' ? '浅色' : '深色';
 });
-
-const themeTitle = computed(
-  () => `切换主题 (当前：${theme.mode})，点击循环 跟随系统 → 浅色 → 深色`,
-);
+const themeTitle = computed(() => `切换主题（当前：${theme.mode}），循环 跟随系统 → 浅色 → 深色`);
 
 function dismissError() {
   state.lastError = null;
+}
+
+async function retryConnect() {
+  await initialize();
 }
 
 async function handlePush() {
@@ -273,3 +329,168 @@ async function handleDiscard() {
   }
 }
 </script>
+
+<style scoped>
+.progress-line {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  height: 2px;
+  width: 100%;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--cyan), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  transition: opacity 0.2s ease;
+}
+
+.progress-line.on {
+  opacity: 1;
+  animation: slide 1.1s linear infinite;
+}
+
+@keyframes slide {
+  from {
+    background-position: -40% 0;
+  }
+
+  to {
+    background-position: 140% 0;
+  }
+}
+
+.commit-bar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(18px + var(--safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(560px, calc(100vw - 28px));
+  padding: 10px 12px 10px 16px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-line);
+  box-shadow: var(--shadow-medium);
+}
+
+.commit-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 4px rgba(247, 185, 85, 0.16);
+}
+
+.commit-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+
+.commit-text b {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.commit-text span {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commit-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.commit-enter-active,
+.commit-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.commit-enter-from,
+.commit-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 10px);
+}
+
+/* keep the floating commit bar from covering the last card */
+.main.has-pending .main-inner {
+  padding-bottom: 96px;
+}
+
+/* ---- disconnected state ---- */
+.app-empty {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: 24px;
+}
+
+.empty-card {
+  width: min(420px, 100%);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 24px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+}
+
+.empty-mark {
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-warn-bg);
+  border: 1px solid var(--surface-warn-border);
+  color: var(--warn);
+  margin-bottom: 4px;
+}
+
+.empty-mark :deep(svg) {
+  width: 24px;
+  height: 24px;
+}
+
+.empty-card h1 {
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.empty-card p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.empty-actions {
+  margin-top: 6px;
+}
+
+@media (max-width: 860px) {
+  .commit-bar {
+    bottom: calc(10px + var(--safe-area-inset-bottom, 0px));
+    padding: 9px 10px 9px 14px;
+  }
+
+  .commit-text span {
+    display: none;
+  }
+}
+</style>

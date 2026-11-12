@@ -1,17 +1,12 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>编辑历史 <small>每次提交都是一条新记录（git 风格增量）</small></h2>
-      <div class="hint">
-        历史保存在 <span class="mono">/data/adb/joyose-edit/history/</span>。每条记录只存本次
-        变更的增量 delta；"恢复到此提交之前/之后"会从当前内存状态反向走链路算出目标状态，
-        交给你决定是否提交到设备。回滚<strong>不会</strong>删除任何历史。
-      </div>
-      <div class="row" style="margin-top: var(--space-2)">
-        <button class="ghost" @click="refresh" :disabled="loading">刷新</button>
-        <button class="danger" @click="handleClear" :disabled="loading">清理旧历史（保留最近 N 条）</button>
-      </div>
-    </div>
+    <PageHeader title="编辑历史" kicker="git-style deltas"
+      desc="历史保存在 /data/adb/joyose-edit/history/，每条只记录本次变更的增量。恢复会从当前内存状态反向推算，回滚不会删除任何历史。">
+      <button class="ghost" @click="refresh" :disabled="loading">
+        <AppIcon name="refresh" /> 刷新
+      </button>
+      <button class="danger" @click="handleClear" :disabled="loading">清理旧历史</button>
+    </PageHeader>
 
     <div class="twopane">
       <div class="list">
@@ -62,7 +57,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onActivated, ref } from 'vue';
 import {
   listHistory,
   readHistory,
@@ -72,6 +67,8 @@ import {
 } from '@/state/session';
 import * as bridge from '@/root/bridge';
 import { toast } from '@/state/toast';
+import PageHeader from './PageHeader.vue';
+import AppIcon from './AppIcon.vue';
 import { dialog } from '@/state/dialog';
 import type { HistoryFileMeta, HistoryRecord } from '@/history/store';
 import { summarizeRecord } from '@/history/diff';
@@ -84,7 +81,9 @@ const detailLoading = ref(false);
 
 const diffEntries = computed(() => record.value?.delta ?? []);
 
-onMounted(() => refresh());
+// Views live inside <KeepAlive>, so refresh whenever the tab is re-entered —
+// a commit in another tab adds files that this list must pick up.
+onActivated(() => refresh());
 
 async function refresh() {
   loading.value = true;

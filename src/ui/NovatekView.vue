@@ -5,22 +5,22 @@
       <span class="hint">当前机型不走此后端，改动不会生效。Novatek 面板仅对带独显的机型有意义。</span>
     </div>
 
+    <PageHeader title="Novatek 独显" kicker="红米独显 · 未实机验证"
+      desc="仅适用于带独显（d1 / d2）的机型，典型为红米至尊版系列。本机若未下发相关键，本页会显示为空。">
+      <button class="ghost" @click="pasteImport">粘贴导入</button>
+      <button class="primary" @click="addBlank">+ 新建</button>
+    </PageHeader>
+
     <div class="panel">
-      <h2>红米独显 <small>未实机验证</small></h2>
-      <div class="hint">
-        仅适用于带独显（d1 / d2）的机型，典型为红米至尊版系列。本机若未下发相关键，本页会显示为空。
-      </div>
-      <div class="row">
-        <label class="row" style="gap: var(--space-1)">
-          <span class="hint">当前列表：</span>
+      <div class="row" style="justify-content: space-between">
+        <label class="row" style="gap: 6px">
+          <span class="label" style="margin: 0">列表</span>
           <select v-model="listKey">
             <option value="main">游戏中配置 ({{ counts.main }})</option>
             <option value="nonplay">非游戏配置 ({{ counts.nonplay }})</option>
           </select>
         </label>
-        <button class="primary" @click="addBlank">+ 新建</button>
-        <button class="ghost" @click="pasteImport">粘贴字符串导入</button>
-        <button class="ghost" @click="quickUnlockThermal">一键温控 95/93/93/91</button>
+        <button class="ghost sm" @click="quickUnlockThermal">一键温控 95/93/93/91</button>
       </div>
     </div>
 
@@ -91,6 +91,8 @@ import {
   blankNovatek,
   type NovatekParams,
 } from '@/parsers/novatek-string';
+import PageHeader from './PageHeader.vue';
+import { rafThrottle } from '@/utils/raf';
 import NovatekSegmentCard from './NovatekSegmentCard.vue';
 import PackageListEditor from './PackageListEditor.vue';
 import { toast } from '@/state/toast';
@@ -184,7 +186,7 @@ function displayPkg(s: string): string {
   return s.split('_', 1)[0];
 }
 
-function rewrite() {
+function rewriteNow() {
   if (!currentParsed.value) return;
   try {
     const serialized = serializeNovatek(currentParsed.value);
@@ -195,6 +197,11 @@ function rewrite() {
     console.warn('novatek serialize failed:', err);
   }
 }
+
+
+// Serialising on every keystroke re-created the array (watch source) and
+// re-rendered the selector; one write per frame is plenty.
+const rewrite = rafThrottle(rewriteNow);
 
 async function addBlank() {
   const pkg = await dialog.prompt('新条目的包名', {

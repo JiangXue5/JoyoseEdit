@@ -41,12 +41,12 @@ function resolveEffective(mode: ThemeMode): 'light' | 'dark' {
   return prefersLight() ? 'light' : 'dark';
 }
 
-// Keep values aligned with --bg-panel in main.css (dark #111c32 / light #ffffff).
+// Keep values aligned with --bg-panel in main.css (dark #101218 / light #ffffff).
 // The status bar behind .mobile-bar shows this color; syncing theme-color here
 // lets Android pick the right status-bar icon tint even when the user forces a
 // non-auto theme that diverges from the system's prefers-color-scheme.
 const THEME_COLOR_BY_EFFECTIVE: Record<'light' | 'dark', string> = {
-  dark: '#111c32',
+  dark: '#101218',
   light: '#ffffff',
 };
 

@@ -1,31 +1,24 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>JSON 编辑 <small>直接修改底层配置</small></h2>
-      <div class="row">
-        <label class="row" style="gap: var(--space-1)">
-          <span class="hint">目标</span>
-          <select v-model="target">
-            <option v-for="name in cloudConfigNames" :key="name" :value="'cc:' + name">
-              cloud_config.{{ name }}.params
-            </option>
-            <option v-for="mod in rulesModules" :key="mod" :value="'rule:' + mod">
-              teg_config.rules[{{ mod }}].rule_content
-            </option>
-          </select>
-        </label>
-        <button class="primary" @click="apply" :disabled="!editor || !isValidJson">应用到内存</button>
-        <button class="ghost" @click="reset">重置为最新值</button>
-      </div>
-    </div>
+    <PageHeader title="JSON 编辑" kicker="raw editor" desc="直接编辑云控参数树。应用后仅改动内存，需在底部提交条写入设备。">
+      <select v-model="target" aria-label="编辑目标">
+        <option v-for="name in cloudConfigNames" :key="name" :value="'cc:' + name">
+          cloud_config.{{ name }}.params
+        </option>
+        <option v-for="mod in rulesModules" :key="mod" :value="'rule:' + mod">
+          teg_config.rules[{{ mod }}].rule_content
+        </option>
+      </select>
+      <button class="ghost" @click="reset">重置</button>
+      <button class="primary" @click="apply" :disabled="!editor || !isValidJson">应用到内存</button>
+    </PageHeader>
 
-    <div class="panel">
+    <div class="panel editor-panel">
       <div class="cm-shell" ref="editorRoot" />
-      <div v-if="!isValidJson" class="tiny" style="color: var(--warn); margin-top: var(--space-2)">
-        ⚠ JSON 无法解析：{{ parseError }}
-      </div>
-      <div v-else class="hint" style="margin-top: var(--space-2)">
-        JSON 合法 · {{ codeLength }} 字符
+      <div class="editor-status">
+        <span v-if="!isValidJson" class="pill danger">JSON 无法解析：{{ parseError }}</span>
+        <span v-else class="pill ok">JSON 合法</span>
+        <span class="tiny faint">{{ codeLength }} 字符</span>
       </div>
     </div>
   </div>
@@ -35,6 +28,8 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import { state, markDirty } from '@/state/session';
 import { toast } from '@/state/toast';
+import { theme } from '@/state/theme';
+import PageHeader from './PageHeader.vue';
 // CodeMirror is the biggest single contributor to bundle size and is only
 // used in this view — defer all imports until the view actually mounts.
 import type { EditorView } from 'codemirror';
@@ -45,6 +40,9 @@ const editor = ref<EditorView | null>(null);
 const isValidJson = ref(true);
 const parseError = ref('');
 const codeLength = ref(0);
+// CodeMirror themes are set through a Compartment so switching the app theme
+// recolours the editor without destroying the document / cursor.
+let themeCompartment: any = null;
 
 const cloudConfigNames = computed(() => Object.keys(state.cloudConfig));
 const rulesModules = computed(() => Object.keys(state.rulesByModule));
@@ -79,20 +77,21 @@ function reset() {
 async function mountEditor() {
   await nextTick();
   if (!editorRoot.value || editor.value) return;
-  const [{ EditorView: EV, basicSetup }, { json }, { oneDark }, { EditorState }] =
+  const [{ EditorView: EV, basicSetup }, { json }, { oneDark }, { EditorState, Compartment }] =
     await Promise.all([
       import('codemirror'),
       import('@codemirror/lang-json'),
       import('@codemirror/theme-one-dark'),
       import('@codemirror/state'),
     ]);
+  themeCompartment = new Compartment();
   editor.value = new EV({
     state: EditorState.create({
       doc: currentText(),
       extensions: [
         basicSetup,
         json(),
-        oneDark,
+        themeCompartment.of(theme.effective === 'light' ? [] : oneDark),
         EV.updateListener.of((v) => {
           if (!v.docChanged) return;
           const text = v.state.doc.toString();
@@ -116,6 +115,17 @@ async function mountEditor() {
 watch(editorRoot, (el) => {
   if (el) mountEditor();
 });
+
+watch(
+  () => theme.effective,
+  async (effective) => {
+    if (!editor.value || !themeCompartment) return;
+    const { oneDark } = await import('@codemirror/theme-one-dark');
+    editor.value.dispatch({
+      effects: themeCompartment.reconfigure(effective === 'light' ? [] : oneDark),
+    });
+  },
+);
 
 onBeforeUnmount(() => {
   editor.value?.destroy();
@@ -147,3 +157,31 @@ function apply() {
   toast.success('已应用到内存', '使用顶部"提交到设备"按钮写入 DB');
 }
 </script>
+
+<style scoped>
+.editor-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.editor-panel .cm-shell {
+  border: none;
+  border-radius: 0;
+  height: min(62dvh, 620px);
+}
+
+.editor-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+@media (max-width: 860px) {
+  .editor-panel .cm-shell {
+    height: 58dvh;
+  }
+}
+</style>

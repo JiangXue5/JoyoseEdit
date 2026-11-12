@@ -96,10 +96,10 @@ export function detectPaths(booster: ParsedBoosterConfig): V3PathStatus[] {
     active: Boolean(novatekParams) || hasNtStrategy,
     count: novatekParams?.length ?? 0,
     note: novatekParams
-      ? `novatek_game_params: ${novatekParams.length} entries`
+      ? `novatek_game_params · ${novatekParams.length} 条`
       : hasNtStrategy
-        ? 'strategy references NT#* but no novatek_game_params'
-        : 'not downloaded — Novatek independent display not present',
+        ? 'strategy 引用了 NT#*，但没有 novatek_game_params'
+        : '云控未下发，本机无独显配置',
   });
 
   statuses.push({
@@ -107,10 +107,10 @@ export function detectPaths(booster: ParsedBoosterConfig): V3PathStatus[] {
     active: Boolean(frcParams) || hasQcomStrategy,
     count: frcParams?.length ?? 0,
     note: frcParams
-      ? `frc_game_params: ${frcParams.length} entries`
+      ? `frc_game_params · ${frcParams.length} 条`
       : hasQcomStrategy
-        ? 'strategy references AFME/FRC/FSR but no frc_game_params'
-        : 'no frc_game_params / fisr_config — ready to create entries',
+        ? 'strategy 引用了 AFME/FRC/FSR，但没有 frc_game_params'
+        : '未下发，可手动创建条目',
   });
 
   statuses.push({
@@ -118,12 +118,12 @@ export function detectPaths(booster: ParsedBoosterConfig): V3PathStatus[] {
     active: Boolean(mifisrEntries) || hasMifisrStrategy || mifisrSwitchOn,
     count: mifisrEntries?.length ?? 0,
     note: mifisrEntries
-      ? `customize_game_params.game_mifisr_config: ${mifisrEntries.length} entries`
+      ? `game_mifisr_config · ${mifisrEntries.length} 条`
       : hasMifisrStrategy
-        ? 'strategy references MIFISR but no customize_game_params'
+        ? 'strategy 引用了 MIFISR，但没有 customize_game_params'
         : mifisrSwitchOn
-          ? 'fisr_mqs_v2 is true — MIFISR-capable, awaiting entries'
-          : 'MIFISR not available on this device',
+          ? 'fisr_mqs_v2 已开启，等待条目'
+          : '本机不支持 MIFISR',
   });
 
   statuses.push({
@@ -131,8 +131,8 @@ export function detectPaths(booster: ParsedBoosterConfig): V3PathStatus[] {
     active: Array.isArray(mivkApps),
     count: Array.isArray(mivkApps) ? mivkApps.length : 0,
     note: Array.isArray(mivkApps)
-      ? `mivk_settings.app_params: ${mivkApps.length} entries`
-      : 'mivk_settings missing',
+      ? `mivk_settings.app_params · ${mivkApps.length} 条`
+      : '未下发 mivk_settings',
   });
 
   statuses.push({
@@ -140,8 +140,8 @@ export function detectPaths(booster: ParsedBoosterConfig): V3PathStatus[] {
     active: Array.isArray(miglGames),
     count: Array.isArray(miglGames) ? miglGames.length : 0,
     note: Array.isArray(miglGames)
-      ? `migl_settings.game_params: ${miglGames.length} entries`
-      : 'migl_settings missing',
+      ? `migl_settings.game_params · ${miglGames.length} 条`
+      : '未下发 migl_settings',
   });
 
   return statuses;

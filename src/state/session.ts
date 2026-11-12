@@ -86,7 +86,7 @@ export const isReady = computed(
 export async function initialize(): Promise<void> {
   if (!bridge.isKsuAvailable()) {
     state.lastError =
-      'KernelSU bridge unavailable — open this WebUI inside KernelSU Manager.';
+      '未检测到 KernelSU 环境，请在 KernelSU 管理器中打开本模块的 WebUI。';
     state.connected = false;
     return;
   }
@@ -173,14 +173,42 @@ function readIntoState(dbS: Database, dbT: Database) {
 }
 
 /** Mark a mutation to booster_config / common_config / rules as pending.
- * Called by the views after every in-memory edit. */
+ * Called by the views after every in-memory edit.
+ *
+ * Path re-detection used to run inline on every keystroke (each `input`
+ * event re-serialised the entry and rebuilt 5 status objects, invalidating
+ * the sidebar badges). It is now coalesced into one animation frame and
+ * skipped entirely when the result is unchanged, which removes the typing
+ * jank without changing observable behaviour. */
 export function markDirty(): void {
   state.dirty = true;
-  if (state.cloudConfig.booster_config) {
+  schedulePathRefresh();
+}
+
+let pathRefreshQueued = false;
+
+function schedulePathRefresh(): void {
+  if (pathRefreshQueued) return;
+  pathRefreshQueued = true;
+  const run = () => {
+    pathRefreshQueued = false;
+    if (!state.cloudConfig.booster_config) return;
     const booster = state.cloudConfig.booster_config.params ?? {};
-    state.paths = detectPaths(booster);
-    state.activeBackend = detectActiveBackend(booster);
+    const nextPaths = detectPaths(booster);
+    if (!samePaths(nextPaths, state.paths)) state.paths = nextPaths;
+    const nextBackend = detectActiveBackend(booster);
+    if (nextBackend !== state.activeBackend) state.activeBackend = nextBackend;
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else setTimeout(run, 0);
+}
+
+function samePaths(a: V3PathStatus[], b: V3PathStatus[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].active !== b[i].active || a[i].count !== b[i].count) return false;
   }
+  return true;
 }
 
 /** Synchronise teg_config.rules.rule_content for a given module from the

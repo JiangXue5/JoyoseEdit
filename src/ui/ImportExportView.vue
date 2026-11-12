@@ -1,12 +1,7 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>导入 / 导出云控 <small>跨设备分享配置</small></h2>
-      <div class="hint">
-        导出的是可读 JSON，适合备份到云盘或分享给同机型用户。导入后改动只加载到内存，
-        需再点顶栏「提交到设备」才会写入 DB，并自动在编辑历史里留一条记录。
-      </div>
-    </div>
+    <PageHeader title="导入 / 导出" kicker="portable JSON"
+      desc="导出可读 JSON，便于备份或分享给同机型用户。导入后只加载到内存，提交到设备时才写入 DB，并在编辑历史里留一条记录。" />
 
     <div class="panel">
       <h2>导出 <small>当前设备的配置</small></h2>
@@ -108,6 +103,7 @@
 import { computed, ref } from 'vue';
 import { state, markDirty } from '@/state/session';
 import { toast } from '@/state/toast';
+import PageHeader from './PageHeader.vue';
 import { dialog } from '@/state/dialog';
 import { diff, summarizeRecord } from '@/history/diff';
 import { snapshotFromMaps } from '@/history/store';

@@ -1,60 +1,68 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>冻结 Joyose 云控（推荐）</h2>
-      <div class="hint" style="margin-bottom: var(--space-3)">
-        Joyose 的游戏配置来自 MIUI 云控，大约每 13 分钟自动拉取一次并覆盖本地。
-        冻结后设备端将永远声称"已是最新版本"，云端不再下发任何规则，本模块改动可长期保留。
-      </div>
+    <PageHeader title="云控锁定" kicker="teg freeze"
+      desc="Joyose 的配置来自 MIUI 云控，约每 13 分钟拉取一次并覆盖本地。冻结后设备端永远声称「已是最新」，改动才能长期保留。">
+      <button class="ghost" @click="refresh" :disabled="busy">
+        <AppIcon name="refresh" /> 刷新状态
+      </button>
+    </PageHeader>
 
-      <div v-if="tegLoading" class="hint">正在读取云控状态…</div>
-      <div v-else-if="!tegState.exists" class="banner warn">
-        <strong>云控 SDK 尚未初始化</strong>
-        <span class="hint">先在顶栏点一次保存，Joyose 启动后再回来这里冻结即可。</span>
-      </div>
-      <div v-else>
-        <table class="table">
-          <tbody>
-            <tr>
-              <td>配置路径</td>
-              <td class="mono">{{ tegState.path }}</td>
-            </tr>
-            <tr>
-              <td>云控基准版本</td>
-              <td class="mono">
-                <span :class="tegState.frozen ? 'pill warn' : ''">{{ tegState.pref_local_max_version }}</span>
-              </td>
-            </tr>
-            <tr>
-              <td>当前状态</td>
-              <td>
-                <span v-if="tegState.frozen" class="pill warn">已冻结（云控永不覆盖）</span>
-                <span v-else class="hint">未冻结（云控会按正常周期覆盖）</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-
-        <div class="btn-row" style="margin-top: var(--space-3)">
-          <button v-if="!tegState.frozen" class="primary" @click="doFreeze" :disabled="busy">冻结云控</button>
-          <button v-else class="ghost" @click="doUnfreeze" :disabled="busy">解冻（恢复云控）</button>
-          <button class="ghost" @click="refresh" :disabled="busy">刷新状态</button>
+    <section class="panel freeze" :class="{ 'is-on': tegState.frozen }">
+      <div class="freeze-head">
+        <div class="freeze-mark">
+          <AppIcon name="shield" />
         </div>
-        <p class="hint" style="margin-top: var(--space-2)">
-          冻结 / 解冻会先停掉一次 Joyose 进程以刷新缓存。
-          <strong>副作用：</strong>冻结期间所有走 MIUI 云控的模块都不会更新，想恢复请点解冻。
-        </p>
+        <div class="freeze-text">
+          <div class="kpi-label">云控状态</div>
+          <h2 class="freeze-title">
+            {{ tegLoading ? '正在读取…' : tegState.frozen ? '已冻结 · 云端不会覆盖' : '未冻结 · 会按周期覆盖' }}
+          </h2>
+          <div class="hint">
+            {{ tegState.frozen
+              ? 'teg SDK 的本地版本被钉在最大值，云端下发的任何规则都会被丢弃。可随时解冻恢复云控。'
+              : '冻结会先停一次 Joyose 再改写 SharedPreferences 缓存，之后所有走 teg 的模块都会停止更新。' }}
+          </div>
+        </div>
+        <div class="freeze-action">
+          <button v-if="!tegState.exists" class="primary" disabled>等待 Joyose 初始化</button>
+          <button v-else-if="!tegState.frozen" class="primary" @click="doFreeze" :disabled="busy">
+            {{ busy ? '处理中…' : '冻结云控' }}
+          </button>
+          <button v-else @click="doUnfreeze" :disabled="busy">
+            {{ busy ? '处理中…' : '解冻（恢复云控）' }}
+          </button>
+        </div>
       </div>
-    </div>
 
-    <div class="panel">
-      <h2>DB 版本锁 <small>辅助手段</small></h2>
-      <div class="hint" style="margin-bottom: var(--space-3)">
-        把 DB 里的版本字段改为 2099 开头。<strong>实测有效的防覆盖方式是上面的冻结云控</strong>；
-        此处仅作辅助，便于观察 version 分布和应对少数旁路读取。
+      <div v-if="!tegLoading && !tegState.exists" class="banner warn" style="margin-top: 14px">
+        <strong>云控 SDK 尚未初始化</strong>
+        <span>先在概览页提交一次配置，或等 Joyose 启动后再回来冻结。</span>
       </div>
 
-      <table class="table">
+      <div v-else-if="tegState.exists" class="kpi-grid" style="margin-top: 14px">
+        <div class="kpi">
+          <span class="kpi-label">基准版本</span>
+          <span class="kpi-value sm mono">{{ tegState.pref_local_max_version ?? '—' }}</span>
+          <span class="kpi-sub">{{ tegState.frozen ? 'Long.MAX_VALUE' : '正常递增' }}</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">配置文件</span>
+          <span class="kpi-value sm mono">{{ shortPath(tegState.path) }}</span>
+          <span class="kpi-sub">com.xiaomi.joyose/shared_prefs</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>DB 版本锁 <small>辅助手段</small></h2>
+      </div>
+      <div class="hint">
+        把 DB 里的版本字段改成 <span class="mono">2099</span> 开头。真正防覆盖的是上面的冻结云控，
+        这里只作辅助：便于观察 version 分布，并应对少数旁路读取。
+      </div>
+
+      <table class="table" style="margin-top: var(--space-3)">
         <thead>
           <tr>
             <th>配置名</th>
@@ -67,17 +75,17 @@
         <tbody>
           <tr v-for="(cfg, name) in state.cloudConfig" :key="name">
             <td><strong class="mono">{{ name }}</strong></td>
-            <td class="mono">
-              <span :class="isLocked(cfg.meta.version) ? 'pill warn' : ''">
+            <td data-label="云控版本">
+              <span class="pill" :class="isLocked(cfg.meta.version) ? 'warn' : ''">
                 {{ cfg.meta.version ?? '—' }}
               </span>
             </td>
-            <td class="mono">{{ cfg.params?.header?.version ?? '—' }}</td>
-            <td class="mono">{{ ruleVersions(name) }}</td>
-            <td>
-              <button v-if="!isLocked(cfg.meta.version)" class="primary" @click="lock(String(name))"
+            <td class="mono muted" data-label="参数头版本">{{ cfg.params?.header?.version ?? '—' }}</td>
+            <td class="mono muted" data-label="规则版本">{{ ruleVersions(String(name)) }}</td>
+            <td class="num" data-label="操作">
+              <button v-if="!isLocked(cfg.meta.version)" class="primary sm" @click="lock(String(name))"
                 :disabled="state.loading">锁定</button>
-              <button v-else class="ghost" @click="unlock(String(name))" :disabled="state.loading">还原 version</button>
+              <button v-else class="ghost sm" @click="unlock(String(name))" :disabled="state.loading">还原</button>
             </td>
           </tr>
         </tbody>
@@ -88,28 +96,34 @@
         <button @click="bumpOnly" :disabled="state.loading">仅刷大版本（保留后 4 位）</button>
       </div>
       <p class="hint" style="margin-top: var(--space-2)">
-        "全部锁定" 会把所有配置的版本前 4 位改成 <strong>2099</strong>，保留后 4 位。
-        此操作仅在内存中生效，需在顶栏点保存提交到设备。
+        「全部锁定」会把所有配置的版本前 4 位改成 <strong>2099</strong>。仅在内存中生效，需在底部提交条写入设备。
       </p>
-    </div>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue';
+import { onActivated, reactive, ref } from 'vue';
 import { state, lockCloudVersion, unlockCloudVersion, markDirty } from '@/state/session';
 import { toast } from '@/state/toast';
 import * as bridge from '@/root/bridge';
+import PageHeader from './PageHeader.vue';
+import AppIcon from './AppIcon.vue';
 
 function isLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');
 }
 
-function ruleVersions(name: string | number): string {
-  const rows = state.rulesByModule[String(name)] ?? [];
+function ruleVersions(name: string): string {
+  const rows = state.rulesByModule[name] ?? [];
   if (rows.length === 0) return '（rules 表为空）';
   const vs = rows.map((r) => r.meta.rule_version).filter(Boolean);
   return vs.join(', ') || '—';
+}
+
+function shortPath(p?: string): string {
+  if (!p) return '—';
+  return p.split('/').slice(-2).join('/');
 }
 
 function lock(name: string) {
@@ -173,15 +187,94 @@ async function doUnfreeze() {
     await bridge.tegUnfreeze();
     toast.warn('云控已解冻', '下一次云控拉取可能覆盖本地改动');
     await refresh();
-  } catch (err) {
-    toast.error('解冻失败', (err as Error).message);
   } finally {
     busy.value = false;
   }
 }
 
-onMounted(() => {
+// Views are cached by <KeepAlive>; re-read the teg state each time the tab is
+// entered so a freeze/unfreeze done elsewhere is reflected immediately.
+onActivated(() => {
   if (state.connected) void refresh();
   else tegLoading.value = false;
 });
 </script>
+
+<style scoped>
+.freeze {
+  position: relative;
+  overflow: hidden;
+}
+
+.freeze.is-on {
+  border-color: var(--surface-ok-border);
+  background:
+    radial-gradient(120% 140% at 0% 0%, var(--surface-ok-bg), transparent 58%),
+    var(--bg-panel);
+}
+
+.freeze-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.freeze-mark {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 13px;
+  display: grid;
+  place-items: center;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.is-on .freeze-mark {
+  border-color: var(--surface-ok-border);
+  color: var(--ok);
+  background: var(--surface-ok-bg);
+}
+
+.freeze-mark :deep(svg) {
+  width: 22px;
+  height: 22px;
+}
+
+.freeze-text {
+  flex: 1;
+  min-width: 200px;
+}
+
+.freeze-title {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  margin: 2px 0 4px;
+}
+
+.is-on .freeze-title {
+  color: var(--ok);
+}
+
+.freeze-action {
+  flex: none;
+  align-self: center;
+}
+
+@media (max-width: 860px) {
+  .freeze-title {
+    font-size: 15px;
+  }
+
+  .freeze-action {
+    width: 100%;
+  }
+
+  .freeze-action button {
+    width: 100%;
+  }
+}
+</style>

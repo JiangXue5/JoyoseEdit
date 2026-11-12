@@ -1,13 +1,7 @@
 <template>
   <div class="stack">
-    <div class="panel">
-      <h2>游戏列表 <small>纳入优化 / 支持</small></h2>
-      <div class="hint">
-        Joyose 根据这两个列表决定是否应用游戏策略。
-        <span class="mono">game_list</span>：正式纳入优化；
-        <span class="mono">support_app</span>：更宽泛的支持列表。
-      </div>
-    </div>
+    <PageHeader title="游戏列表" kicker="game_list / support_app"
+      desc="Joyose 依据这两个名单决定是否为某个应用应用游戏策略。game_list 为正式纳入优化，support_app 是更宽泛的支持列表。" />
 
     <div class="grid-2">
       <PackageListEditor title="game_list" :packages="gameList" @update="(v: string[]) => update('game_list', v)" />
@@ -20,6 +14,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { state, markDirty } from '@/state/session';
+import PageHeader from './PageHeader.vue';
 import PackageListEditor from './PackageListEditor.vue';
 
 const gameList = computed<string[]>(() => {
