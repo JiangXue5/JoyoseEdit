@@ -109,6 +109,20 @@ export async function stat(): Promise<StatResult> {
   return JSON.parse(out);
 }
 
+export interface DigestResult {
+  ok: true;
+  /** sha256 of the DB file, or null when it does not exist. */
+  smartp: string | null;
+  teg: string | null;
+}
+
+/** Content digest of both DBs, used as the conflict-detection baseline.
+ * mtime has one-second resolution and size rarely moves for an in-place JSON
+ * edit, so a stat-based fingerprint misses same-second rewrites. */
+export async function digest(): Promise<DigestResult> {
+  return JSON.parse(await runKsu(`sh ${HELPER} digest`));
+}
+
 export async function pull(which: DbSelector): Promise<Uint8Array> {
   assertSelector(which);
   const out = await runKsu(`sh ${HELPER} pull ${which}`);

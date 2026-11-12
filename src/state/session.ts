@@ -125,13 +125,8 @@ export async function pullAll(): Promise<void> {
       closeDb(dbT);
     }
 
-    // set baseline fingerprint
-    if (state.stat?.smartp.exists) {
-      state.baselineSmartp = fingerprint(state.stat.smartp.mtime ?? 0, state.stat.smartp.size ?? 0);
-    }
-    if (state.stat?.teg.exists) {
-      state.baselineTeg = fingerprint(state.stat.teg.mtime ?? 0, state.stat.teg.size ?? 0);
-    }
+    // set baseline digest
+    await refreshBaseline();
     state.pristineSnapshot = snapshotFromMaps({
       cloudConfig: state.cloudConfig,
       rulesByModule: state.rulesByModule,
@@ -282,8 +277,26 @@ function rewriteYear(version: number): number {
 export interface PushOptions {
   note?: string;
   source?: HistorySource;
-  /** If true, ignore the baseline fingerprint mismatch and overwrite. */
+  /** If true, ignore the baseline digest mismatch and overwrite. */
   force?: boolean;
+}
+
+/** Re-read the DB digests and store them as the conflict-detection baseline. */
+export async function refreshBaseline(): Promise<void> {
+  try {
+    const d = await bridge.digest();
+    state.baselineSmartp = d.smartp;
+    state.baselineTeg = d.teg;
+  } catch {
+    // Helper too old for `digest` (module not updated yet) — degrade to the
+    // coarse stat fingerprint rather than dropping conflict detection.
+    const s = await bridge.stat().catch(() => null);
+    if (!s) return;
+    state.baselineSmartp = s.smartp.exists
+      ? fingerprint(s.smartp.mtime ?? 0, s.smartp.size ?? 0)
+      : null;
+    state.baselineTeg = s.teg.exists ? fingerprint(s.teg.mtime ?? 0, s.teg.size ?? 0) : null;
+  }
 }
 
 /** Commit the in-memory edits: build history record, write both DBs, save
@@ -292,20 +305,17 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
   state.loading = true;
   try {
     if (!opts.force) {
-      const fresh = await bridge.stat();
-      if (state.baselineSmartp) {
-        const fp = fingerprint(fresh.smartp.mtime ?? 0, fresh.smartp.size ?? 0);
-        if (fp !== state.baselineSmartp) {
-          throw new Error(
-            `SmartP.db changed on disk since pull (fingerprint ${fp} vs ${state.baselineSmartp}). Pass { force: true } to overwrite.`,
-          );
-        }
-      }
-      if (state.baselineTeg) {
-        const fp = fingerprint(fresh.teg.mtime ?? 0, fresh.teg.size ?? 0);
-        if (fp !== state.baselineTeg) {
-          throw new Error(`teg_config.db changed on disk since pull (fingerprint ${fp} vs ${state.baselineTeg}).`);
-        }
+      const fresh = await bridge.digest().catch(() => null);
+      const check = (label: string, baseline: string | null, current: string | null) => {
+        if (!baseline || !current || baseline === current) return;
+        throw new Error(
+          `${label} 在拉取后被改动过（${current.slice(0, 12)} ≠ ${baseline.slice(0, 12)}）。` +
+            `请重新拉取，或强制覆盖。`,
+        );
+      };
+      if (fresh) {
+        check('SmartP.db', state.baselineSmartp, fresh.smartp);
+        check('teg_config.db', state.baselineTeg, fresh.teg);
       }
     }
 
@@ -398,12 +408,7 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     state.pristineSnapshot = recordAfter;
     state.dirty = false;
     await refreshStat();
-    if (state.stat?.smartp.exists) {
-      state.baselineSmartp = fingerprint(state.stat.smartp.mtime ?? 0, state.stat.smartp.size ?? 0);
-    }
-    if (state.stat?.teg.exists) {
-      state.baselineTeg = fingerprint(state.stat.teg.mtime ?? 0, state.stat.teg.size ?? 0);
-    }
+    await refreshBaseline();
     return fname;
   } finally {
     state.loading = false;

@@ -5,6 +5,7 @@
 #
 # Subcommands:
 #   stat                           prints schema/version fingerprints as JSON
+#   digest                         prints sha256 of both DBs (conflict detection)
 #   pull smartp|teg                emits base64 of the DB file
 #   push smartp|teg <b64>          decodes <b64> and writes back atomically
 #   backup [label]                 snapshot both DBs into /data/adb/joyose-edit/backup/<epoch>[-label]/
@@ -153,6 +154,25 @@ cmd_pull() {
   # base64 -w0 — single line so the WebUI can slurp it directly.
   base64 -w0 "$target"
   echo
+}
+
+# Content digest of both DBs. mtime has one-second resolution and size barely
+# moves when a JSON blob is edited in place, so "mtime#size" cannot tell two
+# edits apart — two commits in the same second, or a cloud push that rewrote
+# an equally long payload, both slipped past the conflict check.
+cmd_digest() {
+  local key f d
+  printf '{"ok":true'
+  for key in smartp teg; do
+    f=$(resolve_db "$key")
+    if [ -f "$f" ]; then
+      d=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+      printf ',"%s":"%s"' "$key" "${d:-}"
+    else
+      printf ',"%s":null' "$key"
+    fi
+  done
+  printf '}\n'
 }
 
 cmd_push() {
@@ -427,6 +447,7 @@ shift
 
 case "$cmd" in
   stat)           cmd_stat ;;
+  digest)         cmd_digest ;;
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
   backup)         cmd_backup "${1:-}" ;;
