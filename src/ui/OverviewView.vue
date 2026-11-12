@@ -80,7 +80,7 @@
     <!-- cloud config versions -->
     <section class="panel">
       <div class="panel-header">
-        <h2>云控配置 <small>版本与锁定状态</small></h2>
+        <h2>云控配置 <small>版本与来源</small></h2>
         <button class="ghost sm" @click="goLock">管理</button>
       </div>
       <div class="data-list">
@@ -88,13 +88,85 @@
           <div class="data-main">
             <strong class="mono">{{ name }}</strong>
             <span class="pill" :class="isVersionLocked(cfg.meta.version) ? 'warn' : ''">
-              {{ cfg.meta.version ?? '—' }}
+              {{ currentLabel(cfg) }}
             </span>
+            <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
           </div>
           <div class="data-note mono">
-            参数头 {{ cfg.params?.header?.version ?? '—' }} · 规则 {{ ruleVersions(String(name)) }}
+            <span>{{ sourceLine('SmartP', smartpHeaderVersion(String(name)), cfg.meta?.source) }}</span>
+            <span>{{ sourceLine('teg', tegHeaderVersion(String(name)), cfg.meta?.source) }}</span>
+            <span v-if="!cfg.meta?.fromTeg">规则 {{ ruleVersions(String(name)) }}</span>
           </div>
         </div>
+        <div v-if="Object.keys(state.cloudConfig).length === 0" class="hint" style="padding: 8px 0">
+          两个数据库里都没有 cloud_config 行。先在 Joyose 里联网下发一次云控，或到「JSON 编辑」写入。
+        </div>
+      </div>
+    </section>
+
+    <!-- source & write policy -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>来源与写入 <small>全局生效</small></h2>
+      </div>
+      <div class="hint">
+        同一份云控在 SmartP.db 与 teg_config.db 各有一份，官方更新时两边版本可能不同步。
+        「自动」读取版本号较新的一份；<strong>改动仍按下面的写入目标落盘</strong>。
+      </div>
+
+      <div class="policy-list">
+        <div v-if="cfgPresent('booster_config')" class="policy-row">
+          <div class="policy-label">
+            <strong>booster_config</strong>
+            <span class="tiny faint">插帧 / 独显 / 帧率</span>
+          </div>
+          <select v-if="canChooseSource('booster_config')" v-model="boosterPref" @change="onBoosterSource">
+            <option v-for="opt in sourceOptions('booster_config')" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+          <span v-else class="hint mono">{{ singleSourceLabel('booster_config') }}</span>
+        </div>
+
+        <div v-if="cfgPresent('common_config')" class="policy-row">
+          <div class="policy-label">
+            <strong>common_config</strong>
+            <span class="tiny faint">游戏名单 / 通用开关</span>
+          </div>
+          <select v-if="canChooseSource('common_config')" v-model="commonPref" @change="onCommonSource">
+            <option v-for="opt in sourceOptions('common_config')" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+          <span v-else class="hint mono">{{ singleSourceLabel('common_config') }}</span>
+        </div>
+
+        <div v-if="showDataSource" class="policy-row">
+          <div class="policy-label">
+            <strong>数据源策略</strong>
+            <span class="tiny faint">SmartP 缺少该配置时</span>
+          </div>
+          <div class="radio-row">
+            <label><input type="radio" value="smartp" :checked="dataSource === 'smartp'"
+              @change="onDataSource('smartp')" /> 仅 SmartP</label>
+            <label><input type="radio" value="teg-fallback" :checked="dataSource === 'teg-fallback'"
+              @change="onDataSource('teg-fallback')" /> 允许 teg 兜底</label>
+          </div>
+        </div>
+
+        <div class="policy-row">
+          <div class="policy-label">
+            <strong>写入目标</strong>
+            <span class="tiny faint">提交时写哪一份</span>
+          </div>
+          <select v-model="writeTarget" @change="onWriteTargetChange">
+            <option v-for="(label, v) in WRITE_TARGET_LABELS" :key="v" :value="v">{{ label }}</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint" style="margin-top: 10px">
+        写入目标对所有页面生效（结构化编辑、云控锁定、去锁帧、温度解锁）。全新安装会回到默认「同时写」，
+        升级则保留你的选择。
       </div>
     </section>
 
@@ -138,8 +210,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { state, pullAll, refreshStat, recordBackupCheckpoint } from '@/state/session';
+import {
+  getBoosterSourcePref,
+  setBoosterSourcePref,
+  getCommonSourcePref,
+  setCommonSourcePref,
+  getDataSourcePref,
+  setDataSourcePref,
+  getWriteTarget,
+  setWriteTarget,
+  PREF_LABELS,
+  WRITE_TARGET_LABELS,
+  type BoosterSourcePref,
+  type DataSourcePref,
+  type WriteTarget,
+} from '@/state/source';
 import { navigate } from '@/state/nav';
 import { toast } from '@/state/toast';
 import { dialog } from '@/state/dialog';
@@ -148,6 +235,120 @@ import PageHeader from './PageHeader.vue';
 import AppIcon from './AppIcon.vue';
 
 const activePaths = computed(() => state.paths.filter((p) => p.active).length);
+
+// ---- source / write policy -------------------------------------------------
+
+const boosterPref = ref<BoosterSourcePref>(getBoosterSourcePref());
+const commonPref = ref<BoosterSourcePref>(getCommonSourcePref());
+const writeTarget = ref<WriteTarget>(getWriteTarget());
+const dataSource = ref<DataSourcePref>(getDataSourcePref());
+
+function cfgPresent(name: string): boolean {
+  return !!state.cloudConfig[name];
+}
+
+function smartpHas(name: string): boolean {
+  return !!state.smartpRaw[name];
+}
+
+function tegHas(name: string): boolean {
+  return (state.rulesByModule[name]?.length ?? 0) > 0;
+}
+
+/** A choice only exists when both sides carry the config. */
+function canChooseSource(name: string): boolean {
+  return smartpHas(name) && tegHas(name);
+}
+
+function singleSourceLabel(name: string): string {
+  if (smartpHas(name)) return '仅 SmartP.db 有此配置（无从选择）';
+  if (tegHas(name)) return '仅 teg_config.db 有此配置（无从选择）';
+  return '两库均无';
+}
+
+function sourceOptions(name: string): { value: BoosterSourcePref; label: string }[] {
+  const opts: BoosterSourcePref[] = [];
+  if (smartpHas(name)) opts.push('smartp');
+  if (tegHas(name)) opts.push('teg');
+  if (opts.length > 1) opts.unshift('auto');
+  return opts.map((v) => ({ value: v, label: PREF_LABELS[v] }));
+}
+
+/** Header version embedded in SmartP's params (the original source of truth). */
+function smartpHeaderVersion(name: string): string {
+  const v = state.smartpRaw[name]?.header?.version;
+  return typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '';
+}
+
+/** Header version of the newest teg envelope (by envelope.version). */
+function tegHeaderVersion(name: string): string {
+  const rows = state.rulesByModule[name] ?? [];
+  let best: any = null;
+  let bestV = 0;
+  for (const r of rows) {
+    const env = r?.content;
+    if (!env || typeof env !== 'object' || Array.isArray(env)) continue;
+    const v = Number((env as any).version ?? 0);
+    if (v > bestV) {
+      bestV = v;
+      best = env;
+    }
+  }
+  if (!best && rows.length) {
+    const e = rows[0]?.content;
+    best = e && typeof e === 'object' && !Array.isArray(e) ? e : null;
+  }
+  const h = best?.params?.header?.version;
+  return typeof h === 'string' ? h : typeof h === 'number' ? String(h) : '';
+}
+
+function sourceLine(label: string, version: string, current?: string): string {
+  const mark = current === label.toLowerCase() ? ' ← 当前' : '';
+  return `${label} ${version || '—'}${mark}`;
+}
+
+function currentLabel(cfg: any): string {
+  if (cfg.meta?.empty) return '（空）';
+  const v = Number(cfg.meta?.version ?? 0);
+  return v > 0 ? String(v) : '—';
+}
+
+const showDataSource = computed(
+  () =>
+    (!smartpHas('booster_config') && tegHas('booster_config')) ||
+    (!smartpHas('common_config') && tegHas('common_config')),
+);
+
+async function onBoosterSource() {
+  setBoosterSourcePref(boosterPref.value);
+  await applyPull(PREF_LABELS[boosterPref.value]);
+}
+
+async function onCommonSource() {
+  setCommonSourcePref(commonPref.value);
+  await applyPull(PREF_LABELS[commonPref.value]);
+}
+
+async function applyPull(label: string) {
+  try {
+    await pullAll();
+    toast.info('已切换来源并重新拉取', label);
+  } catch (err) {
+    toast.fromError(err, '切换失败');
+  }
+}
+
+async function onDataSource(v: DataSourcePref) {
+  if (dataSource.value === v) return;
+  dataSource.value = v;
+  setDataSourcePref(v);
+  await applyPull(v === 'teg-fallback' ? '允许 teg 兜底' : '仅 SmartP');
+}
+
+function onWriteTargetChange() {
+  setWriteTarget(writeTarget.value);
+  toast.info('写入目标已更新', WRITE_TARGET_LABELS[writeTarget.value]);
+}
 const isLocked = computed(() => {
   const v = state.cloudConfig.booster_config?.meta.version;
   return typeof v === 'number' && String(v).startsWith('2099');
@@ -292,6 +493,59 @@ async function handleRevertLatest() {
 </script>
 
 <style scoped>
+.policy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.policy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.policy-row:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.policy-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+}
+
+.policy-label strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.policy-row select {
+  min-width: 220px;
+  max-width: 100%;
+}
+
+.radio-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.radio-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
 .danger-text {
   color: var(--danger);
 }
