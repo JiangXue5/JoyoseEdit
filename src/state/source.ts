@@ -12,7 +12,8 @@
 //
 // Choice policy:
 //   · common_config defaults to SmartP.db — its teg mirror is frequently
-//     stub / incomplete, so the user must opt into teg explicitly.
+//     stub / incomplete, so the user must opt into teg explicitly. `auto` is
+//     still selectable; on equal versions it resolves to SmartP.
 //   · booster_config follows a user preference:
 //       auto   -> the side with the higher envelope.version wins
 //       smartp -> always SmartP.db
@@ -171,9 +172,12 @@ export function setBoosterSourcePref(v: BoosterSourcePref): void {
 // ----- common_config source (independent from booster_config) -----------------
 
 /** Defaults to SmartP.db — the teg mirror of common_config is frequently
- *  stub/incomplete, so the user must opt into teg explicitly. */
+ *  stub/incomplete, so the user must opt into teg explicitly. `auto` is a valid
+ *  choice too: it compares envelope.version and still lands on SmartP on a tie
+ *  (see pickBoosterParams). Not allowing it here meant the picker wrote
+ *  "auto" to disk but every later boot silently read it back as SmartP. */
 export function getCommonSourcePref(): BoosterSourcePref {
-  return readPref(COMMON_KEY, ['smartp', 'teg'] as const, 'smartp');
+  return readPref(COMMON_KEY, ['auto', 'smartp', 'teg'] as const, 'smartp');
 }
 
 export function setCommonSourcePref(v: BoosterSourcePref): void {
@@ -239,7 +243,7 @@ export function resetAllPrefs(): void {
 export const PREF_LABELS: Record<BoosterSourcePref, string> = {
   auto: '自动（版本较新者优先）',
   smartp: 'SmartP.db（cloud_config）',
-  teg: 'teg_config.db（rules 最新）',
+  teg: 'teg_config.db（rules）',
 };
 
 export const WRITE_TARGET_LABELS: Record<WriteTarget, string> = {

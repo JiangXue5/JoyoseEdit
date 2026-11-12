@@ -1440,6 +1440,14 @@ async function runPrefsTest() {
       return 'cache keeps teg / teg';
     });
 
+    await check('prefs: common source accepts the auto (version compare) mode', () => {
+      // Regression: the getter only allowed smartp/teg, so selecting "自动"
+      // wrote the value and then read it back as SmartP on the next boot.
+      setCommonSourcePref('auto');
+      if (getCommonSourcePref() !== 'auto') throw new Error('common auto not applied');
+      return 'auto';
+    });
+
     await check('prefs: every write also mirrors into localStorage', () => {
       setWriteTarget('smartp');
       if (store.get('joyose-edit.writeTarget') !== 'smartp') {

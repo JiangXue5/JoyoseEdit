@@ -90,8 +90,8 @@
             <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
           </div>
           <div class="data-note mono source-note">
-            <span>{{ sourceLine('SmartP', smartpHeaderVersion(String(name)), cfg.meta?.source) }}</span>
-            <span>{{ sourceLine('teg', tegHeaderVersion(String(name)), cfg.meta?.source) }}</span>
+            <span>{{ sourceLine('SmartP', sourceVersion(String(name), 'smartp'), cfg.meta?.source) }}</span>
+            <span>{{ sourceLine('teg', sourceVersion(String(name), 'teg'), cfg.meta?.source) }}</span>
             <span v-if="!cfg.meta?.empty">规则 {{ ruleVersions(String(name)) }}</span>
           </div>
         </div>
@@ -270,40 +270,38 @@ function sourceOptions(name: string): { value: BoosterSourcePref; label: string 
   if (smartpHas(name)) opts.push('smartp');
   if (tegHas(name)) opts.push('teg');
   if (opts.length > 1) opts.unshift('auto');
-  return opts.map((v) => ({ value: v, label: PREF_LABELS[v] }));
+  return opts.map((v) => ({ value: v, label: sourceOptionLabel(name, v) }));
 }
 
-/** Header version embedded in SmartP's params (the original source of truth). */
-function smartpHeaderVersion(name: string): string {
-  const v = state.smartpRaw[name]?.header?.version;
-  return typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '';
+/** The two numbers auto compares: SmartP's cloud_config.version column vs the
+ *  highest envelope.version among the teg rows. */
+function sourceVersion(name: string, side: 'smartp' | 'teg'): number {
+  const meta = state.cloudConfig[name]?.meta as any;
+  if (!meta) return 0;
+  return side === 'smartp' ? Number(meta.smartpVersion ?? 0) : Number(meta.tegVersion ?? 0);
 }
 
-/** Header version of the newest teg envelope (by envelope.version). */
-function tegHeaderVersion(name: string): string {
-  const rows = state.rulesByModule[name] ?? [];
-  let best: any = null;
-  let bestV = 0;
-  for (const r of rows) {
-    const env = r?.content;
-    if (!env || typeof env !== 'object' || Array.isArray(env)) continue;
-    const v = Number((env as any).version ?? 0);
-    if (v > bestV) {
-      bestV = v;
-      best = env;
-    }
-  }
-  if (!best && rows.length) {
-    const e = rows[0]?.content;
-    best = e && typeof e === 'object' && !Array.isArray(e) ? e : null;
-  }
-  const h = best?.params?.header?.version;
-  return typeof h === 'string' ? h : typeof h === 'number' ? String(h) : '';
+/** Concrete choices show the comparable version, and the newer side gets the
+ *  mark. The old static "rules 最新" label read like a claim about which file
+ *  was fresher — that is precisely what auto compares, and it was wrong
+ *  whenever SmartP had the newer version. */
+function sourceOptionLabel(name: string, v: BoosterSourcePref): string {
+  if (v === 'auto') return PREF_LABELS.auto;
+  const own = sourceVersion(name, v);
+  const other = sourceVersion(name, v === 'smartp' ? 'teg' : 'smartp');
+  const base = v === 'smartp' ? 'SmartP.db' : 'teg_config.db';
+  const version = own > 0 ? ` · ${own}` : '';
+  const mark = own > 0 && other > 0 && own > other ? '（较新）' : '';
+  return `${base}${version}${mark}`;
 }
 
-function sourceLine(label: string, version: string, current?: string): string {
+/** Version shown next to each side: the same comparable numbers auto uses
+ *  (SmartP's version column / the highest teg envelope.version). The params'
+ *  own header.version can lag behind them, which made the "← 当前" line look
+ *  like it disagreed with the picker. */
+function sourceLine(label: string, version: number, current?: string): string {
   const mark = current === label.toLowerCase() ? ' ← 当前' : '';
-  return `${label} ${version || '—'}${mark}`;
+  return `${label} ${version > 0 ? version : '—'}${mark}`;
 }
 
 function currentLabel(cfg: any): string {
@@ -418,14 +416,12 @@ function ruleVersions(name: string): string {
   const rows = state.rulesByModule[name] ?? [];
   if (rows.length === 0) return '（空）';
   const seen = new Set<number>();
-  const vs: string[] = [];
   for (const r of rows) {
     const v = Number((r.content as any)?.version ?? 0);
-    if (!v || seen.has(v)) continue;
-    seen.add(v);
-    vs.push(String(v));
+    if (v > 0) seen.add(v);
   }
-  return vs.join(' · ') || '（空）';
+  // Newest first, so the row auto would pick reads from the left.
+  return [...seen].sort((a, b) => b - a).join(' · ') || '（空）';
 }
 
 function formatSize(bytes?: number): string {
