@@ -7,6 +7,9 @@
       <button class="primary" @click="handleBackup" :disabled="state.loading">
         <AppIcon name="db" /> 立即备份
       </button>
+      <button class="ghost danger-text" @click="handleResetCloud" :disabled="state.loading">
+        <AppIcon name="warn" /> 重置云控
+      </button>
     </PageHeader>
 
     <!-- device spotlight -->
@@ -90,6 +93,28 @@
           </div>
           <div class="data-note mono">
             参数头 {{ cfg.params?.header?.version ?? '—' }} · 规则 {{ ruleVersions(String(name)) }}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- maintenance -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>维护 <small>破坏性操作</small></h2>
+      </div>
+      <div class="data-list">
+        <div class="data-row">
+          <div class="data-main">
+            <strong>重置云控数据</strong>
+            <span class="pill danger">会清空 Joyose 数据</span>
+          </div>
+          <button class="ghost sm danger-text" @click="handleResetCloud" :disabled="state.loading">
+            执行
+          </button>
+          <div class="data-note">
+            清除 com.xiaomi.joyose 的全部应用数据，再唤醒它的云端服务重新下发。
+            本模块的备份 / 历史不受影响，但 Joyose 自身的所有设置（包括你在别处改过的项）都会丢失。
           </div>
         </div>
       </div>
@@ -194,6 +219,35 @@ function goLock() {
   navigate('lock');
 }
 
+/** Destructive: wipes Joyose app data. Requires two confirmations because the
+ *  only way back is a re-download (and a reboot on some ROMs). */
+async function handleResetCloud() {
+  const ok = await dialog.confirm('重置 Joyose 云控数据？', {
+    detail:
+      '会执行 pm clear com.xiaomi.joyose：Joyose 的全部应用数据被清空，随后尝试重新获取云控。' +
+      '请确保当前处于联网状态（建议 Wi-Fi），否则可能取不到新云控。本模块的备份与历史不受影响。',
+    okText: '继续',
+    cancelText: '取消',
+    destructive: true,
+  });
+  if (!ok) return;
+  const sure = await dialog.confirm('最后确认：清空 Joyose 数据', {
+    detail: '此操作不可撤销。若只是想恢复本模块改过的配置，请改用「回滚到最近备份」。',
+    okText: '确认清空',
+    cancelText: '取消',
+    destructive: true,
+  });
+  if (!sure) return;
+  try {
+    await bridge.resetCloud();
+    toast.warn('已重置云控', 'Joyose 数据已清空，等待其重新下载；必要时重启设备');
+    await refreshStat();
+    await pullAll();
+  } catch (err) {
+    toast.fromError(err, '重置失败');
+  }
+}
+
 async function handleRefresh() {
   await refreshStat();
   await pullAll();
@@ -238,6 +292,14 @@ async function handleRevertLatest() {
 </script>
 
 <style scoped>
+.danger-text {
+  color: var(--danger);
+}
+
+.danger-text:hover {
+  border-color: var(--danger);
+}
+
 .hero {
   background:
     radial-gradient(120% 140% at 0% 0%, var(--accent-soft), transparent 55%),

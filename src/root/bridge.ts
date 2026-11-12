@@ -121,6 +121,13 @@ export async function moduleInstallTs(): Promise<string> {
   }
 }
 
+/** Wipe Joyose's app data and wake its cloud services so the config is
+ *  re-downloaded. Destructive: every local Joyose setting goes with it, so the
+ *  caller must confirm first. */
+export async function resetCloud(): Promise<void> {
+  await runKsu(`sh ${HELPER} reset-cloud`);
+}
+
 export interface DigestResult {
   ok: true;
   /** sha256 of the DB file, or null when it does not exist. */

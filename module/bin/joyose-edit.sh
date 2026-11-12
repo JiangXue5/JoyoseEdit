@@ -8,6 +8,8 @@
 #   digest                         prints sha256 of both DBs (conflict detection)
 #   install-ts                     timestamp of the last fresh install ("" when none)
 #   save-dl-from-stage <name> <st> decode a staged blob into /sdcard/Download/joyose-edit/<name>
+#   reset-cloud                    pm clear com.xiaomi.joyose + wake its cloud services
+#                                  (DESTRUCTIVE: every Joyose setting is wiped)
 #   pull smartp|teg                emits base64 of the DB file
 #   push smartp|teg <b64>          decodes <b64> and writes back atomically
 #   backup [label]                 snapshot both DBs into /data/adb/joyose-edit/backup/<epoch>[-label]/
@@ -505,6 +507,22 @@ cmd_save_dl_from_stage() {
   printf '{"ok":true,"path":"%s"}\n' "$f"
 }
 
+# Reset Joyose's cloud state: wipe app data so the next launch re-downloads
+# everything, then wake the cloud service / receivers so it happens promptly
+# instead of on the next 13-minute tick. Destructive by design — the WebUI
+# gates this behind an explicit confirmation.
+cmd_reset_cloud() {
+  pm clear "$PKG" >/dev/null 2>&1 || true
+  am force-stop "$PKG" >/dev/null 2>&1 || true
+  pm enable "$PKG/com.xiaomi.joyose.smartop.SmartOpService" >/dev/null 2>&1 || true
+  pm enable "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || true
+  am broadcast -a android.intent.action.BOOT_COMPLETED -p "$PKG" >/dev/null 2>&1 || true
+  am broadcast "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || true
+  am broadcast "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || true
+  am broadcast -a android.intent.action.BOOT_COMPLETED -n "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || true
+  printf 'ok'
+}
+
 cmd_install_ts() {
   local f=/data/adb/modules/joyose-edit/.install_ts
   if [ -f "$f" ]; then cat "$f"; else printf '0'; fi
@@ -520,6 +538,7 @@ case "$cmd" in
   digest)         cmd_digest ;;
   install-ts)     cmd_install_ts ;;
   save-dl-from-stage) cmd_save_dl_from_stage "${1:?}" "${2:?}" ;;
+  reset-cloud)    cmd_reset_cloud ;;
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
   backup)         cmd_backup "${1:-}" ;;
