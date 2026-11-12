@@ -4,7 +4,6 @@
 // get written back via the root bridge.
 
 import type { Database, SqlJsStatic } from 'sql.js';
-import * as bridge from '@/root/bridge';
 import type { CloudConfigRow, RulesRow } from './schema';
 
 let sqlPromise: Promise<SqlJsStatic> | null = null;
@@ -30,6 +29,10 @@ async function initializeSqlJs(): Promise<SqlJsStatic> {
     typeof window !== 'undefined' && typeof (window as any).ksu?.exec === 'function';
   if (ksuAvailable) {
     try {
+      // Imported lazily: the bridge imports this module back (base64 helpers),
+      // so a top-level import would create a cycle that breaks non-WebView
+      // consumers — including the test harness, which has no `kernelsu` module.
+      const bridge = await import('@/root/bridge');
       const bytes = await bridge.readWasm();
       return await initSqlJs({ wasmBinary: bytes.buffer as ArrayBuffer });
     } catch (err) {
@@ -149,6 +152,26 @@ export function updateRuleContentById(db: Database, id: number, content: string)
   });
   const res = db.exec(`SELECT changes() as n`);
   return Number(res[0]?.values?.[0]?.[0] ?? 0);
+}
+
+/** Insert one row for `module` when none exists (the teg mirror of a config
+ * that SmartP has but teg never received). Returns 0 when the table is absent
+ * (redmi-style DB) instead of throwing — pushing must not fail over a mirror. */
+export function insertRuleRow(db: Database, module: string, content: string, version?: number): number {
+  try {
+    db.run(
+      `INSERT INTO rules (rule_module, rule_content, rule_version) VALUES (:m, :c, :v)`,
+      {
+        ':m': module,
+        ':c': content,
+        ':v': typeof version === 'number' ? version : null,
+      },
+    );
+    const res = db.exec(`SELECT changes() as n`);
+    return Number(res[0]?.values?.[0]?.[0] ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 /** Update `rule_content` and `rule_version` of every row that matches `module`. */

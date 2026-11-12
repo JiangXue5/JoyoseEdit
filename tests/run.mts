@@ -78,6 +78,12 @@ import {
   liftDynamicFpsTemps,
   isFpsLockKey,
 } from '../src/parsers/fpslock';
+import {
+  insertRuleRow,
+  latestRuleIdForModule,
+  listRules,
+  updateRuleContentById,
+} from '../src/db/dbio';
 import { detectActiveBackend, detectPaths, parseParams, stringifyParams } from '../src/db/schema';
 import {
   pickBoosterParams,
@@ -146,6 +152,7 @@ async function main() {
   await runLiftThermalTest();
   await runThermalUnlockTest();
   await runNovatekComplexTest();
+  await runRuleMirrorTest(SQL);
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1293,6 +1300,51 @@ async function runNovatekComplexTest() {
     if (!out.includes('_61#144#')) throw new Error('setB targetFps not applied');
     if (serializeNovatek(parseNovatek(out)) !== out) throw new Error('round-trip broken after edit');
     return 'standard short format editable';
+  });
+}
+
+async function runRuleMirrorTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
+  console.log('\n=== teg mirror row insert ===');
+  const sample = SAMPLES.find((s) => s.label.includes('Xiaomi 15'));
+  if (!sample) return;
+  const bytes = new Uint8Array(readFileSync(path.join(ROOT, sample.teg)));
+  await check('rules: insert a mirror row only when the module has none', () => {
+    const db = new SQL.Database(bytes);
+    try {
+      // Drop every common_config row, then insert one as ensureCommonConfigMirror
+      // would during a commit.
+      db.run(`DELETE FROM rules WHERE rule_module = 'common_config'`);
+      if (latestRuleIdForModule(db, 'common_config') !== null) {
+        throw new Error('row should be gone');
+      }
+      const n = insertRuleRow(db, 'common_config', JSON.stringify({ version: 2024010101, params: { a: 1 } }), 2024010101);
+      if (n !== 1) throw new Error('insert reported ' + n);
+      const id = latestRuleIdForModule(db, 'common_config');
+      if (id === null) throw new Error('row not found after insert');
+      const rows = listRules(db).filter((r) => r.rule_module === 'common_config');
+      if (rows.length !== 1) throw new Error('expected exactly 1 row, got ' + rows.length);
+      if (String(rows[0].rule_content).includes('"a":1') === false) throw new Error('content lost');
+      return 'inserted 1 row, id=' + id;
+    } finally {
+      db.close();
+    }
+  });
+  await check('rules: updating by id leaves sibling revisions untouched', () => {
+    const db = new SQL.Database(bytes);
+    try {
+      const before = listRules(db).filter((r) => r.rule_module === 'booster_config');
+      if (before.length < 2) return 'skipped (sample has <2 revisions)';
+      const id = latestRuleIdForModule(db, 'booster_config');
+      if (id === null) throw new Error('no target row');
+      updateRuleContentById(db, id, JSON.stringify({ probe: true }));
+      const after = listRules(db).filter((r) => r.rule_module === 'booster_config');
+      const changed = after.filter((r, i) => String(r.rule_content) !== String(before[i].rule_content));
+      if (changed.length !== 1) throw new Error('changed rows: ' + changed.length);
+      if (after.length !== before.length) throw new Error('row count drifted');
+      return `${before.length} revisions, exactly 1 rewritten`;
+    } finally {
+      db.close();
+    }
   });
 }
 

@@ -15,6 +15,7 @@ import {
   listCloudConfig,
   listRules,
   latestRuleIdForModule,
+  insertRuleRow,
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
@@ -399,6 +400,27 @@ export function currentRuleRow<T extends { meta: { rule_version?: unknown } }>(
   return best;
 }
 
+/** Version used when teg needs a new mirror row and SmartP offers none. */
+export const COMMON_CONFIG_VERSION = 2024010101;
+
+/** teg carries `rules` but has no common_config mirror at all (common on
+ *  devices whose teg sync only ever delivered booster_config). Create the row
+ *  so a commit keeps both sides in step — but only from real, non-empty SmartP
+ *  content, so we never fabricate a config the device does not have. */
+function ensureCommonConfigMirror(): void {
+  const name = 'common_config';
+  const cc = state.cloudConfig[name];
+  if (!cc || cc.meta?._real !== true || cc.meta?.empty || cc.meta?.fromTeg) return;
+  if ((state.rulesByModule[name]?.length ?? 0) > 0) return;
+  if (!Object.values(state.rulesByModule).some((rows) => rows.length > 0)) return;
+  state.rulesByModule[name] = [
+    {
+      meta: { rule_version: COMMON_CONFIG_VERSION, _real: true, empty: false },
+      content: refreshEnvelope(null, cc.params, COMMON_CONFIG_VERSION, name),
+    },
+  ];
+}
+
 /** Synchronise teg_config.rules.rule_content for a given module from the
  * current cloud_config.params. Mirrors what Joyose itself does internally.
  *
@@ -642,6 +664,7 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     // Auto-sync rules.rule_content from the matching cloud_config row, so
     // any edit made via the structured views propagates to the teg mirror
     // without the view layer needing to remember.
+    ensureCommonConfigMirror();
     for (const name of Object.keys(state.cloudConfig)) {
       if (state.rulesByModule[name]?.length) syncRuleContent(name);
     }
@@ -666,7 +689,7 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
         // Only rows that genuinely exist in SmartP and carry content: a config
         // that arrived from the teg fallback must never be written into SmartP,
         // and an empty row has nothing to write.
-        if (obj.meta?._real !== true || obj.meta?.empty) continue;
+        if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.fromTeg) continue;
         const serialized = stringifyParams(obj.params);
         if (baseline[name] !== undefined && JSON.stringify(baseline[name]) === serialized) {
           continue;
@@ -696,7 +719,12 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
         // against our (possibly stale) in-memory copy: Joyose may have
         // appended a newer revision between pull and push.
         const id = latestRuleIdForModule(dbT, module);
-        if (id === null) continue;
+        if (id === null) {
+          // The mirror row was created in memory above; insert it now instead of
+          // silently dropping the write.
+          insertRuleRow(dbT, module, JSON.stringify(row.content), COMMON_CONFIG_VERSION);
+          continue;
+        }
         updateRuleContentById(dbT, id, JSON.stringify(row.content));
       }
 
