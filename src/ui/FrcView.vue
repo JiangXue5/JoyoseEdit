@@ -2,7 +2,7 @@
   <div class="stack">
     <div v-if="backendMismatch" class="banner error">
       <strong>此面板不适用于当前机型</strong>
-      <span class="hint">当前机型不走此后端，改动不会生效。请到对应面板操作，或通过 JSON 编辑页直接改底层数据。</span>
+      <span class="hint">当前机型不走此后端，改动不会生效。请到对应面板操作，或通过「参数树」页直接改底层数据。</span>
     </div>
 
     <PageHeader title="高通 GPU 插帧" kicker="AFME / FRC / FSR · 未实机验证"

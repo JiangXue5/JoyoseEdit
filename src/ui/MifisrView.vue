@@ -533,7 +533,7 @@ const problems = computed<Issue[]>(() => {
       id: 'resolution',
       tone: 'warn',
       title: '该配置限制了分辨率白名单',
-      detail: `受限策略：${resolutionLeaveSummary.value}。切换画质档位后若勾选框消失，多半是该字段导致，可去 JSON 编辑页删除或改成当前档位。`,
+      detail: `受限策略：${resolutionLeaveSummary.value}。切换画质档位后若勾选框消失，多半是该字段导致，可去「参数树」页删除或改成当前档位。`,
     });
   }
 

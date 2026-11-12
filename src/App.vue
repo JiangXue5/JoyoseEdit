@@ -169,7 +169,7 @@ const VIEW_META: Record<ViewId, { title: string; desc: string }> = {
   mifisr: { title: 'MIFISR 画质增强', desc: '小米 17 系列的插帧 + 超分配置，逐游戏维护。' },
   novatek: { title: 'Novatek 独显', desc: '红米独显机型的 NT# 策略与温控参数。' },
   mivk: { title: '渲染模块', desc: 'MIVK / MIGL 渲染 hook 的模块开关与等级。' },
-  json: { title: 'JSON 编辑', desc: '直接编辑云控参数树，适合排查与专家级调整。' },
+  json: { title: '参数树编辑', desc: '直接编辑云控参数树，适合排查与专家级调整。' },
   history: { title: '编辑历史', desc: '每次提交产生一条增量记录，可随时回到任意节点。' },
   importexport: { title: '导入 / 导出', desc: '把配置打包成 JSON，用于备份或跨设备迁移。' },
 };
@@ -252,7 +252,7 @@ const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
   ];
 
   const other: NavItem[] = [
-    { id: 'json', label: 'JSON 编辑', icon: 'braces' },
+    { id: 'json', label: '参数树', icon: 'braces' },
     { id: 'history', label: '编辑历史', icon: 'clock' },
     { id: 'importexport', label: '导入 / 导出', icon: 'swap' },
   ];

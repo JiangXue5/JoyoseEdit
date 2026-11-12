@@ -113,7 +113,7 @@
           </dl>
         </div>
         <div v-if="Object.keys(state.cloudConfig).length === 0" class="hint" style="padding: 8px 0">
-          两个数据库里都没有 cloud_config 行。先在 Joyose 里联网下发一次云控，或到「JSON 编辑」写入。
+          两个数据库里都没有 cloud_config 行。先在 Joyose 里联网下发一次云控，或到「参数树」写入。
         </div>
       </div>
     </section>

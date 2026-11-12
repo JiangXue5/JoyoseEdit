@@ -1,6 +1,6 @@
 <template>
   <div class="stack">
-    <PageHeader title="JSON 编辑" kicker="raw editor"
+    <PageHeader title="参数树编辑" kicker="parameter tree"
       desc="直接改云控参数树。保存是直写：立刻写入所选数据库的那一行并重启 Joyose，不走底部提交条。">
       <select v-model="target" aria-label="编辑目标">
         <option v-for="t in TARGETS" :key="t.id" :value="t.id">{{ t.label }}</option>
