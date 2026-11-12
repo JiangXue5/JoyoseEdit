@@ -406,7 +406,7 @@ export function syncRuleContent(configName: string, newVersion?: number): void {
   const row = currentRuleRow(state.rulesByModule[configName] ?? []);
   if (!row) return;
   const v = newVersion ?? Number(cc.meta.version ?? row.meta.rule_version ?? 0);
-  row.content = refreshEnvelope(row.content as any, cc.params, v);
+  row.content = refreshEnvelope(row.content as any, cc.params, v, configName);
   if (typeof newVersion === 'number') row.meta.rule_version = newVersion;
 }
 
@@ -457,6 +457,126 @@ function rewriteYear(version: number): number {
   const s = String(version);
   if (s.length < 4) return Number(`2099${'0'.repeat(Math.max(0, 10 - s.length))}${s}`);
   return Number(`2099${s.slice(4)}`);
+}
+
+/** The four fixed targets the JSON editor can write to. They are deliberately
+ *  narrow: one database, one config. The editor is a scalpel, not the global
+ *  commit — it neither mirrors to the other DB nor records history. */
+export type JsonTarget = 'sp_booster' | 'sp_common' | 'teg_booster' | 'teg_common';
+
+const JSON_TARGET_CONFIG: Record<JsonTarget, { name: string; db: 'smartp' | 'teg' }> = {
+  sp_booster: { name: 'booster_config', db: 'smartp' },
+  sp_common: { name: 'common_config', db: 'smartp' },
+  teg_booster: { name: 'booster_config', db: 'teg' },
+  teg_common: { name: 'common_config', db: 'teg' },
+};
+
+/** Write the editor's text straight into one target row.
+ *
+ *  SmartP_* touches only that `cloud_config` row (params; the version column is
+ *  left as-is unless the editor is the only thing that ever set it), teg_*
+ *  touches only the module's current `rules` row. Both refuse to write when the
+ *  row does not exist: fabricating a row is how "empty config" bugs start.
+ *
+ *  Conflict check uses the sha256 baseline, so a cloud push that landed while
+ *  the editor was open prompts instead of being silently overwritten. */
+export async function saveJsonTarget(
+  target: JsonTarget,
+  jsonText: string,
+): Promise<{ ok: true; target: string }> {
+  const { name, db: which } = JSON_TARGET_CONFIG[target];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (err: any) {
+    throw new Error(`JSON 解析失败：${err?.message ?? err}`);
+  }
+
+  // Soft conflict check — same baseline the commit path uses.
+  const fresh = await bridge.digest().catch(() => null);
+  if (fresh) {
+    const baseline = which === 'smartp' ? state.baselineSmartp : state.baselineTeg;
+    const current = which === 'smartp' ? fresh.smartp : fresh.teg;
+    if (baseline && current && baseline !== current) {
+      const ok = window.confirm(
+        `${which === 'smartp' ? 'SmartP.db' : 'teg_config.db'} 在打开编辑器后被 Joyose 更新过。` +
+          `继续保存会覆盖该行上的本次云端更新。仍要保存？`,
+      );
+      if (!ok) throw new Error('已取消保存，编辑器内容保留');
+    }
+  }
+
+  // A direct write skips the commit bar, so take the restore point here — the
+  // user has no "discard" path for a JSON edit.
+  await bridge.backup('json-edit').catch(() => null);
+
+  if (which === 'smartp') {
+    if (target === 'sp_booster') {
+      if (!(name in state.smartpRaw)) {
+        throw new Error('SmartP 中没有 booster_config 行，无法写入（可改用 teg 目标）');
+      }
+    } else if (!(name in state.smartpRaw)) {
+      throw new Error('SmartP 中没有 common_config 行，无法写入（可改用 teg 目标）');
+    }
+
+    const bytes = await bridge.pull('smartp');
+    const db = await openDb(bytes);
+    let out: Uint8Array;
+    try {
+      const count = Number(
+        db.exec(`SELECT COUNT(*) FROM cloud_config WHERE config_name = :n`, { ':n': name })[0]
+          ?.values?.[0]?.[0] ?? 0,
+      );
+      if (count === 0) {
+        throw new Error(`SmartP 中没有 ${name} 行，无法写入`);
+      }
+      const existing = state.cloudConfig[name]?.meta?.version;
+      updateCloudConfigParams(
+        db,
+        name,
+        stringifyParams(parsed),
+        typeof existing === 'number' ? existing : undefined,
+      );
+      out = exportDb(db);
+    } finally {
+      closeDb(db);
+    }
+    const res = await bridge.push('smartp', out);
+    state.applyStatus = { stopped: res.stopped ?? null, at: Date.now() };
+  } else {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('teg 目标必须是一个信封对象（{ config_name, version, params, … }）');
+    }
+    const bytes = await bridge.pull('teg');
+    const db = await openDb(bytes);
+    let out: Uint8Array;
+    try {
+      const id = latestRuleIdForModule(db, name);
+      if (id === null) {
+        throw new Error(`teg 中没有 ${name} 行，无法写入（可改用 SmartP 目标）`);
+      }
+      updateRuleContentById(db, id, JSON.stringify(parsed));
+      out = exportDb(db);
+    } finally {
+      closeDb(db);
+    }
+    const res = await bridge.push('teg', out);
+    state.applyStatus = { stopped: res.stopped ?? null, at: Date.now() };
+  }
+
+  const restarted = await bridge.restart().catch(() => null);
+  if (restarted && typeof restarted.stopped === 'boolean') {
+    state.applyStatus = {
+      stopped: state.applyStatus?.stopped === false ? false : restarted.stopped,
+      at: Date.now(),
+    };
+  }
+
+  // Rebuild from the DB so the editor shows what actually landed. A failure
+  // here does not invalidate the write.
+  await pullAll().catch(() => null);
+  return { ok: true, target };
 }
 
 /** How many history files / backup directories to keep on the device. */
@@ -531,12 +651,25 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
       // whole in-memory snapshot back.
       const baseline = state.pristineSnapshot?.smartp?.cloud_config ?? {};
       for (const [name, obj] of Object.entries(state.cloudConfig)) {
+        // Only rows that genuinely exist in SmartP and carry content: a config
+        // that arrived from the teg fallback must never be written into SmartP,
+        // and an empty row has nothing to write.
+        if (obj.meta?._real !== true || obj.meta?.empty) continue;
         const serialized = stringifyParams(obj.params);
         if (baseline[name] !== undefined && JSON.stringify(baseline[name]) === serialized) {
           continue;
         }
-        const version =
-          typeof obj.meta.version === 'number' ? obj.meta.version : undefined;
+        // Keep SmartP's own version column unless the user locked it: the
+        // reconciled meta.version may come from teg, and copying it here would
+        // silently move SmartP's version forward on every source switch.
+        const locked = typeof obj.meta?.originalVersion !== 'undefined';
+        const version = locked
+          ? typeof obj.meta?.version === 'number'
+            ? obj.meta.version
+            : undefined
+          : typeof obj.meta?.smartpVersion === 'number' && obj.meta.smartpVersion > 0
+            ? obj.meta.smartpVersion
+            : undefined;
         updateCloudConfigParams(dbS, name, serialized, version);
       }
       for (const [module, rows] of Object.entries(state.rulesByModule)) {
@@ -544,6 +677,9 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
         if (rows.length === 0) continue;
         const row = currentRuleRow(rows);
         if (!row) continue;
+        // Same rule for the mirror: never write a row the DB does not have, and
+        // skip empty envelopes so a placeholder cannot erase real content.
+        if (row.meta?._real !== true || row.meta?.empty) continue;
         // Resolve the target *against the DB we are about to write*, not
         // against our (possibly stale) in-memory copy: Joyose may have
         // appended a newer revision between pull and push.

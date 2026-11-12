@@ -1048,6 +1048,28 @@ async function runEnvelopeTest() {
     if (fresh.version !== 100) throw new Error('version wrong');
     if ((fresh.params as any).a !== 1) throw new Error('params wrong');
   });
+  await check('envelope: every key is materialised (no undefined dropped by JSON)', () => {
+    const fresh = refreshEnvelope({ version: 5, params: {} } as any, { a: 1 }, 2026080401);
+    for (const k of ['config_name', 'group_name', 'enable', 'version', 'with_model', 'params']) {
+      if (!(k in fresh)) throw new Error('missing key ' + k);
+    }
+    if (JSON.stringify(fresh).includes('undefined')) throw new Error('undefined leaked');
+    if (fresh.enable !== true || fresh.with_model !== false) throw new Error('defaults wrong');
+    return '6 keys, defaults applied';
+  });
+  await check('envelope: fallbackName repairs empty config_name / group_name', () => {
+    const fresh = refreshEnvelope(
+      { config_name: '', group_name: '', enable: true, version: 1, with_model: false, params: {} } as any,
+      { a: 1 },
+      2024010101,
+      'common_config',
+    );
+    if (fresh.config_name !== 'common_config' || fresh.group_name !== 'common_config') {
+      throw new Error('not repaired: ' + JSON.stringify(fresh));
+    }
+    if (JSON.stringify(fresh).includes('""')) throw new Error('empty name leaked');
+    return 'repaired to module name';
+  });
 }
 
 function collectAllKeys(node: unknown, acc: string[] = []): string[] {
