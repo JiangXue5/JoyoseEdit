@@ -212,6 +212,16 @@ function samePaths(a: V3PathStatus[], b: V3PathStatus[]): boolean {
   return true;
 }
 
+/** Byte-wise comparison of a freshly exported DB against the bytes we pulled.
+ * sql.js re-emits the whole file, so pointer equality is useless here. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 /** The row Joyose treats as current for a module: highest `rule_version`
  * (an insert ordinal), not highest envelope version. The rules table keeps
  * every historical release, so "the module" is ambiguous without this. */
@@ -286,8 +296,7 @@ export interface PushOptions {
   force?: boolean;
 }
 
-/** Re-read the DB digests and store them as the conflict-detection baseline. */
-export async function refreshBaseline(): Promise<void> {
+/** Re-read the DB digests and store them as the conflict-detection baseline. */export async function refreshBaseline(): Promise<void> {
   try {
     const d = await bridge.digest();
     state.baselineSmartp = d.smartp;
@@ -388,9 +397,17 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     const recordStop = (r: { stopped?: boolean }) => {
       if (typeof r?.stopped === 'boolean') stops.push(r.stopped);
     };
-    recordStop(await bridge.push('smartp', outSmartp));
+    // Uploading a DB costs one ksu.exec round-trip per 48 KB of base64 — about
+    // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
+    // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
+    if (!sameBytes(outSmartp, smartpBytes)) {
+      recordStop(await bridge.push('smartp', outSmartp));
+    }
     // only touch teg if we actually have rows to write
-    if (Object.values(state.rulesByModule).some((rows) => rows.length > 0)) {
+    if (
+      Object.values(state.rulesByModule).some((rows) => rows.length > 0) &&
+      !sameBytes(outTeg, tegBytes)
+    ) {
       recordStop(await bridge.push('teg', outTeg));
     }
 
