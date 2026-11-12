@@ -304,8 +304,16 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     let outSmartp: Uint8Array;
     let outTeg: Uint8Array;
     try {
+      // Only rewrite rows the user actually touched. Re-serialising every row
+      // meant that a cloud push landing between our pull and our commit was
+      // silently rolled back on every unrelated config, because we wrote the
+      // whole in-memory snapshot back.
+      const baseline = state.pristineSnapshot?.smartp?.cloud_config ?? {};
       for (const [name, obj] of Object.entries(state.cloudConfig)) {
         const serialized = stringifyParams(obj.params);
+        if (baseline[name] !== undefined && JSON.stringify(baseline[name]) === serialized) {
+          continue;
+        }
         const version =
           typeof obj.meta.version === 'number' ? obj.meta.version : undefined;
         updateCloudConfigParams(dbS, name, serialized, version);
