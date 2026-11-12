@@ -77,7 +77,7 @@ npm run dev
 ## 源码导航
 
 ```text
-module/                   KernelSU 模块载荷（customize / post-fs-data / bin）
+module/                   KernelSU 模块载荷（customize / service / bin）
   bin/joyose-edit.sh      所有特权操作的唯一入口；子命令白名单
 src/parsers/              各 per-game 字符串格式的 parse / serialize / validate
 src/db/                   sql.js 封装 + DB 路径探测 + 磁盘指纹

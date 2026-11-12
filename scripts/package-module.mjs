@@ -5,7 +5,7 @@
 //                        base semantic version from source — commit count
 //                        only rides in versionCode and the zip filename)
 //   customize.sh
-//   post-fs-data.sh
+//   service.sh
 //   bin/joyose-edit.sh
 //   webroot/
 //     index.html + assets/ (copied from dist/)
@@ -46,7 +46,7 @@ async function main() {
   // ensure bin/ scripts are executable on unpack (best-effort on Windows)
   await fs.chmod(path.join(stagingDir, 'bin', 'joyose-edit.sh'), 0o755).catch(() => { });
   await fs.chmod(path.join(stagingDir, 'customize.sh'), 0o755).catch(() => { });
-  await fs.chmod(path.join(stagingDir, 'post-fs-data.sh'), 0o755).catch(() => { });
+  await fs.chmod(path.join(stagingDir, 'service.sh'), 0o755).catch(() => { });
   await fs.chmod(path.join(stagingDir, 'uninstall.sh'), 0o755).catch(() => { });
 
   // copy dist/ into staging/webroot/

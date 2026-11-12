@@ -1249,7 +1249,7 @@ module/                       KernelSU 模块载荷
                               · 属性只读: vision-status
                               · teg SDK SP: teg-status / teg-freeze / teg-unfreeze
   customize.sh                安装钩子
-  post-fs-data.sh             首启动备份（不会自动 resetprop vendor flag）
+  service.sh                  首启动备份（late_start，等 CE 存储就绪后才跑）
   module.prop
 
 scripts/package-module.mjs    打包 dist/ + module/ 成 release/*.zip
