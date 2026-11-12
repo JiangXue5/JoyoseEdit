@@ -147,7 +147,12 @@ export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteR
   return JSON.parse(await runKsu(`sh ${HELPER} push-from-stage ${which} ${stage}`));
 }
 
-export async function backup(label?: string): Promise<{ ok: true; dir: string; name: string }> {
+export async function backup(label?: string): Promise<{
+  ok: true;
+  dir: string;
+  name: string;
+  stopped?: boolean;
+}> {
   const safe = label ? sanitizeLabel(label) : '';
   const cmd = safe ? `sh ${HELPER} backup ${safe}` : `sh ${HELPER} backup`;
   const out = await runKsu(cmd);

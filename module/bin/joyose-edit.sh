@@ -203,7 +203,7 @@ cmd_push() {
 }
 
 cmd_backup() {
-  local label="${1:-}" stamp dir
+  local label="${1:-}" stamp dir stopped chk
   stamp=$(date +%s)
   if [ -n "$label" ]; then
     safe_name "$label" || die "invalid label"
@@ -213,9 +213,25 @@ cmd_backup() {
   fi
   mkdir -p "$dir"
   chmod 700 "$dir"
+  # A file-level copy of a database that a live process is writing can capture
+  # a page or a rollback journal mid-transaction, which turns into a corrupt
+  # (or silently rolled-back) restore later. Quiesce first — pushAll calls
+  # backup immediately before it writes, so this costs nothing there.
+  stopped=$(_stop_pkg)
   [ -f "$SMARTP" ] && cp -f "$SMARTP" "$dir/SmartP.db"
   [ -f "$TEG" ] && cp -f "$TEG" "$dir/teg_config.db"
-  printf '{"ok":true,"dir":"%s","name":"%s"}\n' "$dir" "$(basename "$dir")"
+  if command -v sqlite3 >/dev/null 2>&1; then
+    for f in "$dir/SmartP.db" "$dir/teg_config.db"; do
+      [ -f "$f" ] || continue
+      chk=$(sqlite3 "$f" 'PRAGMA quick_check;' 2>/dev/null || printf 'error')
+      if [ "$chk" != "ok" ]; then
+        rm -rf "$dir"
+        die "backup snapshot failed integrity check ($(basename "$f")): $chk"
+      fi
+    done
+  fi
+  printf '{"ok":true,"dir":"%s","name":"%s","stopped":%s}\n' \
+    "$dir" "$(basename "$dir")" "$stopped"
 }
 
 _revert_from_dir() {
