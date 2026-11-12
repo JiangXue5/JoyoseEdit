@@ -18,7 +18,7 @@
 #                                  (keeps only the newest 10 backup dirs)
 #   revert <epoch-label>           restore a specific backup
 #   revert-latest                  restore most recent backup
-#   restart                        am force-stop com.xiaomi.joyose
+#   restart                        stop Joyose, then start it again so it re-reads the DBs
 #   history-list                   list every history file (one JSON per line)
 #   history-get <name>             print the contents of one history file
 #   history-clear <keep>           keep N newest, remove the rest
@@ -116,6 +116,30 @@ _stop_pkg() {
   local i=0
   while [ "$i" -lt 20 ]; do
     if ! _pid_alive; then
+      printf 'true'
+      return 0
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  printf 'false'
+}
+
+# Joyose only reads the DBs when it starts. Leaving it stopped after a write
+# meant the first game launch paid for the cold start: the game-side booster
+# asked for a config before Joyose had loaded ours, so the edit only showed up
+# on the second launch. Starting it here moves that load in front of the user.
+# `.MainActivity` is what the other Joyose editors use; if the ROM has no such
+# entry `am start` fails quietly and we are back to the old behaviour.
+_start_pkg() {
+  if ! command -v am >/dev/null 2>&1; then
+    printf 'false'
+    return 0
+  fi
+  am start --user 0 -n "$PKG/.MainActivity" >/dev/null 2>&1 || true
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    if _pid_alive; then
       printf 'true'
       return 0
     fi
@@ -317,9 +341,10 @@ cmd_revert_latest() {
 }
 
 cmd_restart() {
-  local stopped
+  local stopped started
   stopped=$(_stop_pkg)
-  printf '{"ok":true,"pkg":"%s","stopped":%s}\n' "$PKG" "$stopped"
+  started=$(_start_pkg)
+  printf '{"ok":true,"pkg":"%s","stopped":%s,"started":%s}\n' "$PKG" "$stopped" "$started"
 }
 
 cmd_history_list() {

@@ -1,6 +1,6 @@
 {
-  "version": "v1.1.5",
-  "versionCode": 11500,
-  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.5/joyose-edit-v1.1.5.zip",
-  "changelog": "v1.1.5 — 概览页「云控配置」重排：两边版本直接显示成日期，真正生效的一侧打绿色标记，历史版本只列积压；「JSON 编辑」更名为「参数树」，页头与交叉引用同步；云控配置与版本锁表格统一按 booster_config → common_config 排列，与「来源与写入」对齐。"
+  "version": "v1.1.6",
+  "versionCode": 11600,
+  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.6/joyose-edit-v1.1.6.zip",
+  "changelog": "v1.1.6 — 写入/提交后主动把 Joyose 拉起来，让它在进游戏前就读完新配置；之前只停不启，第一局游戏常常赶在它冷启动完成之前拿配置，必须开两遍才生效。若机型没有可启动入口，会退回旧行为并在提示里说明。"
 }

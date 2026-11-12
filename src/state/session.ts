@@ -91,9 +91,11 @@ export interface SessionState {
   /** Snapshot of the state captured on pull — used as `before` for history records. */
   pristineSnapshot: ReturnType<typeof snapshotFromMaps> | null;
   dirty: boolean;
-  /** Outcome of the last write: whether Joyose was confirmed stopped.
-   * `null` while unknown (helper too old to report it). */
-  applyStatus: { stopped: boolean | null; at: number } | null;
+  /** Outcome of the last write: whether Joyose was confirmed stopped, and
+   *  whether it was brought back afterwards (i.e. it has already re-read the
+   *  DBs, so the next game launch picks the edit up). `null` while unknown
+   *  (helper too old to report it). */
+  applyStatus: { stopped: boolean | null; started: boolean | null; at: number } | null;
   /** When the last commit had to rebase onto a fresher DB, the timestamp of
    *  that merge; null when the last commit applied directly. */
   rebasedAt: number | null;
@@ -585,7 +587,7 @@ export async function saveJsonTarget(
       closeDb(db);
     }
     const res = await bridge.push('smartp', out);
-    state.applyStatus = { stopped: res.stopped ?? null, at: Date.now() };
+    state.applyStatus = { stopped: res.stopped ?? null, started: null, at: Date.now() };
   } else {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('teg 目标必须是一个信封对象（{ config_name, version, params, … }）');
@@ -604,13 +606,14 @@ export async function saveJsonTarget(
       closeDb(db);
     }
     const res = await bridge.push('teg', out);
-    state.applyStatus = { stopped: res.stopped ?? null, at: Date.now() };
+    state.applyStatus = { stopped: res.stopped ?? null, started: null, at: Date.now() };
   }
 
   const restarted = await bridge.restart().catch(() => null);
   if (restarted && typeof restarted.stopped === 'boolean') {
     state.applyStatus = {
       stopped: state.applyStatus?.stopped === false ? false : restarted.stopped,
+      started: restarted.started ?? null,
       at: Date.now(),
     };
   }
@@ -819,6 +822,7 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     if (restarted) recordStop(restarted);
     state.applyStatus = {
       stopped: stops.length > 0 ? stops.every(Boolean) : null,
+      started: restarted?.started ?? null,
       at: Date.now(),
     };
 

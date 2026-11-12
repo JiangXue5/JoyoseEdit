@@ -360,13 +360,21 @@ async function handlePush() {
   try {
     const name = await pushAll({ note });
     const rebased = state.rebasedAt !== null;
-    if (state.applyStatus?.stopped === false) {
+    const applied = state.applyStatus;
+    if (applied?.stopped === false) {
       toast.warn(
         '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
         name,
       );
     } else if (rebased) {
       toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
+    } else if (applied?.started === true) {
+      // Restarting Joyose right after the write means it has already read the
+      // new rows; without this the first game launch raced the cold start and
+      // the edit only showed up on the second one.
+      toast.success('已提交，Joyose 已重新加载配置', `${name} · 直接进游戏即可，不需要再开一遍`);
+    } else if (applied?.started === false) {
+      toast.info('已提交', `${name} · Joyose 已停止，下次启动游戏时会读取新配置`);
     } else {
       toast.success('已提交并写入历史', name);
     }

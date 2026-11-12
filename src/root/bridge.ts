@@ -215,6 +215,8 @@ export interface RestartResult {
   pkg: string;
   /** Whether the process was confirmed gone, not just "am did not throw". */
   stopped?: boolean;
+  /** Whether Joyose came back up and therefore re-read the DBs. */
+  started?: boolean;
 }
 
 export async function restart(): Promise<RestartResult> {
