@@ -73,37 +73,37 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(cfg, name) in state.cloudConfig" :key="name" :class="{ 'row-empty': cfg.meta?.empty }">
+          <tr v-for="row in cfgRows" :key="row.name" :class="{ 'row-empty': row.cfg.meta?.empty }">
             <td>
-              <strong class="mono">{{ name }}</strong>
-              <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
-              <span v-else-if="cfg.meta?.fromTeg" class="pill off">来自 teg</span>
+              <strong class="mono">{{ row.name }}</strong>
+              <span v-if="row.cfg.meta?.empty" class="pill off">空配置</span>
+              <span v-else-if="row.cfg.meta?.fromTeg" class="pill off">来自 teg</span>
             </td>
             <td data-label="云控版本">
-              <span v-if="cfg.meta?.empty" class="muted">—</span>
-              <span v-else class="pill" :class="isLocked(cfg.meta.version) ? 'warn' : ''">
-                {{ cfg.meta.version ?? '—' }}
+              <span v-if="row.cfg.meta?.empty" class="muted">—</span>
+              <span v-else class="pill" :class="isLocked(row.cfg.meta.version) ? 'warn' : ''">
+                {{ row.cfg.meta.version ?? '—' }}
               </span>
             </td>
             <td class="mono muted" data-label="参数头版本">
-              {{ cfg.meta?.empty ? '—' : cfg.params?.header?.version ?? '—' }}
+              {{ row.cfg.meta?.empty ? '—' : row.cfg.params?.header?.version ?? '—' }}
             </td>
             <td class="mono muted" data-label="规则版本">
-              <template v-if="ruleVersionList(String(name)).length">
-                <span v-for="(rv, ri) in ruleVersionList(String(name))" :key="ri"
+              <template v-if="ruleVersionList(row.name).length">
+                <span v-for="(rv, ri) in ruleVersionList(row.name)" :key="ri"
                   :class="{ 'old-version': rv.old }">
-                  {{ rv.v }}<template v-if="ri < ruleVersionList(String(name)).length - 1">, </template>
+                  {{ rv.v }}<template v-if="ri < ruleVersionList(row.name).length - 1">, </template>
                 </span>
               </template>
               <span v-else>（空）</span>
             </td>
             <td class="num" data-label="操作">
-              <template v-if="cfg.meta?.empty">
+              <template v-if="row.cfg.meta?.empty">
                 <span class="muted">—</span>
               </template>
-              <button v-else-if="!isLocked(cfg.meta.version)" class="primary sm" @click="lock(String(name))"
+              <button v-else-if="!isLocked(row.cfg.meta.version)" class="primary sm" @click="lock(row.name)"
                 :disabled="state.loading">锁定</button>
-              <button v-else class="ghost sm" @click="unlock(String(name))" :disabled="state.loading">还原</button>
+              <button v-else class="ghost sm" @click="unlock(row.name)" :disabled="state.loading">还原</button>
             </td>
           </tr>
         </tbody>
@@ -122,12 +122,16 @@
 </template>
 
 <script setup lang="ts">
-import { onActivated, reactive, ref } from 'vue';
+import { computed, onActivated, reactive, ref } from 'vue';
 import { state, lockCloudVersion, unlockCloudVersion, markDirty } from '@/state/session';
 import { toast } from '@/state/toast';
 import * as bridge from '@/root/bridge';
 import PageHeader from './PageHeader.vue';
 import AppIcon from './AppIcon.vue';
+import { orderedCloudConfig } from './cloudOrder';
+
+/** 和概览页同一个次序：booster_config 在上、common_config 在下。 */
+const cfgRows = computed(() => orderedCloudConfig(state.cloudConfig));
 
 function isLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');

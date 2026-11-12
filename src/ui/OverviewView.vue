@@ -81,34 +81,34 @@
         <button class="ghost sm" @click="goLock">管理</button>
       </div>
       <div class="data-list">
-        <div v-for="(cfg, name) in state.cloudConfig" :key="name" class="cfg-row">
+        <div v-for="row in cfgRows" :key="row.name" class="cfg-row">
           <div class="cfg-head">
-            <strong class="mono">{{ name }}</strong>
+            <strong class="mono">{{ row.name }}</strong>
             <span
               class="cfg-version"
-              :class="{ locked: isVersionLocked(cfg.meta?.version) }"
-              :title="cfg.meta?.empty ? '' : `原始版本号 ${cfg.meta?.version ?? '—'}`"
-            ><span class="lbl">{{ isVersionLocked(cfg.meta?.version) ? '锁定' : '生效' }}</span>{{ currentLabel(cfg) }}</span>
-            <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
+              :class="{ locked: isVersionLocked(row.cfg.meta?.version) }"
+              :title="row.cfg.meta?.empty ? '' : `原始版本号 ${row.cfg.meta?.version ?? '—'}`"
+            ><span class="lbl">{{ isVersionLocked(row.cfg.meta?.version) ? '锁定' : '生效' }}</span>{{ currentLabel(row.cfg) }}</span>
+            <span v-if="row.cfg.meta?.empty" class="pill off">空配置</span>
           </div>
           <dl class="cfg-sources">
             <div class="cfg-source">
               <dt>SmartP.db</dt>
               <dd>
-                <span class="num">{{ fmtVersion(sourceVersion(String(name), 'smartp')) }}</span>
-                <span v-if="isActiveSource(cfg.meta?.source, 'smartp')" class="cfg-tag">生效</span>
+                <span class="num">{{ fmtVersion(sourceVersion(row.name, 'smartp')) }}</span>
+                <span v-if="isActiveSource(row.cfg.meta?.source, 'smartp')" class="cfg-tag">生效</span>
               </dd>
             </div>
             <div class="cfg-source">
               <dt>teg_config.db</dt>
               <dd>
-                <span class="num">{{ fmtVersion(sourceVersion(String(name), 'teg')) }}</span>
-                <span v-if="isActiveSource(cfg.meta?.source, 'teg')" class="cfg-tag">生效</span>
+                <span class="num">{{ fmtVersion(sourceVersion(row.name, 'teg')) }}</span>
+                <span v-if="isActiveSource(row.cfg.meta?.source, 'teg')" class="cfg-tag">生效</span>
               </dd>
             </div>
-            <div v-if="ruleHistory(String(name))" class="cfg-source">
+            <div v-if="ruleHistory(row.name)" class="cfg-source">
               <dt>历史版本</dt>
-              <dd class="faint">{{ ruleHistory(String(name)) }}</dd>
+              <dd class="faint">{{ ruleHistory(row.name) }}</dd>
             </div>
           </dl>
         </div>
@@ -249,6 +249,7 @@ import { dialog } from '@/state/dialog';
 import * as bridge from '@/root/bridge';
 import PageHeader from './PageHeader.vue';
 import AppIcon from './AppIcon.vue';
+import { orderedCloudConfig } from './cloudOrder';
 
 const activePaths = computed(() => state.paths.filter((p) => p.active).length);
 
@@ -331,6 +332,10 @@ function currentLabel(cfg: any): string {
   if (cfg.meta?.empty) return '（空）';
   return fmtVersion(cfg.meta?.version);
 }
+
+/** 云控 JSON 的键序由后端拼装顺序决定，不能拿它当展示顺序。
+ *  这里跟着下面的「来源与写入」排：booster 在上、common 在下，两处对照着读。 */
+const cfgRows = computed(() => orderedCloudConfig(state.cloudConfig));
 
 const showDataSource = computed(
   () =>
