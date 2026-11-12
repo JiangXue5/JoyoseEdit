@@ -86,6 +86,20 @@ safe_name() {
 # So: stop the process first, drop any stale journal/WAL sidecars (they belong
 # to the file we just replaced), then write.
 
+# True when the process is still around. Both probes are toybox built-ins on
+# Android; if neither exists we must not claim the stop succeeded.
+_pid_alive() {
+  if command -v pidof >/dev/null 2>&1; then
+    pidof "$PKG" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$PKG" >/dev/null 2>&1
+    return $?
+  fi
+  return 0
+}
+
 _stop_pkg() {
   if ! command -v am >/dev/null 2>&1; then
     printf 'false'
@@ -94,7 +108,7 @@ _stop_pkg() {
   am force-stop "$PKG" >/dev/null 2>&1 || true
   local i=0
   while [ "$i" -lt 20 ]; do
-    if ! pidof "$PKG" >/dev/null 2>&1; then
+    if ! _pid_alive; then
       printf 'true'
       return 0
     fi
