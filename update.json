@@ -1,0 +1,6 @@
+{
+  "version": "v1.1.0",
+  "versionCode": 11000,
+  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.0/joyose-edit-v1.1.0.zip",
+  "changelog": "v1.1.0 — 重做 WebUI（石墨底设计系统、分组侧栏、移动端适配、输入延迟约 3× 降低）；修复提交后要开两遍游戏才生效（先停进程再换库、清 journal、写后校验）；修复规则历史行被压平；冲突检测改用 sha256；新增数据源策略（SmartP / teg 自动取新）、覆写目标（同时写 / 仅 SmartP / 仅 teg）、去除锁帧、温度解锁、JSON 四目标直写、导出到 Download、备份与历史保留最新 10 份、模块内检查更新。"
+}

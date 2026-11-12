@@ -1,9 +1,8 @@
 // Produce a KernelSU-installable zip at
 //   release/joyose-edit-<version>-<commit-count>[-dirty][-<short-sha>].zip
 // The zip layout is:
-//   module.prop         (versionCode = commit count; `version` stays at the
-//                        base semantic version from source — commit count
-//                        only rides in versionCode and the zip filename)
+//   module.prop         (versionCode from module.prop when > 0, else commit
+//                        count; `version` stays at the base semantic version)
 //   customize.sh
 //   service.sh
 //   bin/joyose-edit.sh
@@ -54,14 +53,25 @@ async function main() {
   await fs.mkdir(webroot, { recursive: true });
   await copyDir(distDir, webroot);
 
-  // Read the semantic version from module.prop as-is. Commit count drives
-  // ONLY the versionCode (KernelSU's update signal) and the zip filename;
-  // the `version` field stays at the base semantic version.
+  // `version` comes from module.prop as-is. An explicit `versionCode=N` in
+  // module.prop wins, because that is the number update.json advertises: if the
+  // zip and the manifest disagree, the manager either never offers the update
+  // or offers it forever. A versionCode of 0 / missing falls back to the commit
+  // count, which keeps local test builds strictly increasing.
   const rawProp = await fs.readFile(path.join(moduleDir, 'module.prop'), 'utf-8');
   const baseVersion = /^version=(.*)$/m.exec(rawProp)?.[1]?.trim() ?? 'v0';
+  const declaredCode = Number.parseInt(
+    /^versionCode=(.*)$/m.exec(rawProp)?.[1]?.trim() ?? '',
+    10,
+  );
 
   const git = readGitInfo(ROOT);
-  const versionCode = git.commits > 0 ? git.commits : 1;
+  const versionCode =
+    Number.isFinite(declaredCode) && declaredCode > 0
+      ? declaredCode
+      : git.commits > 0
+        ? git.commits
+        : 1;
 
   const updatedProp = rewriteModuleProp(rawProp, {
     versionCode,

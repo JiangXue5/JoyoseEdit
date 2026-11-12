@@ -1,8 +1,8 @@
 id=joyose-edit
 name=JoyoseEdit
-version=v0.1.0
-versionCode=1
+version=v1.1.0
+versionCode=11000
 author=YuKongA
 description=KernelSU WebUI editor for V3 Joyose cloud control (SmartP.db + teg_config.db). Supports Novatek / Qualcomm GPU (AFME/FRC/FSR) / MIVK paths, with additive edit history.
-updateJson=
+updateJson=https://raw.githubusercontent.com/JiangXue5/JoyoseEdit/main/update.json
 webuiIcon=icon.png
