@@ -308,7 +308,14 @@ async function handlePush() {
   if (note === null) return;
   try {
     const name = await pushAll({ note });
-    toast.success('已提交并写入历史', name);
+    if (state.applyStatus?.stopped === false) {
+      toast.warn(
+        '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
+        name,
+      );
+    } else {
+      toast.success('已提交并写入历史', name);
+    }
   } catch (err) {
     toast.fromError(err, '提交失败');
   }

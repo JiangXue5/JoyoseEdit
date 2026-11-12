@@ -219,9 +219,18 @@ async function handleRevertLatest() {
   if (!ok) return;
   try {
     const r = await bridge.revertLatest();
-    await bridge.restart().catch(() => null);
+    let stopped = r.stopped;
+    if (stopped !== true) {
+      // Older helper: revert did not stop Joyose itself, so ask again.
+      const again = await bridge.restart().catch(() => null);
+      if (typeof again?.stopped === 'boolean') stopped = again.stopped;
+    }
     await pullAll();
-    toast.success('已回滚到备份', r.from);
+    if (stopped === false) {
+      toast.warn('已回滚，但 Joyose 未能停止 —— 请手动重启它后再进游戏', r.from);
+    } else {
+      toast.success('已回滚到备份', r.from);
+    }
   } catch (err) {
     toast.fromError(err, '回滚失败');
   }

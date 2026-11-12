@@ -129,7 +129,17 @@ export async function pull(which: DbSelector): Promise<Uint8Array> {
   return base64ToBytes(out.trim());
 }
 
-export async function push(which: DbSelector, bytes: Uint8Array): Promise<{ ok: true; path: string }> {
+export interface WriteResult {
+  ok: true;
+  path: string;
+  uid?: number;
+  gid?: number;
+  /** Whether Joyose was confirmed dead before the file was replaced.
+   * Absent on an older installed helper. */
+  stopped?: boolean;
+}
+
+export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteResult> {
   assertSelector(which);
   const b64 = bytesToBase64(bytes);
   const stage = `push-${which}-${Date.now().toString(36)}`;
@@ -144,15 +154,28 @@ export async function backup(label?: string): Promise<{ ok: true; dir: string; n
   return JSON.parse(out);
 }
 
-export async function revert(name: string): Promise<{ ok: true; from: string }> {
+export interface RevertResult {
+  ok: true;
+  from: string;
+  stopped?: boolean;
+}
+
+export async function revert(name: string): Promise<RevertResult> {
   return JSON.parse(await runKsu(`sh ${HELPER} revert ${sanitizeLabel(name, true)}`));
 }
 
-export async function revertLatest(): Promise<{ ok: true; from: string }> {
+export async function revertLatest(): Promise<RevertResult> {
   return JSON.parse(await runKsu(`sh ${HELPER} revert-latest`));
 }
 
-export async function restart(): Promise<{ ok: true; pkg: string }> {
+export interface RestartResult {
+  ok: true;
+  pkg: string;
+  /** Whether the process was confirmed gone, not just "am did not throw". */
+  stopped?: boolean;
+}
+
+export async function restart(): Promise<RestartResult> {
   return JSON.parse(await runKsu(`sh ${HELPER} restart`));
 }
 

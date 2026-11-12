@@ -139,10 +139,19 @@ async function revertFromBackup() {
   });
   if (!ok) return;
   try {
-    await bridge.revert(backupName);
-    await bridge.restart().catch(() => null);
+    const reverted = await bridge.revert(backupName);
+    let stopped = reverted.stopped;
+    if (stopped !== true) {
+      // Older helper: revert did not stop Joyose itself, so ask again.
+      const again = await bridge.restart().catch(() => null);
+      if (typeof again?.stopped === 'boolean') stopped = again.stopped;
+    }
     await pullAll();
-    toast.success('已回滚到备份', backupName);
+    if (stopped === false) {
+      toast.warn('已回滚，但 Joyose 未能停止 —— 请手动重启它后再进游戏', backupName);
+    } else {
+      toast.success('已回滚到备份', backupName);
+    }
   } catch (err) {
     toast.fromError(err, '回滚失败');
   }

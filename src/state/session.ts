@@ -63,6 +63,9 @@ export interface SessionState {
   /** Snapshot of the state captured on pull — used as `before` for history records. */
   pristineSnapshot: ReturnType<typeof snapshotFromMaps> | null;
   dirty: boolean;
+  /** Outcome of the last write: whether Joyose was confirmed stopped.
+   * `null` while unknown (helper too old to report it). */
+  applyStatus: { stopped: boolean | null; at: number } | null;
 }
 
 export const state = reactive<SessionState>({
@@ -78,6 +81,7 @@ export const state = reactive<SessionState>({
   activeBackend: null,
   pristineSnapshot: null,
   dirty: false,
+  applyStatus: null,
 });
 
 export const isReady = computed(
@@ -132,6 +136,7 @@ export async function pullAll(): Promise<void> {
       rulesByModule: state.rulesByModule,
     });
     state.dirty = false;
+    state.applyStatus = null;
     state.lastError = null;
   } catch (err: any) {
     state.lastError = err?.message ?? String(err);
@@ -379,10 +384,14 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     });
 
     // persist DBs first, so if anything fails we can re-sync
-    await bridge.push('smartp', outSmartp);
+    const stops: boolean[] = [];
+    const recordStop = (r: { stopped?: boolean }) => {
+      if (typeof r?.stopped === 'boolean') stops.push(r.stopped);
+    };
+    recordStop(await bridge.push('smartp', outSmartp));
     // only touch teg if we actually have rows to write
     if (Object.values(state.rulesByModule).some((rows) => rows.length > 0)) {
-      await bridge.push('teg', outTeg);
+      recordStop(await bridge.push('teg', outTeg));
     }
 
     // write history after successful DB push. v2 records store only the
@@ -402,8 +411,14 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     const fname = buildHistoryFilename(ts, seq);
     await bridge.historySave(fname, JSON.stringify(rec));
 
-    // restart Joyose so it picks up the new values
-    await bridge.restart().catch(() => null);
+    // Restart Joyose so it re-reads the DB. Report the result instead of
+    // swallowing it: a silent failure here looks like "the edit did nothing".
+    const restarted = await bridge.restart().catch(() => null);
+    if (restarted) recordStop(restarted);
+    state.applyStatus = {
+      stopped: stops.length > 0 ? stops.every(Boolean) : null,
+      at: Date.now(),
+    };
 
     state.pristineSnapshot = recordAfter;
     state.dirty = false;
