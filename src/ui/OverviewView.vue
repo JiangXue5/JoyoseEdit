@@ -7,9 +7,6 @@
       <button class="primary" @click="handleBackup" :disabled="state.loading">
         <AppIcon name="db" /> 立即备份
       </button>
-      <button class="ghost danger-text" @click="handleResetCloud" :disabled="state.loading">
-        <AppIcon name="warn" /> 重置云控
-      </button>
     </PageHeader>
 
     <!-- device spotlight -->
@@ -92,10 +89,10 @@
             </span>
             <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
           </div>
-          <div class="data-note mono">
+          <div class="data-note mono source-note">
             <span>{{ sourceLine('SmartP', smartpHeaderVersion(String(name)), cfg.meta?.source) }}</span>
             <span>{{ sourceLine('teg', tegHeaderVersion(String(name)), cfg.meta?.source) }}</span>
-            <span v-if="!cfg.meta?.fromTeg">规则 {{ ruleVersions(String(name)) }}</span>
+            <span v-if="!cfg.meta?.empty">规则 {{ ruleVersions(String(name)) }}</span>
           </div>
         </div>
         <div v-if="Object.keys(state.cloudConfig).length === 0" class="hint" style="padding: 8px 0">
@@ -396,11 +393,20 @@ function isVersionLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');
 }
 
+/** Rule versions as comparable numbers: envelope.version (YYYYMMDDxx).
+ *  `rule_version` is an internal insert ordinal and must not be shown as one. */
 function ruleVersions(name: string): string {
   const rows = state.rulesByModule[name] ?? [];
   if (rows.length === 0) return '（空）';
-  const vs = rows.map((r) => r.meta.rule_version).filter(Boolean);
-  return vs.join(', ') || '—';
+  const seen = new Set<number>();
+  const vs: string[] = [];
+  for (const r of rows) {
+    const v = Number((r.content as any)?.version ?? 0);
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    vs.push(String(v));
+  }
+  return vs.join(' · ') || '（空）';
 }
 
 function formatSize(bytes?: number): string {
@@ -552,6 +558,14 @@ async function handleRevertLatest() {
 
 .danger-text:hover {
   border-color: var(--danger);
+}
+
+/* Two source lines + the rule list read as separate facts; without wrapping
+   they ran together into "SmartP 2025112651teg 2025122001". */
+.source-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
 }
 
 .hero {
