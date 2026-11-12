@@ -49,10 +49,26 @@
           <input v-model="currentParsed.pkg" @input="rewrite" />
         </div>
 
-        <div class="grid-3">
+        <!-- Simple 7-field sets: three cards side by side. Complex multi-block
+             sets (a set is several blocks joined by `&` / `|`) get one card per
+             block, in document order, because they are not interchangeable. -->
+        <div v-if="!isComplex" class="grid-3">
           <NovatekSegmentCard label="Set A ── 独显方案 A" :segment="currentParsed.setA" @change="rewrite" />
           <NovatekSegmentCard label="Set GPU ── GPU 备选" :segment="currentParsed.setGpu" @change="rewrite" />
           <NovatekSegmentCard label="Set B ── 独显方案 B" :segment="currentParsed.setB" @change="rewrite" />
+        </div>
+        <div v-else class="stack">
+          <div class="banner warn">
+            <strong>复杂多块格式</strong>
+            <span>这条配置由多个块用 <span class="mono">&amp;</span> / <span class="mono">|</span> 拼接而成，
+              逐块编辑。块之间的连接符不会被改动。</span>
+          </div>
+          <NovatekSegmentCard
+            v-for="fb in flatBlocks"
+            :key="fb.key"
+            :label="fb.label"
+            :segment="fb.block"
+            @change="rewrite" />
         </div>
 
         <div class="panel" style="margin: 0; background: var(--bg-elevated)">
@@ -90,6 +106,8 @@ import {
   setThermal,
   blankNovatek,
   type NovatekParams,
+  type NovatekSet,
+  type NovatekBlock,
 } from '@/parsers/novatek-string';
 import PageHeader from './PageHeader.vue';
 import { rafThrottle } from '@/utils/raf';
@@ -100,6 +118,45 @@ import { dialog } from '@/state/dialog';
 
 const listKey = ref<'main' | 'nonplay'>('main');
 const selected = ref(0);
+
+const isComplex = computed(() => !!currentParsed.value?.complex);
+
+interface FlatBlockItem {
+  key: string;
+  label: string;
+  block: NovatekBlock;
+}
+
+const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function letterName(i: number): string {
+  return LETTERS[i % 26] ?? `#${i + 1}`;
+}
+
+/** Flatten every block across the three sets and give each a stable name:
+ *  minFps==0 && targetFps==0 is the GPU fallback block, everything else is a
+ *  numbered independent-display scheme. */
+const flatBlocks = computed<FlatBlockItem[]>(() => {
+  const p = currentParsed.value;
+  if (!p) return [];
+  const segs: [string, NovatekSet][] = [
+    ['setA', p.setA],
+    ['setGpu', p.setGpu],
+    ['setB', p.setB],
+  ];
+  const out: FlatBlockItem[] = [];
+  let order = 0;
+  for (const [skey, set] of segs) {
+    set.blocks.forEach((b, bi) => {
+      const isGpu = Number(b.minFps) === 0 && Number(b.targetFps) === 0;
+      const label = isGpu
+        ? 'Set GPU ── GPU 备选'
+        : `Set ${letterName(order)} ── 独显方案 ${letterName(order)}`;
+      if (!isGpu) order++;
+      out.push({ key: `${skey}-${bi}`, label, block: b });
+    });
+  }
+  return out;
+});
 
 const backendMismatch = computed(
   () => state.activeBackend !== null && state.activeBackend !== 'novatek',

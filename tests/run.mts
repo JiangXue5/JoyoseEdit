@@ -30,6 +30,7 @@ import {
   validateNovatek,
   setThermal,
   blankNovatek,
+  describeComplexBlocks,
   decodeSlot,
   encodeSlotHex,
 } from '../src/parsers/novatek-string';
@@ -144,6 +145,7 @@ async function main() {
   await runFpsLockPrefixTest();
   await runLiftThermalTest();
   await runThermalUnlockTest();
+  await runNovatekComplexTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1248,6 +1250,49 @@ async function runThermalUnlockTest() {
     if (!tree.game_booster.frc_game_params[0].raw.includes('_96.5_93_91')) throw new Error('frc not lifted');
     if (applyThermalUnlock(tree).changed) throw new Error('second apply changed something');
     return `lifted ${r.groupsTotal} groups across ${r.fieldsAffected} fields`;
+  });
+}
+
+const COMPLEX_NOVATEK =
+  'com.miHoYo.Yuanshen_49#144#48,144,1,0x2114,0,0,0,0,0,0,0,0,0,0,0,1,0x1#45#43#41.5#40&41#120#40,120,1,0x2114,0,0,0,0,0,0,0,0,0,0,0,1,0x1#46.7#45#43#41|49#144#48,144,1,0x2114,0,0,0,0,0,0,0,0,0,0,0,1,0x1#46.7#45#43#41_0#0#0,0,0,0,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41_49#144#48,144,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#45#43#41.5#40&41#120#40,120,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41|49#144#48,144,1,0x2114,1,0x55,1,0x222,0,0,0,0,0x52,1,0x1#46.7#45#43#41';
+
+async function runNovatekComplexTest() {
+  console.log('\n=== novatek complex multi-block ===');
+  await check('novatek: complex multi-block round-trips verbatim', () => {
+    const p = parseNovatek(COMPLEX_NOVATEK);
+    if (serializeNovatek(p) !== COMPLEX_NOVATEK) throw new Error('round-trip mismatch');
+    if (!p.complex) throw new Error('complex flag not set');
+    return 'pkg=' + p.pkg + ': verbatim';
+  });
+  await check('novatek: three blocks per set with & / | joins preserved', () => {
+    const blocks = describeComplexBlocks(parseNovatek(COMPLEX_NOVATEK).setA.raw as string);
+    if (blocks.length !== 3) throw new Error('expected 3 blocks, got ' + blocks.length);
+    if (blocks[0].join !== '' || blocks[1].join !== '&' || blocks[2].join !== '|') {
+      throw new Error('joins wrong: ' + blocks.map((b) => b.join).join(','));
+    }
+    if (blocks[1].minFps !== '41' || blocks[1].targetFps !== '120') throw new Error('block2 mis-parse');
+    return '3 blocks, joins preserved';
+  });
+  await check('novatek: setThermal lifts every block', () => {
+    const p = parseNovatek(COMPLEX_NOVATEK);
+    setThermal(p, '95', '93', '93', '91');
+    const out = serializeNovatek(p);
+    if (!out.includes('#95#93#93#91&41#120')) throw new Error('temps not lifted / join lost');
+    return 'temps lifted, block joins preserved';
+  });
+  await check('novatek: surface edits on a short set actually persist', () => {
+    const p = parseNovatek(
+      'com.miHoYo.Nap_61#120#60,120,1,0x2314#95#93#93#91_0#0#0,0,0,0,1,0x44,1,0x222,0,0,0,0,0x52,1,0x2#95#93#93#91_61#120#60,120,1,0x2314,1,0x44,1,0x222,0,0,0,0,0x52,1,0x2#95#93#93#91',
+    );
+    p.setA.minFps = '73';
+    p.setA.t1 = '47';
+    p.setB.targetFps = '144';
+    const out = serializeNovatek(p);
+    if (!out.startsWith('com.miHoYo.Nap_73#120#')) throw new Error('minFps not applied: ' + out.slice(0, 40));
+    if (!out.includes('#47#93#93#91_')) throw new Error('t1 not applied');
+    if (!out.includes('_61#144#')) throw new Error('setB targetFps not applied');
+    if (serializeNovatek(parseNovatek(out)) !== out) throw new Error('round-trip broken after edit');
+    return 'standard short format editable';
   });
 }
 
