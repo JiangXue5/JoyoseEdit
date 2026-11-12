@@ -81,19 +81,36 @@
         <button class="ghost sm" @click="goLock">管理</button>
       </div>
       <div class="data-list">
-        <div v-for="(cfg, name) in state.cloudConfig" :key="name" class="data-row">
-          <div class="data-main">
+        <div v-for="(cfg, name) in state.cloudConfig" :key="name" class="cfg-row">
+          <div class="cfg-head">
             <strong class="mono">{{ name }}</strong>
-            <span class="pill" :class="isVersionLocked(cfg.meta.version) ? 'warn' : ''">
-              {{ currentLabel(cfg) }}
-            </span>
+            <span
+              class="cfg-version"
+              :class="{ locked: isVersionLocked(cfg.meta?.version) }"
+              :title="cfg.meta?.empty ? '' : `原始版本号 ${cfg.meta?.version ?? '—'}`"
+            ><span class="lbl">{{ isVersionLocked(cfg.meta?.version) ? '锁定' : '生效' }}</span>{{ currentLabel(cfg) }}</span>
             <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
           </div>
-          <div class="data-note mono source-note">
-            <span>{{ sourceLine('SmartP', sourceVersion(String(name), 'smartp'), cfg.meta?.source) }}</span>
-            <span>{{ sourceLine('teg', sourceVersion(String(name), 'teg'), cfg.meta?.source) }}</span>
-            <span v-if="!cfg.meta?.empty">规则 {{ ruleVersions(String(name)) }}</span>
-          </div>
+          <dl class="cfg-sources">
+            <div class="cfg-source">
+              <dt>SmartP.db</dt>
+              <dd>
+                <span class="num">{{ fmtVersion(sourceVersion(String(name), 'smartp')) }}</span>
+                <span v-if="isActiveSource(cfg.meta?.source, 'smartp')" class="cfg-tag">生效</span>
+              </dd>
+            </div>
+            <div class="cfg-source">
+              <dt>teg_config.db</dt>
+              <dd>
+                <span class="num">{{ fmtVersion(sourceVersion(String(name), 'teg')) }}</span>
+                <span v-if="isActiveSource(cfg.meta?.source, 'teg')" class="cfg-tag">生效</span>
+              </dd>
+            </div>
+            <div v-if="ruleHistory(String(name))" class="cfg-source">
+              <dt>历史版本</dt>
+              <dd class="faint">{{ ruleHistory(String(name)) }}</dd>
+            </div>
+          </dl>
         </div>
         <div v-if="Object.keys(state.cloudConfig).length === 0" class="hint" style="padding: 8px 0">
           两个数据库里都没有 cloud_config 行。先在 Joyose 里联网下发一次云控，或到「JSON 编辑」写入。
@@ -295,19 +312,24 @@ function sourceOptionLabel(name: string, v: BoosterSourcePref): string {
   return `${base}${version}${mark}`;
 }
 
-/** Version shown next to each side: the same comparable numbers auto uses
- *  (SmartP's version column / the highest teg envelope.version). The params'
- *  own header.version can lag behind them, which made the "← 当前" line look
- *  like it disagreed with the picker. */
-function sourceLine(label: string, version: number, current?: string): string {
-  const mark = current === label.toLowerCase() ? ' ← 当前' : '';
-  return `${label} ${version > 0 ? version : '—'}${mark}`;
+/** Cloud versions are `YYYYMMDDnn`. The raw number is unreadable at a glance,
+ *  and three of them side by side said nothing about which was which — so the
+ *  list shows dates and keeps the raw form in the tooltip. */
+function fmtVersion(v: unknown): string {
+  const n = Number(v ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const s = String(Math.trunc(n));
+  if (s.length === 10) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  return s;
+}
+
+function isActiveSource(source: unknown, side: 'smartp' | 'teg'): boolean {
+  return String(source ?? '').toLowerCase() === side;
 }
 
 function currentLabel(cfg: any): string {
   if (cfg.meta?.empty) return '（空）';
-  const v = Number(cfg.meta?.version ?? 0);
-  return v > 0 ? String(v) : '—';
+  return fmtVersion(cfg.meta?.version);
 }
 
 const showDataSource = computed(
@@ -410,18 +432,21 @@ function isVersionLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');
 }
 
-/** Rule versions as comparable numbers: envelope.version (YYYYMMDDxx).
- *  `rule_version` is an internal insert ordinal and must not be shown as one. */
-function ruleVersions(name: string): string {
+/** Revisions left behind in teg's `rules` table. The newest one is already
+ *  shown as teg's version above, so only the backlog is listed here —
+ *  repeating the newest number in both lines was pure noise. */
+function ruleHistory(name: string): string {
   const rows = state.rulesByModule[name] ?? [];
-  if (rows.length === 0) return '（空）';
   const seen = new Set<number>();
   for (const r of rows) {
     const v = Number((r.content as any)?.version ?? 0);
     if (v > 0) seen.add(v);
   }
-  // Newest first, so the row auto would pick reads from the left.
-  return [...seen].sort((a, b) => b - a).join(' · ') || '（空）';
+  const vs = [...seen].sort((a, b) => b - a).slice(1);
+  if (vs.length === 0) return '';
+  const shown = vs.slice(0, 2).map(fmtVersion);
+  const more = vs.length > shown.length ? ` 等 ${vs.length} 条` : '';
+  return `${shown.join(' · ')}${more}`;
 }
 
 function formatSize(bytes?: number): string {
