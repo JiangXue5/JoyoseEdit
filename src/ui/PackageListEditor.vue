@@ -140,9 +140,13 @@ function dedupe() {
 
 @media (max-width: 860px) {
   .pkg-list-scroll {
-    /* Was 52dvh — more than half the screen turned into an inner scrollbox,
-       so the page itself looked frozen wherever the finger landed. */
-    max-height: 42dvh;
+    /* No inner scrollbox at all on a phone. A box that is taller than its
+       content still counts as a scroll container, so a short list (a couple of
+       packages) turned into a dead zone: the swipe did nothing there and never
+       reached the page. Letting the list flow with the page removes the
+       question entirely — the panel scrolls as one. */
+    max-height: none;
+    overflow: visible;
   }
 }
 </style>

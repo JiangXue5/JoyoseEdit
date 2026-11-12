@@ -1373,7 +1373,11 @@ pre {
   border-radius: var(--radius-md);
   padding: 18px;
   min-width: 0;
-  overflow-x: auto;
+  /* `clip` instead of `auto`: an `overflow-x: auto` box also forces the block
+     axis to `auto`, so it becomes a vertical scroll container that can never
+     scroll — and swallows every swipe that starts on the form. `clip` cuts the
+     2px overflow without creating a scroll container at all. */
+  overflow-x: clip;
 }
 
 .twopane .detail.hint,
@@ -1872,6 +1876,11 @@ pre {
     overflow-y: hidden;
     padding: 8px;
     -webkit-overflow-scrolling: touch;
+    /* The desktop rule above sets `contain`, which would trap the gesture in
+       this row even when it has a single chip. Only the horizontal axis needs
+       to be isolated here. */
+    overscroll-behavior: auto;
+    overscroll-behavior-x: contain;
   }
 
   .twopane .list > .row {

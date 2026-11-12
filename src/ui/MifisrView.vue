@@ -1077,7 +1077,7 @@ function enableMifisrSwitch() {
   border: 1px solid var(--border);
   font-size: 11.5px;
   line-height: 1.55;
-  overflow-x: auto;
+  overflow-x: clip;
   color: var(--text-muted);
 }
 
