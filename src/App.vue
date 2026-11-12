@@ -330,11 +330,14 @@ async function handlePush() {
   if (note === null) return;
   try {
     const name = await pushAll({ note });
+    const rebased = state.rebasedAt !== null;
     if (state.applyStatus?.stopped === false) {
       toast.warn(
         '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
         name,
       );
+    } else if (rebased) {
+      toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
     } else {
       toast.success('已提交并写入历史', name);
     }

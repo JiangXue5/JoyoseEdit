@@ -89,6 +89,9 @@ export interface SessionState {
   /** Outcome of the last write: whether Joyose was confirmed stopped.
    * `null` while unknown (helper too old to report it). */
   applyStatus: { stopped: boolean | null; at: number } | null;
+  /** When the last commit had to rebase onto a fresher DB, the timestamp of
+   *  that merge; null when the last commit applied directly. */
+  rebasedAt: number | null;
 }
 
 export const state = reactive<SessionState>({
@@ -106,6 +109,7 @@ export const state = reactive<SessionState>({
   pristineSnapshot: null,
   dirty: false,
   applyStatus: null,
+  rebasedAt: null,
 });
 
 export const isReady = computed(
@@ -179,6 +183,7 @@ export async function pullAll(): Promise<void> {
     });
     state.dirty = false;
     state.applyStatus = null;
+    state.rebasedAt = null;
     state.lastError = null;
   } catch (err: any) {
     state.lastError = err?.message ?? String(err);
@@ -607,18 +612,25 @@ export interface PushOptions {
   }
 }
 
+/** The DB moved underneath us. Distinct from a generic failure so the caller
+ *  can rebase and retry instead of asking the user to throw their edits away. */
+export class ConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+
 /** Commit the in-memory edits: build history record, write both DBs, save
  * history, refresh state. Returns the history filename written. */
-export async function pushAll(opts: PushOptions = {}): Promise<string> {
-  state.loading = true;
+async function pushCore(opts: PushOptions = {}): Promise<string> {
   try {
     if (!opts.force) {
       const fresh = await bridge.digest().catch(() => null);
       const check = (label: string, baseline: string | null, current: string | null) => {
         if (!baseline || !current || baseline === current) return;
-        throw new Error(
-          `${label} 在拉取后被改动过（${current.slice(0, 12)} ≠ ${baseline.slice(0, 12)}）。` +
-            `请重新拉取，或强制覆盖。`,
+        throw new ConflictError(
+          `${label} 在拉取后被改动过（${current.slice(0, 12)} ≠ ${baseline.slice(0, 12)}）。`,
         );
       };
       if (fresh) {
@@ -755,6 +767,76 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
     await refreshStat();
     await refreshBaseline();
     return fname;
+  } catch (err) {
+    // ConflictError bubbles to pushAll, which rebases and retries; anything
+    // else is a genuine failure and must reach the user.
+    throw err;
+  }
+}
+
+/** Re-apply the pending edits on top of whatever Joyose just wrote.
+ *
+ *  The user's changes are expressed as a delta against pristineSnapshot; we
+ *  pull the fresh DBs, restore the per-row metadata (a locked version must not
+ *  be undone by the rebase), and replay the delta onto the new base. Nothing
+ *  is discarded except a change the cloud made to the exact same field. */
+async function rebaseOntoLatest(): Promise<void> {
+  const baseSnap =
+    state.pristineSnapshot ??
+    snapshotFromMaps({ cloudConfig: state.cloudConfig, rulesByModule: state.rulesByModule });
+  const delta = diff(baseSnap, snapshotFromMaps({
+    cloudConfig: state.cloudConfig,
+    rulesByModule: state.rulesByModule,
+  }));
+
+  const metasBefore: Record<string, any> = {};
+  for (const [k, v] of Object.entries(state.cloudConfig)) {
+    metasBefore[k] = JSON.parse(JSON.stringify((v as any).meta ?? null));
+  }
+
+  const [smartpBytes, tegBytes] = await Promise.all([
+    state.stat?.smartp?.exists ? bridge.pull('smartp') : Promise.resolve<null>(null),
+    state.stat?.teg?.exists ? bridge.pull('teg') : Promise.resolve<null>(null),
+  ]);
+  const dbS = smartpBytes ? await openDb(smartpBytes) : null;
+  const dbT = tegBytes ? await openDb(tegBytes) : null;
+  try {
+    readIntoState(dbS, dbT);
+  } finally {
+    if (dbS) closeDb(dbS);
+    if (dbT) closeDb(dbT);
+  }
+
+  for (const [k, m] of Object.entries(metasBefore)) {
+    if (state.cloudConfig[k] && m) (state.cloudConfig[k] as any).meta = m;
+  }
+
+  const newestSnap = snapshotFromMaps({
+    cloudConfig: state.cloudConfig,
+    rulesByModule: state.rulesByModule,
+  });
+  rehydrateFromSnapshot(applyDelta(newestSnap, delta));
+  state.pristineSnapshot = newestSnap;
+  state.dirty = true;
+}
+
+/** Public commit entry point: on a conflict, rebase onto the fresh DBs and
+ *  retry (up to 3 attempts) before surfacing the error. */
+export async function pushAll(opts: PushOptions = {}): Promise<string> {
+  state.loading = true;
+  try {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await pushCore(opts);
+      } catch (err) {
+        lastErr = err;
+        if (!(err instanceof ConflictError) || opts.force || attempt === 2) throw err;
+        await rebaseOntoLatest();
+        state.rebasedAt = Date.now();
+      }
+    }
+    throw lastErr;
   } finally {
     state.loading = false;
   }
