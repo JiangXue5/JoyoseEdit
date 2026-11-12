@@ -1,6 +1,6 @@
 {
-  "version": "v1.1.1",
-  "versionCode": 11100,
-  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.1/joyose-edit-v1.1.1.zip",
-  "changelog": "v1.1.1 — 修复滚动：页头折叠时页面被滚动锚定拽回顶部、来回闪（现在关闭锚定 + 双阈值 + 切页复位）；修复内嵌滚动区（游戏列表 / 包名列表 / JSON 编辑器）滚到边界后吞掉手势、大半屏划不动（现在会把手势交回页面）。"
+  "version": "v1.1.2",
+  "versionCode": 11200,
+  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.2/joyose-edit-v1.1.2.zip",
+  "changelog": "v1.1.2 — 修复「来源 / 写入目标选完又跳回默认」：偏好改为保存在模块目录的 settings.json，不再依赖 WebView 的 localStorage（换管理器、清 WebView 数据都不会丢）；写入失败会给出提示。"
 }
