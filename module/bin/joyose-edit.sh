@@ -70,6 +70,54 @@ safe_name() {
   esac
 }
 
+# ---- process / file hand-off ----------------------------------------------
+# Joyose keeps the parsed cloud config in memory *and* keeps the SQLite file
+# handles open. Replacing a database underneath a live process is what makes
+# an edit look like it "needs two game launches" to take effect:
+#
+#   mv new SmartP.db -> old inode stays open in Joyose
+#   Joyose writes something in the next few ms -> creates SmartP.db-journal
+#     for the *unlinked* old inode, but at the *same path*
+#   next open sees a hot journal -> rolls the OLD pages back over our NEW file
+#     -> the first launch reads the pre-edit config
+#   the recovery consumed the journal -> the second launch sees the new file
+#
+# So: stop the process first, drop any stale journal/WAL sidecars (they belong
+# to the file we just replaced), then write.
+
+_stop_pkg() {
+  if ! command -v am >/dev/null 2>&1; then
+    printf 'false'
+    return 0
+  fi
+  am force-stop "$PKG" >/dev/null 2>&1 || true
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if ! pidof "$PKG" >/dev/null 2>&1; then
+      printf 'true'
+      return 0
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  printf 'false'
+}
+
+# Sidecars are per-database-name, not per-inode: after a replace they still
+# point at the bytes we just threw away.
+_drop_sidecars() {
+  rm -f "$1-journal" "$1-wal" "$1-shm" 2>/dev/null || true
+}
+
+# Post-write sanity. sqlite3 is present on most ROMs; when it is missing we
+# fall back to the magic-word check the callers already do.
+_verify_db() {
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  local out
+  out=$(sqlite3 "$1" 'PRAGMA quick_check;' 2>/dev/null || printf 'error')
+  [ "$out" = "ok" ] || die "post-write integrity check failed for $1: $out"
+}
+
 stat_one() {
   local f="$1" key="$2"
   if [ -f "$f" ]; then
@@ -108,7 +156,7 @@ cmd_pull() {
 }
 
 cmd_push() {
-  local sel="$1" b64="$2" target tmp uid gid
+  local sel="$1" b64="$2" target tmp uid gid stopped
   [ -n "$b64" ] || die "push: missing base64 payload"
   target=$(resolve_db "$sel")
   [ -f "$target" ] || die "missing: $target"
@@ -121,12 +169,17 @@ cmd_push() {
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
   chown "$uid:$gid" "$tmp" 2>/dev/null || true
   chmod 660 "$tmp"
+  stopped=$(_stop_pkg)
+  _drop_sidecars "$target"
   mv -f "$tmp" "$target"
+  _drop_sidecars "$target"
+  _verify_db "$target"
   # SELinux labels: copy from sibling file to keep Joyose happy if present.
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$target" 2>/dev/null || true
   fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s}\n' "$target" "$uid" "$gid"
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":%s}\n' \
+    "$target" "$uid" "$gid" "$stopped"
 }
 
 cmd_backup() {
@@ -146,24 +199,38 @@ cmd_backup() {
 }
 
 _revert_from_dir() {
-  local dir="$1" uid gid
+  local dir="$1" uid gid stopped tmp
   [ -d "$dir" ] || die "no such backup: $dir"
+  # Same hand-off rule as push: never overwrite a file Joyose still has open.
+  # `cp -f` used to write in place (same inode) which lets the process keep a
+  # stale pager cache over the new bytes; stage + rename instead.
+  stopped=$(_stop_pkg)
   if [ -f "$dir/SmartP.db" ] && [ -f "$SMARTP" ]; then
     uid=$(stat -c '%u' "$SMARTP"); gid=$(stat -c '%g' "$SMARTP")
-    cp -f "$dir/SmartP.db" "$SMARTP"
-    chown "$uid:$gid" "$SMARTP" 2>/dev/null || true
-    chmod 660 "$SMARTP"
+    tmp="$SMARTP.jedit.$$"
+    cp -f "$dir/SmartP.db" "$tmp"
+    chown "$uid:$gid" "$tmp" 2>/dev/null || true
+    chmod 660 "$tmp"
+    _drop_sidecars "$SMARTP"
+    mv -f "$tmp" "$SMARTP"
+    _drop_sidecars "$SMARTP"
   fi
   if [ -f "$dir/teg_config.db" ] && [ -f "$TEG" ]; then
     uid=$(stat -c '%u' "$TEG"); gid=$(stat -c '%g' "$TEG")
-    cp -f "$dir/teg_config.db" "$TEG"
-    chown "$uid:$gid" "$TEG" 2>/dev/null || true
-    chmod 660 "$TEG"
+    tmp="$TEG.jedit.$$"
+    cp -f "$dir/teg_config.db" "$tmp"
+    chown "$uid:$gid" "$tmp" 2>/dev/null || true
+    chmod 660 "$tmp"
+    _drop_sidecars "$TEG"
+    mv -f "$tmp" "$TEG"
+    _drop_sidecars "$TEG"
   fi
+  _verify_db "$SMARTP"
+  _verify_db "$TEG"
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$SMARTP" "$TEG" 2>/dev/null || true
   fi
-  printf '{"ok":true,"from":"%s"}\n' "$dir"
+  printf '{"ok":true,"from":"%s","stopped":%s}\n' "$dir" "$stopped"
 }
 
 cmd_revert() {
@@ -179,8 +246,9 @@ cmd_revert_latest() {
 }
 
 cmd_restart() {
-  am force-stop "$PKG" 2>/dev/null || true
-  printf '{"ok":true,"pkg":"%s"}\n' "$PKG"
+  local stopped
+  stopped=$(_stop_pkg)
+  printf '{"ok":true,"pkg":"%s","stopped":%s}\n' "$PKG" "$stopped"
 }
 
 cmd_history_list() {
@@ -311,7 +379,7 @@ cmd_stage_append() {
 }
 
 cmd_push_from_stage() {
-  local sel="$1" stage="$2" target tmp uid gid stage_file
+  local sel="$1" stage="$2" target tmp uid gid stage_file stopped
   safe_name "$stage" || die "invalid stage name"
   target=$(resolve_db "$sel")
   [ -f "$target" ] || die "missing: $target"
@@ -324,12 +392,19 @@ cmd_push_from_stage() {
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
   chown "$uid:$gid" "$tmp" 2>/dev/null || true
   chmod 660 "$tmp"
+  # Stop the consumer before the swap, and clear sidecars that still describe
+  # the file we are replacing. See the note above _stop_pkg.
+  stopped=$(_stop_pkg)
+  _drop_sidecars "$target"
   mv -f "$tmp" "$target"
+  _drop_sidecars "$target"
   rm -f "$stage_file"
+  _verify_db "$target"
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$target" 2>/dev/null || true
   fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s}\n' "$target" "$uid" "$gid"
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":%s}\n' \
+    "$target" "$uid" "$gid" "$stopped"
 }
 
 cmd_history_save_from_stage() {
