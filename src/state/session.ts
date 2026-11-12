@@ -14,8 +14,9 @@ import {
   exportDb,
   listCloudConfig,
   listRules,
+  latestRuleIdForModule,
   updateCloudConfigParams,
-  updateRulesContent,
+  updateRuleContentById,
 } from '@/db/dbio';
 import {
   detectActiveBackend,
@@ -211,18 +212,40 @@ function samePaths(a: V3PathStatus[], b: V3PathStatus[]): boolean {
   return true;
 }
 
+/** The row Joyose treats as current for a module: highest `rule_version`
+ * (an insert ordinal), not highest envelope version. The rules table keeps
+ * every historical release, so "the module" is ambiguous without this. */
+export function currentRuleRow<T extends { meta: { rule_version?: unknown } }>(
+  rows: T[],
+): T | null {
+  if (rows.length === 0) return null;
+  let best = rows[0];
+  let bestVersion = Number(best.meta?.rule_version ?? 0);
+  if (!Number.isFinite(bestVersion)) bestVersion = 0;
+  for (const row of rows.slice(1)) {
+    const v = Number(row.meta?.rule_version ?? 0);
+    if (Number.isFinite(v) && v > bestVersion) {
+      best = row;
+      bestVersion = v;
+    }
+  }
+  return best;
+}
+
 /** Synchronise teg_config.rules.rule_content for a given module from the
- * current cloud_config.params. Mirrors what Joyose itself does internally. */
+ * current cloud_config.params. Mirrors what Joyose itself does internally.
+ *
+ * Only the module's current row is touched. Rewriting every row with one blob
+ * used to collapse a Xiaomi 15's five booster_config revisions into a single
+ * copy and, worse, stamp the oldest row's `rule_version` onto all of them. */
 export function syncRuleContent(configName: string, newVersion?: number): void {
   const cc = state.cloudConfig[configName];
   if (!cc) return;
-  const rules = state.rulesByModule[configName];
-  if (!rules || rules.length === 0) return;
-  for (const r of rules) {
-    const v = newVersion ?? Number(cc.meta.version ?? r.meta.rule_version ?? 0);
-    r.content = refreshEnvelope(r.content as any, cc.params, v);
-    if (typeof newVersion === 'number') r.meta.rule_version = newVersion;
-  }
+  const row = currentRuleRow(state.rulesByModule[configName] ?? []);
+  if (!row) return;
+  const v = newVersion ?? Number(cc.meta.version ?? row.meta.rule_version ?? 0);
+  row.content = refreshEnvelope(row.content as any, cc.params, v);
+  if (typeof newVersion === 'number') row.meta.rule_version = newVersion;
 }
 
 /** Lock the cloud version by rewriting the leading 4 digits to `2099`.
@@ -321,11 +344,14 @@ export async function pushAll(opts: PushOptions = {}): Promise<string> {
       for (const [module, rows] of Object.entries(state.rulesByModule)) {
         // When rules table is empty (redmi style), skip.
         if (rows.length === 0) continue;
-        const latest = rows[0];
-        const envelope = latest.content;
-        const version =
-          typeof latest.meta.rule_version === 'number' ? latest.meta.rule_version : undefined;
-        updateRulesContent(dbT, module, JSON.stringify(envelope), version);
+        const row = currentRuleRow(rows);
+        if (!row) continue;
+        // Resolve the target *against the DB we are about to write*, not
+        // against our (possibly stale) in-memory copy: Joyose may have
+        // appended a newer revision between pull and push.
+        const id = latestRuleIdForModule(dbT, module);
+        if (id === null) continue;
+        updateRuleContentById(dbT, id, JSON.stringify(row.content));
       }
 
       outSmartp = exportDb(dbS);

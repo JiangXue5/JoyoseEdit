@@ -118,6 +118,39 @@ export function listRules(db: Database): RulesRow[] {
   return out;
 }
 
+/**
+ * `rules` keeps one row per historical release of a module — a Xiaomi 15
+ * carries five booster_config revisions side by side, each ~140 KB with its
+ * own envelope version. The row Joyose treats as current is the one with the
+ * highest `rule_version` (a monotonic internal ordinal; it is NOT the
+ * YYYYMMDDxx value that lives inside the envelope).
+ */
+export function latestRuleIdForModule(db: Database, module: string): number | null {
+  const stmt = db.prepare(
+    `SELECT _id FROM rules WHERE rule_module = :m
+      ORDER BY rule_version DESC, _id DESC LIMIT 1`,
+  );
+  stmt.bind({ ':m': module });
+  const has = stmt.step();
+  const row = has ? (stmt.getAsObject() as { _id?: number }) : null;
+  stmt.free();
+  const id = Number(row?._id);
+  return Number.isFinite(id) ? id : null;
+}
+
+/** Rewrite the content of a single rules row, addressed by primary key.
+ * Deliberately leaves `rule_version` alone: it is Joyose's insert ordinal,
+ * and rewriting it (or copying one row's value onto every sibling) makes the
+ * local DB look older than the cloud and invites an immediate re-push. */
+export function updateRuleContentById(db: Database, id: number, content: string): number {
+  db.run(`UPDATE rules SET rule_content = :c WHERE _id = :id`, {
+    ':c': content,
+    ':id': id,
+  });
+  const res = db.exec(`SELECT changes() as n`);
+  return Number(res[0]?.values?.[0]?.[0] ?? 0);
+}
+
 /** Update `rule_content` and `rule_version` of every row that matches `module`. */
 export function updateRulesContent(
   db: Database,
