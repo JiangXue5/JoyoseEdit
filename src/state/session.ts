@@ -48,6 +48,7 @@ import {
   getDataSourcePref,
   getBoosterSourcePref,
   getCommonSourcePref,
+  getWriteTarget,
   getStoredInstallTs,
   storeInstallTs,
   resetAllPrefs,
@@ -647,6 +648,12 @@ export class ConflictError extends Error {
  * history, refresh state. Returns the history filename written. */
 async function pushCore(opts: PushOptions = {}): Promise<string> {
   try {
+    // Which database(s) this commit may touch. Global setting, honoured by
+    // every page — see the "来源与写入" panel.
+    const writeTarget = getWriteTarget();
+    const writeSmartp = writeTarget === 'both' || writeTarget === 'smartp';
+    const writeTeg = writeTarget === 'both' || writeTarget === 'teg';
+
     if (!opts.force) {
       const fresh = await bridge.digest().catch(() => null);
       const check = (label: string, baseline: string | null, current: string | null) => {
@@ -655,37 +662,45 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
           `${label} 在拉取后被改动过（${current.slice(0, 12)} ≠ ${baseline.slice(0, 12)}）。`,
         );
       };
+      // Only the database we are about to write can conflict with us; a teg
+      // update must not block a SmartP-only commit.
       if (fresh) {
-        check('SmartP.db', state.baselineSmartp, fresh.smartp);
-        check('teg_config.db', state.baselineTeg, fresh.teg);
+        if (writeSmartp) check('SmartP.db', state.baselineSmartp, fresh.smartp);
+        if (writeTeg) check('teg_config.db', state.baselineTeg, fresh.teg);
       }
     }
 
     // Auto-sync rules.rule_content from the matching cloud_config row, so
     // any edit made via the structured views propagates to the teg mirror
-    // without the view layer needing to remember.
-    ensureCommonConfigMirror();
-    for (const name of Object.keys(state.cloudConfig)) {
-      if (state.rulesByModule[name]?.length) syncRuleContent(name);
+    // without the view layer needing to remember. Only meaningful when teg is
+    // a write target.
+    if (writeTeg) {
+      ensureCommonConfigMirror();
+      for (const name of Object.keys(state.cloudConfig)) {
+        if (state.rulesByModule[name]?.length) syncRuleContent(name);
+      }
     }
 
     // auto-backup
     await bridge.backup().catch(() => null);
 
     // re-pull current bytes, mutate, write back
-    const [smartpBytes, tegBytes] = await Promise.all([bridge.pull('smartp'), bridge.pull('teg')]);
-    const dbS = await openDb(smartpBytes);
-    const dbT = await openDb(tegBytes);
+    const [smartpBytes, tegBytes] = await Promise.all([
+      writeSmartp && state.stat?.smartp?.exists ? bridge.pull('smartp') : Promise.resolve<null>(null),
+      writeTeg && state.stat?.teg?.exists ? bridge.pull('teg') : Promise.resolve<null>(null),
+    ]);
+    const dbS = smartpBytes ? await openDb(smartpBytes) : null;
+    const dbT = tegBytes ? await openDb(tegBytes) : null;
 
-    let outSmartp: Uint8Array;
-    let outTeg: Uint8Array;
+    let outSmartp: Uint8Array | null = null;
+    let outTeg: Uint8Array | null = null;
     try {
       // Only rewrite rows the user actually touched. Re-serialising every row
       // meant that a cloud push landing between our pull and our commit was
       // silently rolled back on every unrelated config, because we wrote the
       // whole in-memory snapshot back.
       const baseline = state.pristineSnapshot?.smartp?.cloud_config ?? {};
-      for (const [name, obj] of Object.entries(state.cloudConfig)) {
+      for (const [name, obj] of dbS ? Object.entries(state.cloudConfig) : []) {
         // Only rows that genuinely exist in SmartP and carry content: a config
         // that arrived from the teg fallback must never be written into SmartP,
         // and an empty row has nothing to write.
@@ -705,9 +720,9 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
           : typeof obj.meta?.smartpVersion === 'number' && obj.meta.smartpVersion > 0
             ? obj.meta.smartpVersion
             : undefined;
-        updateCloudConfigParams(dbS, name, serialized, version);
+        if (dbS) updateCloudConfigParams(dbS, name, serialized, version);
       }
-      for (const [module, rows] of Object.entries(state.rulesByModule)) {
+      for (const [module, rows] of dbT ? Object.entries(state.rulesByModule) : []) {
         // When rules table is empty (redmi style), skip.
         if (rows.length === 0) continue;
         const row = currentRuleRow(rows);
@@ -718,6 +733,7 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
         // Resolve the target *against the DB we are about to write*, not
         // against our (possibly stale) in-memory copy: Joyose may have
         // appended a newer revision between pull and push.
+        if (!dbT) continue;
         const id = latestRuleIdForModule(dbT, module);
         if (id === null) {
           // The mirror row was created in memory above; insert it now instead of
@@ -728,11 +744,11 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
         updateRuleContentById(dbT, id, JSON.stringify(row.content));
       }
 
-      outSmartp = exportDb(dbS);
-      outTeg = exportDb(dbT);
+      outSmartp = dbS ? exportDb(dbS) : null;
+      outTeg = dbT ? exportDb(dbT) : null;
     } finally {
-      closeDb(dbS);
-      closeDb(dbT);
+      if (dbS) closeDb(dbS);
+      if (dbT) closeDb(dbT);
     }
 
     const recordBefore = state.pristineSnapshot ??
@@ -750,11 +766,13 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     // Uploading a DB costs one ksu.exec round-trip per 48 KB of base64 — about
     // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
     // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
-    if (!sameBytes(outSmartp, smartpBytes)) {
+    if (outSmartp && smartpBytes && !sameBytes(outSmartp, smartpBytes)) {
       recordStop(await bridge.push('smartp', outSmartp));
     }
     // only touch teg if we actually have rows to write
     if (
+      outTeg &&
+      tegBytes &&
       Object.values(state.rulesByModule).some((rows) => rows.length > 0) &&
       !sameBytes(outTeg, tegBytes)
     ) {
