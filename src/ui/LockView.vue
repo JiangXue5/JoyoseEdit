@@ -73,17 +73,35 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(cfg, name) in state.cloudConfig" :key="name">
-            <td><strong class="mono">{{ name }}</strong></td>
+          <tr v-for="(cfg, name) in state.cloudConfig" :key="name" :class="{ 'row-empty': cfg.meta?.empty }">
+            <td>
+              <strong class="mono">{{ name }}</strong>
+              <span v-if="cfg.meta?.empty" class="pill off">空配置</span>
+              <span v-else-if="cfg.meta?.fromTeg" class="pill off">来自 teg</span>
+            </td>
             <td data-label="云控版本">
-              <span class="pill" :class="isLocked(cfg.meta.version) ? 'warn' : ''">
+              <span v-if="cfg.meta?.empty" class="muted">—</span>
+              <span v-else class="pill" :class="isLocked(cfg.meta.version) ? 'warn' : ''">
                 {{ cfg.meta.version ?? '—' }}
               </span>
             </td>
-            <td class="mono muted" data-label="参数头版本">{{ cfg.params?.header?.version ?? '—' }}</td>
-            <td class="mono muted" data-label="规则版本">{{ ruleVersions(String(name)) }}</td>
+            <td class="mono muted" data-label="参数头版本">
+              {{ cfg.meta?.empty ? '—' : cfg.params?.header?.version ?? '—' }}
+            </td>
+            <td class="mono muted" data-label="规则版本">
+              <template v-if="ruleVersionList(String(name)).length">
+                <span v-for="(rv, ri) in ruleVersionList(String(name))" :key="ri"
+                  :class="{ 'old-version': rv.old }">
+                  {{ rv.v }}<template v-if="ri < ruleVersionList(String(name)).length - 1">, </template>
+                </span>
+              </template>
+              <span v-else>（空）</span>
+            </td>
             <td class="num" data-label="操作">
-              <button v-if="!isLocked(cfg.meta.version)" class="primary sm" @click="lock(String(name))"
+              <template v-if="cfg.meta?.empty">
+                <span class="muted">—</span>
+              </template>
+              <button v-else-if="!isLocked(cfg.meta.version)" class="primary sm" @click="lock(String(name))"
                 :disabled="state.loading">锁定</button>
               <button v-else class="ghost sm" @click="unlock(String(name))" :disabled="state.loading">还原</button>
             </td>
@@ -97,6 +115,7 @@
       </div>
       <p class="hint" style="margin-top: var(--space-2)">
         「全部锁定」会把所有配置的版本前 4 位改成 <strong>2099</strong>。仅在内存中生效，需在底部提交条写入设备。
+        规则版本列里<strong>划掉</strong>的是历史版本，不属于锁定对象，但会保留在 teg 中。
       </p>
     </section>
   </div>
@@ -114,11 +133,29 @@ function isLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');
 }
 
-function ruleVersions(name: string): string {
+interface RuleVersionItem {
+  v: string;
+  /** Older than the config's current version, i.e. a historical release. */
+  old: boolean;
+}
+
+/** Rule versions as the user can compare them: envelope.version (YYYYMMDDxx).
+ *  `rule_version` is an internal insert ordinal and was previously shown here,
+ *  which made 649438 look like a version next to 2025120301. */
+function ruleVersionList(name: string): RuleVersionItem[] {
   const rows = state.rulesByModule[name] ?? [];
-  if (rows.length === 0) return '（rules 表为空）';
-  const vs = rows.map((r) => r.meta.rule_version).filter(Boolean);
-  return vs.join(', ') || '—';
+  if (rows.length === 0) return [];
+  const base = Number(state.cloudConfig[name]?.meta?.version ?? 0);
+  const seen = new Set<number>();
+  const out: RuleVersionItem[] = [];
+  for (const r of rows) {
+    const envV = (r.content as any)?.version;
+    const v = typeof envV === 'number' && envV > 0 ? envV : 0;
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push({ v: String(v), old: Number(v) < base });
+  }
+  return out;
 }
 
 function shortPath(p?: string): string {
@@ -133,19 +170,37 @@ function lock(name: string) {
 }
 
 function unlock(name: string) {
-  const cur = Number(state.cloudConfig[name]?.meta.version ?? 0);
-  const restored = Number(`2024${String(cur).slice(4)}`);
+  const cc = state.cloudConfig[name] as any;
+  const cur = Number(cc?.meta?.version ?? 0);
+  // Restore the version recorded before locking. The old `2024 + tail` guess
+  // wrote a wrong year whenever the cloud had already moved past 2024.
+  const restored = Number(cc?.meta?.originalVersion ?? cur);
   unlockCloudVersion(name, restored);
   markDirty();
   toast.warn('已还原版本（待提交）', `${name} → ${restored}；下一次云控下发可能覆盖`);
 }
 
 function lockAll() {
-  for (const name of Object.keys(state.cloudConfig)) {
-    lockCloudVersion(name);
+  const names = Object.keys(state.cloudConfig);
+  if (names.length === 0) {
+    toast.info('没有可锁定的云控配置', '检测不到 booster_config / common_config');
+    return;
+  }
+  const skipped: string[] = [];
+  for (const name of names) {
+    try {
+      lockCloudVersion(name);
+    } catch {
+      // no usable version on either side (e.g. an empty teg mirror)
+      skipped.push(name);
+    }
   }
   markDirty();
-  toast.success('全部配置版本已刷到 2099 开头（待提交）');
+  if (skipped.length) {
+    toast.warn('已锁定其余配置', `跳过（无有效版本）：${skipped.join('、')}`);
+  } else {
+    toast.success('全部配置版本已刷到 2099 开头（待提交）');
+  }
 }
 
 function bumpOnly() {
@@ -201,6 +256,15 @@ onActivated(() => {
 </script>
 
 <style scoped>
+.row-empty {
+  opacity: 0.6;
+}
+
+.old-version {
+  text-decoration: line-through;
+  opacity: 0.55;
+}
+
 .freeze {
   position: relative;
   overflow: hidden;
