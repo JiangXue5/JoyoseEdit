@@ -10,3 +10,6 @@ release/*.zip
 # editor
 .vscode/
 .idea/
+
+# local mock fixtures for the preview harness
+public/__mock/
