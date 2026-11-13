@@ -10,7 +10,10 @@
 //      confirm the edits stuck.
 //   5. Exercise history store + diff against a filesystem driver.
 
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync } from 'node:fs';
+import {
+  readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync,
+  statSync, symlinkSync,
+} from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -3005,6 +3008,8 @@ interface HelperHarness {
   dataDir: string;
   fake: string;
   bin: string;
+  /** Set when the test needs a PATH the helper cannot escape. */
+  sysbin?: string;
 }
 
 function touchState(h: HelperHarness, name: string) {
@@ -3053,7 +3058,7 @@ exec /usr/bin/mv "$@"
   writeFileSync(path.join(bin, '.fake-dir'), fake);
 }
 
-function newHarness(opts: { sqlite3?: 'corrupt' } = {}): HelperHarness {
+function newHarness(opts: { sqlite3?: 'corrupt' | 'absent' | 'ok' } = {}): HelperHarness {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'joyose-helper-'));
   const dbDir = path.join(dir, 'db');
   const dataDir = path.join(dir, 'data');
@@ -3065,14 +3070,71 @@ function newHarness(opts: { sqlite3?: 'corrupt' } = {}): HelperHarness {
   writeFileSync(path.join(dbDir, 'SmartP.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 15/SmartP.db')));
   writeFileSync(path.join(dbDir, 'new.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')));
   writeFakeTools(bin, fake);
-  if (opts.sqlite3 === 'corrupt') {
+  let sysbin: string | undefined;
+  if (opts.sqlite3 === 'absent') {
+    // The helper takes a different branch when sqlite3 is missing, and the
+    // host decides which branch this test hits: the dev sandbox has no
+    // sqlite3, GitHub's ubuntu runner does. Both must exercise the fallback,
+    // so PATH is rebuilt out of symlinks to everything except sqlite3.
+    sysbin = mirrorPathWithout(path.join(dir, 'sysbin'), ['sqlite3']);
+  } else if (opts.sqlite3 === 'corrupt') {
     // A ROM that has sqlite3, and a file whose PRAGMA quick_check fails even
     // though the 16-byte header is intact.
     const f = path.join(bin, 'sqlite3');
     writeFileSync(f, '#!/bin/sh\nprintf "corruption\\n"\n');
     chmodSync(f, 0o755);
+  } else if (opts.sqlite3 === 'ok') {
+    // A ROM whose sqlite3 is fine. Answering by SQL keeps the stub honest:
+    // quick_check says ok, the table count query succeeds.
+    const f = path.join(bin, 'sqlite3');
+    writeFileSync(f, `#!/bin/sh
+case "$2" in
+  *quick_check*) printf 'ok\\n' ;;
+  *sqlite_master*) printf '3\\n' ;;
+  *) printf 'ok\\n' ;;
+esac
+exit 0
+`);
+    chmodSync(f, 0o755);
   }
-  return { dir, dbDir, dataDir, fake, bin };
+  return { dir, dbDir, dataDir, fake, bin, sysbin };
+}
+
+/** Recreate the real PATH as one directory of symlinks, minus `exclude`.
+ *
+ *  Used to prove a "tool is not installed" branch on a machine where the tool
+ *  is installed. Filtering PATH string-wise cannot work — the binary usually
+ *  lives in /usr/bin next to sh, cp and mv, which the helper needs.
+ */
+function mirrorPathWithout(dir: string, exclude: string[]): string {
+  mkdirSync(dir, { recursive: true });
+  const skip = new Set(exclude);
+  const done = new Set<string>();
+  for (const entry of (process.env.PATH ?? '').split(':')) {
+    if (!entry) continue;
+    let names: string[];
+    try {
+      names = readdirSync(entry);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (skip.has(name) || done.has(name)) continue;
+      const target = path.join(entry, name);
+      try {
+        if (!statSync(target).isFile()) continue;
+      } catch {
+        continue;
+      }
+      try {
+        symlinkSync(target, path.join(dir, name));
+        done.add(name);
+      } catch {
+        /* a later PATH entry already provided this name */
+      }
+    }
+  }
+  return dir;
 }
 
 function harnessScript(h: HelperHarness, driver: string): string {
@@ -3087,7 +3149,7 @@ function harnessScript(h: HelperHarness, driver: string): string {
     '#!/bin/sh',
     body,
     `DB=${h.dbDir}`,
-    `export PATH="${h.bin}:$PATH"`,
+    h.sysbin ? `export PATH="${h.bin}:${h.sysbin}"` : `export PATH="${h.bin}:$PATH"`,
     `export FAKE="${h.fake}"`,
     'set +e',
     driver,
@@ -3100,7 +3162,12 @@ function runHarness(h: HelperHarness, driver: string, env: Record<string, string
   const r = spawnSync('sh', [file], {
     encoding: 'utf8',
     timeout: 60000,
-    env: { ...process.env, ...env, FAKE: h.fake },
+    env: {
+      ...process.env,
+      ...env,
+      ...(h.sysbin ? { PATH: `${h.bin}:${h.sysbin}` } : {}),
+      FAKE: h.fake,
+    },
   });
   return { code: r.status ?? -1, out: r.stdout ?? '', err: r.stderr ?? '' };
 }
@@ -3162,7 +3229,10 @@ echo "EXIT=$?"`;
   });
 
   await check('helper: 截断的候选库被拒（头正确不足以为证）', () => {
-    const h = newHarness();
+    // A real sqlite3 would also reject this, but the property under test is
+    // the helper's own geometry check — the one that has to work when the ROM
+    // ships no sqlite3. Force that branch so the assertion means what it says.
+    const h = newHarness({ sqlite3: 'absent' });
     const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
     const r = runHarness(h, `head -c 4096 "$DB/new.db" > "$DB/trunc.db"
 B64=$(base64 -w0 "$DB/trunc.db")
@@ -3188,7 +3258,17 @@ echo "EXIT=$?"`);
   });
 
   await check('helper: 没有 sqlite3 时好库仍然可写（geometry 校验）', () => {
-    const h = newHarness();
+    const h = newHarness({ sqlite3: 'absent' });
+    // Assert the setup, not just the outcome: if PATH still resolves sqlite3
+    // the helper silently takes the other branch and this test proves nothing.
+    const probe = spawnSync('sh', ['-c', 'command -v sqlite3'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${h.bin}:${h.sysbin}` },
+    });
+    if (probe.status === 0) {
+      cleanupHarness(h);
+      throw new Error('harness still resolves sqlite3 at ' + probe.stdout.trim());
+    }
     const expected = shaOf(path.join(h.dbDir, 'new.db'));
     const r = runHarness(h, push);
     const after = shaOf(path.join(h.dbDir, 'SmartP.db'));
@@ -3197,6 +3277,17 @@ echo "EXIT=$?"`);
     if (!r.out.includes('"verified":"geometry"')) throw new Error('did not report the fallback');
     if (after !== expected) throw new Error('bytes on disk are not the ones we sent');
     return 'geometry fallback, exact bytes';
+  });
+  await check('helper: 有 sqlite3 且 quick_check 通过时走完整校验', () => {
+    const h = newHarness({ sqlite3: 'ok' });
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    const r = runHarness(h, push);
+    const after = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write refused: ' + r.err.slice(0, 200));
+    if (!r.out.includes('"verified":"sqlite3"')) throw new Error('did not use the real check');
+    if (after === before) throw new Error('database was not written');
+    return 'quick_check path, written';
   });
   await check('helper: 替换失败时原库保持且不留副本', () => {
     const h = newHarness();
