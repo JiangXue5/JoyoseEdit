@@ -168,6 +168,7 @@ import {
   STRATEGY_PRESETS,
   emptyFisrConfig,
   findGroupForPkg,
+  groupImpact,
   upsertPkgPolicy,
   removePkg,
   type FisrConfig,
@@ -322,14 +323,33 @@ function removeCurrent() {
   markDirty();
 }
 
-function applyPreset(preset: PresetName) {
+async function applyPreset(preset: PresetName) {
   if (!currentParsed.value) return;
-  applyFisrPreset(currentParsed.value.pkg, preset);
+  await applyFisrPreset(currentParsed.value.pkg, preset);
 }
 
-function applyFisrPreset(pkg: string, preset: PresetName) {
+/** Same shared-group warning as the MIFISR page: upsertPkgPolicy() splits the
+ *  group first, so the other games keep their strategy — but that is invisible
+ *  from here unless we say it. */
+async function confirmSplit(pkg: string, action: string): Promise<boolean> {
+  const cfg = ensureGameBooster().fisr_config as FisrConfig | undefined;
+  if (!cfg) return true;
+  const impact = groupImpact(cfg, pkg);
+  if (!impact?.shared) return true;
+  const shown = impact.peers.slice(0, 6).join('、');
+  const more = impact.peers.length > 6 ? ` 等 ${impact.peers.length} 款` : '';
+  return dialog.confirm(`${action}会影响共用的策略组`, {
+    detail:
+      `${pkg} 的策略与 ${impact.peers.length} 款游戏共用（${shown}${more}），`
+      + `共用 ${impact.policies} 条策略。继续会把 ${pkg} 拆成独立策略组，其余游戏不变。`,
+    okText: '拆分并继续',
+  });
+}
+
+async function applyFisrPreset(pkg: string, preset: PresetName) {
   const gb = ensureGameBooster();
   if (!gb.fisr_config) gb.fisr_config = emptyFisrConfig();
+  if (!(await confirmSplit(pkg, '应用 FRC 预设'))) return;
   upsertPkgPolicy(gb.fisr_config, pkg, STRATEGY_PRESETS[preset](), {
     switch_default_status: '0#0',
   });

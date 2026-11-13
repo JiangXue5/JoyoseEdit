@@ -170,6 +170,27 @@ export function setPkgSupportVk(cfg: FisrConfig, pkg: string, value: boolean): b
   return true;
 }
 
+export interface GroupImpact {
+  /** Other games sharing this group's policy list and support_vk flag. */
+  peers: string[];
+  /** True when peers is non-empty: any edit will split the group first. */
+  shared: boolean;
+  /** How many policies the group currently carries. */
+  policies: number;
+}
+
+/** Who else is affected if `pkg`'s group is edited.
+ *
+ *  The UI shows this before a preset / feature / support_vk change, because the
+ *  split is silent otherwise: the user edits "this game" and cannot tell that
+ *  the strategy entry was previously shared with three others. */
+export function groupImpact(cfg: FisrConfig, pkg: string): GroupImpact | null {
+  const group = findGroupForPkg(cfg, pkg);
+  if (!group) return null;
+  const peers = group.game_list.filter((p) => p !== pkg);
+  return { peers, shared: peers.length > 0, policies: group.enhance_policy_config.length };
+}
+
 /**
  * Append a single policy to the group for `pkg`. If the group doesn't exist,
  * create one. If a policy with the same `feature` already exists on the group,

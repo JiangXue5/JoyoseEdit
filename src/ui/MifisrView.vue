@@ -290,14 +290,16 @@ import {
   STRATEGY_PRESETS,
   emptyFisrConfig,
   findGroupForPkg,
+  groupImpact,
   upsertPkgPolicy,
-  removePkg,
+  setPkgSupportVk,
   addPolicyForPkg,
   removePolicyForPkg,
   isValidSupportGameMode,
   type FisrConfig,
   type FisrPolicy,
 } from '@/parsers/fisr-config';
+import { findPkgRoutes, removePkgRoutes } from '@/parsers/pkg-routes';
 import { findByCmdline, getEntries, modulesOf } from '@/parsers/mivk-migl';
 import { lookupKnownGame } from '@/presets/mifisr/known-games';
 import { toast } from '@/state/toast';
@@ -606,15 +608,22 @@ const currentSupportVk = computed(() => {
   return group?.support_vk === true;
 });
 
-function toggleSupportVk(on: boolean) {
+async function toggleSupportVk(on: boolean) {
   if (!currentParsed.value) return;
   const cfg = state.cloudConfig.booster_config?.params?.game_booster?.fisr_config as
     | FisrConfig
     | undefined;
   if (!cfg) return;
-  const group = findGroupForPkg(cfg, currentParsed.value.pkg);
+  const pkg = currentParsed.value.pkg;
+  const group = findGroupForPkg(cfg, pkg);
   if (!group) return;
-  group.support_vk = on;
+  // The flag is group-level: writing it on a shared group flips it for every
+  // game listed there, which is not what "this game's checkbox" implies.
+  if (group.game_list.length > 1) {
+    const ok = await confirmSplit(pkg, '切换 Vulkan 增强开关');
+    if (!ok) return;
+  }
+  setPkgSupportVk(cfg, pkg, on);
   markDirty();
 }
 
@@ -884,9 +893,20 @@ function removeCurrent() {
   } else if (selected.value >= list.length) {
     selected.value = list.length - 1;
   }
-  if (gb.fisr_config) removePkg(gb.fisr_config, pkg);
-  removeFromMqs(pkg);
-  removeFromDpFiConfig(pkg);
+  // Clear every route that only exists for this game, not just fisr_config:
+  // a leftover support_highfps_app entry keeps overriding fps for a game the
+  // user just deleted. Standalone settings (gex fps cap, FRC string) are left
+  // alone and reported instead of being silently dropped.
+  const cleaned = removePkgRoutes(gb, pkg);
+  const straight = cleaned.removed.map((r) => `${r.label}×${r.count}`).join('、');
+  const left = cleaned.kept.map((r) => `${r.label}×${r.count}`).join('、');
+  toast.success(
+    `已删除 ${pkg}`,
+    straight ? `同时清理：${straight}` : '没有其他关联路由',
+  );
+  if (left) {
+    toast.warn('这些关联设置已保留', `${left} 不是增强路由，需要的话请到对应页面单独删除`);
+  }
   markDirty();
 }
 
@@ -903,11 +923,12 @@ function hasFeature(feature: string): boolean {
   return routedPolicies.value?.some((p) => p.feature === feature) ?? false;
 }
 
-function addFisrFeature(feature: 'FI' | 'SR' | 'FISR') {
+async function addFisrFeature(feature: 'FI' | 'SR' | 'FISR') {
   if (!currentParsed.value) return;
   const pkg = currentParsed.value.pkg;
   const gb = ensureGameBooster();
   if (!gb.fisr_config) gb.fisr_config = emptyFisrConfig();
+  if (!(await confirmSplit(pkg, `添加 ${feature} 策略`))) return;
   const policy = policyForFeature(feature);
   const added = addPolicyForPkg(gb.fisr_config as FisrConfig, pkg, policy);
   if (!added) {
@@ -921,20 +942,22 @@ function addFisrFeature(feature: 'FI' | 'SR' | 'FISR') {
   toast.success(`已添加 ${feature}`, `strategy=${policy.strategy}`);
 }
 
-function removeFisrFeature(feature: string) {
+async function removeFisrFeature(feature: string) {
   if (!currentParsed.value) return;
   const pkg = currentParsed.value.pkg;
   const gb = ensureGameBooster();
   if (!gb.fisr_config) return;
+  if (!(await confirmSplit(pkg, `移除 ${feature} 策略`))) return;
   const removed = removePolicyForPkg(gb.fisr_config as FisrConfig, pkg, feature);
   if (!removed) return;
   markDirty();
   toast.success(`已移除 ${feature}`);
 }
 
-function applyFisrPreset(pkg: string) {
+async function applyFisrPreset(pkg: string) {
   const gb = ensureGameBooster();
   if (!gb.fisr_config) gb.fisr_config = emptyFisrConfig();
+  if (!(await confirmSplit(pkg, '应用 MIFISR 预设'))) return;
   upsertPkgPolicy(gb.fisr_config, pkg, STRATEGY_PRESETS.mifisrStandard());
   if (alsoUpdateMqs.value) addToMqs(pkg);
   markDirty();
@@ -949,21 +972,31 @@ function addToMqs(pkg: string) {
   }
 }
 
-function removeFromMqs(pkg: string) {
-  const gb = ensureGameBooster();
-  if (Array.isArray(gb.mqs_enhance_list)) {
-    gb.mqs_enhance_list = gb.mqs_enhance_list.filter((s: string) => !s.startsWith(`${pkg}:`));
-  }
-}
-
 // DMI (feature "FI" + strategy DMI) reads customize_game_params.dp_fi_config
 // at activation time; a miss makes l.b.q() return -1 and FI silently aborts.
-// Kept for expert users who switch a policy to DMI in the JSON editor.
-function removeFromDpFiConfig(pkg: string): void {
+// Kept for expert users who switch a policy to DMI in the JSON editor. The
+// deletion path uses removePkgRoutes(), which cleans this along with the rest.
+
+/** Warn before an edit that will split a shared policy group.
+ *
+ *  A group's `enhance_policy_config` and `support_vk` are shared by every game
+ *  in `game_list`. splitPkgGroup() keeps the change local, but the user cannot
+ *  see that from the editor — ask first, and name the games that stay behind. */
+async function confirmSplit(pkg: string, action: string): Promise<boolean> {
   const gb = ensureGameBooster();
-  const list = gb.customize_game_params?.dp_fi_config;
-  if (!Array.isArray(list)) return;
-  gb.customize_game_params.dp_fi_config = list.filter((s: string) => !s.startsWith(`${pkg}_`));
+  const cfg = gb.fisr_config as FisrConfig | undefined;
+  if (!cfg) return true;
+  const impact = groupImpact(cfg, pkg);
+  if (!impact?.shared) return true;
+  const shown = impact.peers.slice(0, 6).join('、');
+  const more = impact.peers.length > 6 ? ` 等 ${impact.peers.length} 款` : '';
+  return dialog.confirm(`${action}会影响共用的策略组`, {
+    detail:
+      `${pkg} 的策略与 ${impact.peers.length} 款游戏共用（${shown}${more}），`
+      + `共用 ${impact.policies} 条策略。继续会把 ${pkg} 拆成独立策略组，`
+      + `其余游戏的策略与 support_vk 保持不变。`,
+    okText: '拆分并继续',
+  });
 }
 
 function applyThermal(t1: number, t2: number, t3: number, t4: number) {

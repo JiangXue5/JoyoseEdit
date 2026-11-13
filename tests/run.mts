@@ -43,7 +43,9 @@ import {
   removePkg,
   setPkgSupportVk,
   splitPkgGroup,
+  groupImpact,
 } from '../src/parsers/fisr-config';
+import { findPkgRoutes, removePkgRoutes } from '../src/parsers/pkg-routes';
 import {
   parseSupportModule,
   serializeSupportModule,
@@ -1156,6 +1158,63 @@ async function runMifisrStringTest() {
     if (cfg.enhance_config.length !== before) throw new Error('group duplicated');
     if (own !== cfg.enhance_config[0]) throw new Error('returned a different group');
     return 'in place';
+  });
+
+  await check('impact: shared group names its peers, lone group does not', () => {
+    const cfg: any = {
+      enhance_config: [
+        { game_list: ['com.a', 'com.b', 'com.c'], enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }, { feature: 'FISR', strategy: 'FRC' }] },
+        { game_list: ['com.solo'], enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }] },
+      ],
+    };
+    const shared = groupImpact(cfg, 'com.b')!;
+    if (!shared.shared) throw new Error('shared group not detected');
+    if (shared.peers.join(',') !== 'com.a,com.c') throw new Error('peers wrong: ' + shared.peers.join(','));
+    if (shared.policies !== 2) throw new Error('policy count wrong: ' + shared.policies);
+    const solo = groupImpact(cfg, 'com.solo')!;
+    if (solo.shared || solo.peers.length !== 0) throw new Error('lone group reported as shared');
+    if (groupImpact(cfg, 'com.missing') !== null) throw new Error('missing pkg must return null');
+    return 'peers com.a,com.c / solo clean';
+  });
+
+  await check('routes: deleting a game clears its enhancement routes only', () => {
+    const gb: any = {
+      fisr_config: {
+        enhance_config: [
+          { game_list: ['com.a', 'com.b'], enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }] },
+        ],
+      },
+      mqs_enhance_list: ['com.a:60#default', 'com.b:60#default'],
+      customize_game_params: { dp_fi_config: ['com.a_dmi', 'com.b_dmi'] },
+      support_highfps_app: ['com.a:120', 'com.b:120'],
+      novatek_gex_fps_limit: ['com.a:144'],
+      frc_game_params: ['com.a_45_90_30_60_47_46_43_41_0x0_1_1'],
+    };
+    const before = findPkgRoutes(gb, 'com.a').map((r) => r.key);
+    if (before.length !== 6) throw new Error('expected 6 routes, got ' + before.join(','));
+    const res = removePkgRoutes(gb, 'com.a');
+    const removed = res.removed.map((r) => r.key).sort().join(',');
+    if (removed !== 'customize_game_params.dp_fi_config,fisr_config,mqs_enhance_list,support_highfps_app') {
+      throw new Error('removed set wrong: ' + removed);
+    }
+    const kept = res.kept.map((r) => r.key).sort().join(',');
+    if (kept !== 'frc_game_params,novatek_gex_fps_limit') throw new Error('kept set wrong: ' + kept);
+    if (findPkgRoutes(gb, 'com.a').length !== 2) throw new Error('routes left: ' + findPkgRoutes(gb, 'com.a').map((r) => r.key).join(','));
+    // Neighbour untouched.
+    const nb = findPkgRoutes(gb, 'com.b').map((r) => r.key).sort().join(',');
+    if (nb !== 'customize_game_params.dp_fi_config,fisr_config,mqs_enhance_list,support_highfps_app') {
+      throw new Error('neighbour damaged: ' + nb);
+    }
+    return '4 cleaned / 2 kept / neighbour intact';
+  });
+
+  await check('routes: second delete is a no-op and reports nothing removed', () => {
+    const gb: any = { mqs_enhance_list: ['com.b:60#default'], support_highfps_app: ['com.b:120'] };
+    if (findPkgRoutes(gb, 'com.a').length !== 0) throw new Error('unexpected hit');
+    const res = removePkgRoutes(gb, 'com.a');
+    if (res.removed.length || res.kept.length) throw new Error('reported work on a missing game');
+    if (gb.mqs_enhance_list.length !== 1) throw new Error('unrelated entry removed');
+    return 'no-op';
   });
 }
 
