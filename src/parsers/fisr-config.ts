@@ -102,10 +102,31 @@ export function findGroupForPkg(cfg: FisrConfig, pkg: string): FisrGroup | undef
   return cfg.enhance_config.find((g) => g.game_list.includes(pkg));
 }
 
+/** Give `pkg` a group of its own.
+ *
+ *  A group can list several games and share one `enhance_policy_config` (and
+ *  one `support_vk`). Editing the group to change one game therefore changes
+ *  every other game in it. Splitting first keeps the shared group's policy for
+ *  the remaining games and gives the edited game an independent copy.
+ *
+ *  Returns the group that now owns `pkg` (the original one when it is already
+ *  alone). */
+export function splitPkgGroup(cfg: FisrConfig, pkg: string): FisrGroup | undefined {
+  const group = findGroupForPkg(cfg, pkg);
+  if (!group) return undefined;
+  if (group.game_list.length <= 1) return group;
+  const own = clone(group);
+  own.game_list = [pkg];
+  group.game_list = group.game_list.filter((p) => p !== pkg);
+  cfg.enhance_config.push(own);
+  return own;
+}
+
 /**
  * Upsert a strategy preset for `pkg`. If an existing group already contains
- * `pkg`, its policy list is replaced with `policy`; otherwise a new group is
- * appended. Returns the mutated config (also mutates in place).
+ * `pkg`, it is split out first when that group is shared, so the change cannot
+ * leak to the other games listed there; otherwise a new group is appended.
+ * Returns the mutated config (also mutates in place).
  */
 export function upsertPkgPolicy(
   cfg: FisrConfig,
@@ -120,10 +141,11 @@ export function upsertPkgPolicy(
   if (!Array.isArray(cfg.enhance_config)) cfg.enhance_config = [];
   const existing = findGroupForPkg(cfg, pkg);
   if (existing) {
-    existing.enhance_policy_config = clone(policy);
-    if (extras?.switch_default_status) existing.switch_default_status = extras.switch_default_status;
-    if (extras?.joint_action_cmd) existing.joint_action_cmd = extras.joint_action_cmd.slice();
-    if (typeof extras?.support_vk === 'boolean') existing.support_vk = extras.support_vk;
+    const target = existing.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : existing;
+    target.enhance_policy_config = clone(policy);
+    if (extras?.switch_default_status) target.switch_default_status = extras.switch_default_status;
+    if (extras?.joint_action_cmd) target.joint_action_cmd = extras.joint_action_cmd.slice();
+    if (typeof extras?.support_vk === 'boolean') target.support_vk = extras.support_vk;
   } else {
     const group: FisrGroup = {
       game_list: [pkg],
@@ -137,12 +159,14 @@ export function upsertPkgPolicy(
   return cfg;
 }
 
-/** Set or clear the `support_vk` flag on the group containing `pkg`. No-op if
- *  the group doesn't exist yet. Returns true if the group was updated. */
+/** Set or clear the `support_vk` flag for `pkg` only. The flag is group-level,
+ *  so a shared group is split first. No-op if the group doesn't exist yet.
+ *  Returns true if the flag was updated. */
 export function setPkgSupportVk(cfg: FisrConfig, pkg: string, value: boolean): boolean {
   const group = findGroupForPkg(cfg, pkg);
   if (!group) return false;
-  group.support_vk = value;
+  const target = group.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : group;
+  target.support_vk = value;
   return true;
 }
 
@@ -159,10 +183,13 @@ export function addPolicyForPkg(
   if (!Array.isArray(cfg.enhance_config)) cfg.enhance_config = [];
   const existing = findGroupForPkg(cfg, pkg);
   if (existing) {
-    if (existing.enhance_policy_config.some((p) => p.feature === policy.feature)) {
+    // A shared group's policy list is common to every listed game; adding to
+    // it would enable the feature for all of them.
+    const target = existing.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : existing;
+    if (target.enhance_policy_config.some((p) => p.feature === policy.feature)) {
       return false;
     }
-    existing.enhance_policy_config.push(clone(policy));
+    target.enhance_policy_config.push(clone(policy));
   } else {
     cfg.enhance_config.push({
       game_list: [pkg],
@@ -185,12 +212,15 @@ export function removePolicyForPkg(
 ): boolean {
   const existing = findGroupForPkg(cfg, pkg);
   if (!existing) return false;
-  const before = existing.enhance_policy_config.length;
-  existing.enhance_policy_config = existing.enhance_policy_config.filter(
+  // Same reason as addPolicyForPkg: removing from a shared list would disable
+  // the feature for the other games in the group.
+  const target = existing.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : existing;
+  const before = target.enhance_policy_config.length;
+  target.enhance_policy_config = target.enhance_policy_config.filter(
     (p) => p.feature !== feature,
   );
-  if (existing.enhance_policy_config.length === before) return false;
-  if (existing.enhance_policy_config.length === 0) removePkg(cfg, pkg);
+  if (target.enhance_policy_config.length === before) return false;
+  if (target.enhance_policy_config.length === 0) removePkg(cfg, pkg);
   return true;
 }
 

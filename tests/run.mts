@@ -41,6 +41,8 @@ import {
   isFisrConfig,
   findGroupForPkg,
   removePkg,
+  setPkgSupportVk,
+  splitPkgGroup,
 } from '../src/parsers/fisr-config';
 import {
   parseSupportModule,
@@ -1020,6 +1022,65 @@ async function runMifisrStringTest() {
       .join(',');
     const want = ['FI:MIFISR', 'FISR:MIFISR', 'SR:MIFISR'].sort().join(',');
     if (pairs !== want) throw new Error(`pairs=${pairs}, want ${want}`);
+  });
+
+  await check('fisr: editing one game splits a shared policy group', () => {
+    const cfg: any = {
+      enhance_config: [
+        {
+          game_list: ['com.a', 'com.b'],
+          support_vk: false,
+          enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }],
+        },
+      ],
+    };
+    upsertPkgPolicy(cfg, 'com.a', [{ feature: 'FI', strategy: 'MIFISR' }]);
+    const a = findGroupForPkg(cfg, 'com.a');
+    const b = findGroupForPkg(cfg, 'com.b');
+    if (!a || !b) throw new Error('group missing after upsert');
+    if (a === b) throw new Error('shared group was edited in place');
+    if (a.enhance_policy_config[0]?.strategy !== 'MIFISR') {
+      throw new Error('target strategy not applied: ' + JSON.stringify(a));
+    }
+    if (b.enhance_policy_config[0]?.strategy !== 'AFME') {
+      throw new Error('neighbour strategy changed: ' + JSON.stringify(b));
+    }
+    if (b.game_list.length !== 1 || b.game_list[0] !== 'com.b') {
+      throw new Error('neighbour list changed: ' + JSON.stringify(b.game_list));
+    }
+    if (a.game_list.length !== 1) throw new Error('target still shared');
+    return 'split: a independent, b untouched';
+  });
+
+  await check('fisr: setPkgSupportVk on a shared group stays scoped to one game', () => {
+    const cfg: any = {
+      enhance_config: [
+        {
+          game_list: ['com.a', 'com.b'],
+          support_vk: false,
+          enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }],
+        },
+      ],
+    };
+    if (!setPkgSupportVk(cfg, 'com.a', true)) throw new Error('set refused');
+    const a = findGroupForPkg(cfg, 'com.a')!;
+    const b = findGroupForPkg(cfg, 'com.b')!;
+    if (a.support_vk !== true) throw new Error('flag not set on target');
+    if (b.support_vk !== false) throw new Error('flag leaked to neighbour');
+    return 'scoped to com.a';
+  });
+
+  await check('fisr: a single-game group is edited without cloning', () => {
+    const cfg: any = {
+      enhance_config: [
+        { game_list: ['com.a'], enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }] },
+      ],
+    };
+    const before = cfg.enhance_config.length;
+    const own = splitPkgGroup(cfg, 'com.a');
+    if (cfg.enhance_config.length !== before) throw new Error('group duplicated');
+    if (own !== cfg.enhance_config[0]) throw new Error('returned a different group');
+    return 'in place';
   });
 }
 
