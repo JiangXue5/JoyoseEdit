@@ -510,7 +510,11 @@ async function handleBackup() {
     const r = await backupNow();
     await recordBackupCheckpoint(r.name).catch(() => null);
     await refreshStat();
-    toast.success('已备份', r.name);
+    if (r.wasRunning && r.restarted === false) {
+      toast.warn('已备份，但 Joyose 未能重新启动', `${r.name} · 进游戏前请手动打开一次 Joyose`);
+    } else {
+      toast.success('已备份', r.name);
+    }
   } catch (err) {
     toast.fromError(err, '备份失败');
   }
@@ -525,15 +529,9 @@ async function handleRevertLatest() {
   if (!ok) return;
   try {
     const r = await revertLatestBackup();
-    let stopped = r.stopped;
-    if (stopped !== true) {
-      // Older helper: revert did not stop Joyose itself, so ask again.
-      const again = await bridge.restart().catch(() => null);
-      if (typeof again?.stopped === 'boolean') stopped = again.stopped;
-    }
     await pullAll();
-    if (stopped === false) {
-      toast.warn('已回滚，但 Joyose 未能停止 —— 请手动重启它后再进游戏', r.from);
+    if (r.wasRunning && r.restarted === false) {
+      toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', r.from);
     } else {
       toast.success('已回滚到备份', r.from);
     }

@@ -649,7 +649,7 @@ export interface PushOptions {
  *  only way back, so a missing backup means the write must not start. */
 async function ensureBackup(label?: string): Promise<void> {
   try {
-    const res = await bridge.backup(label);
+    const res = await bridge.backup(label, { restore: false });
     if (!res?.ok || !res.dir) {
       throw new Error('备份命令没有返回备份目录');
     }

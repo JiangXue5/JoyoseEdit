@@ -203,22 +203,40 @@ export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteR
   return JSON.parse(await runKsu(`sh ${HELPER} ${args.join(' ')}`));
 }
 
-export async function backup(label?: string): Promise<{
+export interface BackupResult {
   ok: true;
   dir: string;
   name: string;
+  /** Whether Joyose was confirmed stopped before the snapshot. */
   stopped?: boolean;
-}> {
+  /** Whether it was running before we quiesced it. */
+  wasRunning?: boolean;
+  /** Whether it was brought back afterwards (manual backups only). */
+  restarted?: boolean;
+}
+
+export async function backup(
+  label?: string,
+  opts: { restore?: boolean } = {},
+): Promise<BackupResult> {
   const safe = label ? sanitizeLabel(label) : '';
-  const cmd = safe ? `sh ${HELPER} backup ${safe}` : `sh ${HELPER} backup`;
-  const out = await runKsu(cmd);
-  return JSON.parse(out);
+  const parts = [`sh ${HELPER} backup`];
+  if (safe) parts.push(safe);
+  // A commit takes its backup right before writing, and the write path
+  // restarts Joyose itself — asking the helper to start it here would add a
+  // cold start to every commit.
+  if (opts.restore === false) parts.push('--no-restore');
+  return JSON.parse(await runKsu(parts.join(' ')));
 }
 
 export interface RevertResult {
   ok: true;
   from: string;
   stopped?: boolean;
+  /** Whether Joyose was running before the restore. */
+  wasRunning?: boolean;
+  /** Whether it was started again afterwards. */
+  restarted?: boolean;
 }
 
 export async function revert(name: string): Promise<RevertResult> {

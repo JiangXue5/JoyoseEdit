@@ -50,7 +50,10 @@ PKG=com.xiaomi.joyose
 mkdir -p "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 chmod 700 "$DATA_ROOT" "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 
-die() { printf '{"ok":false,"error":%s}\n' "$(printf '%s' "$1" | _json_string)"; exit 1; }
+# Errors go to stderr: callers capture stdout in $(...) all over this file
+# (resolve_db, prune_backups), and a fatal message printed to stdout was being
+# swallowed by command substitution — the user only saw "shell exit 1".
+die() { printf '{"ok":false,"error":%s}\n' "$(printf '%s' "$1" | _json_string)" >&2; exit 1; }
 
 # ---- helpers --------------------------------------------------------------
 _json_string() {
@@ -409,7 +412,13 @@ cmd_push() {
 }
 
 cmd_backup() {
-  local label="${1:-}" stamp dir stopped chk
+  local label="" restore="restore" arg stamp dir stopped chk was started
+  for arg in "$@"; do
+    case "$arg" in
+      --no-restore) restore="no-restore" ;;
+      *) label="$arg" ;;
+    esac
+  done
   stamp=$(date +%s)
   if [ -n "$label" ]; then
     safe_name "$label" || die "invalid label"
@@ -419,26 +428,39 @@ cmd_backup() {
   fi
   mkdir -p "$dir"
   chmod 700 "$dir"
+  # Remember whether Joyose was up before we quiesce it: a manual backup must
+  # not leave the phone with the game service stopped until the next launch.
+  was=false
+  if _pid_alive; then was=true; fi
   # A file-level copy of a database that a live process is writing can capture
   # a page or a rollback journal mid-transaction, which turns into a corrupt
   # (or silently rolled-back) restore later. Quiesce first — pushAll calls
   # backup immediately before it writes, so this costs nothing there.
   stopped=$(_stop_pkg)
+  if [ "$stopped" != "true" ]; then
+    rm -rf "$dir"
+    die "Joyose is still running; refusing to snapshot an open database"
+  fi
   [ -f "$SMARTP" ] && cp -f "$SMARTP" "$dir/SmartP.db"
   [ -f "$TEG" ] && cp -f "$TEG" "$dir/teg_config.db"
-  if command -v sqlite3 >/dev/null 2>&1; then
-    for f in "$dir/SmartP.db" "$dir/teg_config.db"; do
-      [ -f "$f" ] || continue
-      chk=$(sqlite3 "$f" 'PRAGMA quick_check;' 2>/dev/null || printf 'error')
-      if [ "$chk" != "ok" ]; then
-        rm -rf "$dir"
-        die "backup snapshot failed integrity check ($(basename "$f")): $chk"
-      fi
-    done
-  fi
+  for f in "$dir/SmartP.db" "$dir/teg_config.db"; do
+    [ -f "$f" ] || continue
+    chk=$(_verify_db "$f")
+    if [ "$chk" = "failed" ]; then
+      rm -rf "$dir"
+      die "backup snapshot failed integrity check ($(basename "$f"))"
+    fi
+  done
   prune_backups 10
-  printf '{"ok":true,"dir":"%s","name":"%s","stopped":%s,"kept":10}\n' \
-    "$dir" "$(basename "$dir")" "$stopped"
+  # A commit takes its backup immediately before writing, and the write path
+  # restarts Joyose itself — starting it here would only add a cold start to
+  # every commit. Manual backups restore the previous state by default.
+  started=false
+  if [ "$restore" != "no-restore" ] && [ "$was" = "true" ]; then
+    started=$(_start_pkg)
+  fi
+  printf '{"ok":true,"dir":"%s","name":"%s","stopped":%s,"wasRunning":%s,"restarted":%s,"kept":10}\n' \
+    "$dir" "$(basename "$dir")" "$stopped" "$was" "$started"
 }
 
 # Keep only the newest N backup directories (default 10). Covers every backup
@@ -455,38 +477,42 @@ prune_backups() {
 }
 
 _revert_from_dir() {
-  local dir="$1" uid gid stopped tmp
+  local dir="$1" tmp f chk was started
   [ -d "$dir" ] || die "no such backup: $dir"
+
+  # Refuse to restore a corrupt backup: the whole point is that this file is
+  # the known-good copy. Check both before touching either live database.
+  for f in "$dir/SmartP.db" "$dir/teg_config.db"; do
+    [ -f "$f" ] || continue
+    chk=$(_verify_db "$f")
+    if [ "$chk" = "failed" ]; then
+      die "backup file failed integrity check: $(basename "$f")"
+    fi
+  done
+
+  was=false
+  if _pid_alive; then was=true; fi
+
   # Same hand-off rule as push: never overwrite a file Joyose still has open.
-  # `cp -f` used to write in place (same inode) which lets the process keep a
-  # stale pager cache over the new bytes; stage + rename instead.
-  stopped=$(_stop_pkg)
+  # _install_db keeps a rollback copy and restores it if the post-check fails,
+  # so a bad restore cannot leave the phone with two broken databases.
   if [ -f "$dir/SmartP.db" ] && [ -f "$SMARTP" ]; then
-    uid=$(stat -c '%u' "$SMARTP"); gid=$(stat -c '%g' "$SMARTP")
     tmp="$SMARTP.jedit.$$"
-    cp -f "$dir/SmartP.db" "$tmp"
-    chown "$uid:$gid" "$tmp" 2>/dev/null || true
-    chmod 660 "$tmp"
-    _drop_sidecars "$SMARTP"
-    mv -f "$tmp" "$SMARTP"
-    _drop_sidecars "$SMARTP"
+    cp -f "$dir/SmartP.db" "$tmp" || die "cannot stage backup copy"
+    _install_db "$SMARTP" "$tmp" >/dev/null
   fi
   if [ -f "$dir/teg_config.db" ] && [ -f "$TEG" ]; then
-    uid=$(stat -c '%u' "$TEG"); gid=$(stat -c '%g' "$TEG")
     tmp="$TEG.jedit.$$"
-    cp -f "$dir/teg_config.db" "$tmp"
-    chown "$uid:$gid" "$tmp" 2>/dev/null || true
-    chmod 660 "$tmp"
-    _drop_sidecars "$TEG"
-    mv -f "$tmp" "$TEG"
-    _drop_sidecars "$TEG"
+    cp -f "$dir/teg_config.db" "$tmp" || die "cannot stage backup copy"
+    _install_db "$TEG" "$tmp" >/dev/null
   fi
-  _verify_db "$SMARTP"
-  _verify_db "$TEG"
-  if command -v restorecon >/dev/null 2>&1; then
-    restorecon "$SMARTP" "$TEG" 2>/dev/null || true
+
+  started=false
+  if [ "$was" = "true" ]; then
+    started=$(_start_pkg)
   fi
-  printf '{"ok":true,"from":"%s","stopped":%s}\n' "$dir" "$stopped"
+  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s}\n' \
+    "$dir" "$was" "$started"
 }
 
 cmd_revert() {
@@ -753,7 +779,7 @@ case "$cmd" in
   reset-cloud)    cmd_reset_cloud ;;
   pull)           cmd_pull "${1:?}" ;;
   push)           cmd_push "${1:?}" "${2:?}" ;;
-  backup)         cmd_backup "${1:-}" ;;
+  backup)         cmd_backup "$@" ;;
   prune-backups)  prune_backups "${1:-10}" ;;
   revert)         cmd_revert "${1:?}" ;;
   revert-latest)  cmd_revert_latest ;;

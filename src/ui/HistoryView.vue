@@ -141,15 +141,9 @@ async function revertFromBackup() {
   if (!ok) return;
   try {
     const reverted = await revertToBackup(backupName);
-    let stopped = reverted.stopped;
-    if (stopped !== true) {
-      // Older helper: revert did not stop Joyose itself, so ask again.
-      const again = await bridge.restart().catch(() => null);
-      if (typeof again?.stopped === 'boolean') stopped = again.stopped;
-    }
     await pullAll();
-    if (stopped === false) {
-      toast.warn('已回滚，但 Joyose 未能停止 —— 请手动重启它后再进游戏', backupName);
+    if (reverted.wasRunning && reverted.restarted === false) {
+      toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', backupName);
     } else {
       toast.success('已回滚到备份', backupName);
     }
