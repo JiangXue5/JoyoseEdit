@@ -74,22 +74,52 @@ _json_string() {
 # subcommand takes this lock; the second one waits or fails with the owner.
 LOCK_DIR="$DATA_ROOT/lock"
 LOCK_TTL=180
+# Filled by _acquire_lock, checked by _release_lock. Guards against removing a
+# lock that a *different* process created with our pid number after we died.
+MY_LOCK_TOKEN=''
 
-# A lock is stale only when its owner is gone *and* it is older than the TTL.
-# Age alone is not enough: a slow but healthy upload would lose its lock.
+# Field 22 of /proc/<pid>/stat: process start time in clock ticks since boot.
+# comm (field 2) can contain spaces and parentheses, so cut to the last ')'.
+_proc_start() {
+  sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
+_new_token() {
+  if [ -r /dev/urandom ]; then
+    od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+  fi
+}
+
+# A lock is stale when its owner is *gone* — never merely because it is old.
+# The previous version required `kill -0` AND `age < LOCK_TTL`, so a write that
+# took longer than three minutes had its lock declared dead while still running,
+# and a second writer could enter the critical section underneath it. Age is now
+# only a fallback for the no-procfs / legacy-owner-file case.
 _lock_owner_alive() {
-  local pid ts now
+  local pid ts start token now nowstart
   [ -f "$LOCK_DIR/owner" ] || return 1
-  read -r pid ts _ < "$LOCK_DIR/owner" 2>/dev/null || return 1
+  read -r pid ts start token _ < "$LOCK_DIR/owner" 2>/dev/null || return 1
   [ -n "${pid:-}" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
+  case "${start:-}" in
+    ''|*[!0-9]*) ;;                    # no start time recorded
+    *)
+      nowstart=$(_proc_start "$pid")
+      if [ -n "$nowstart" ]; then
+        # Same pid + same start time = the holder. A different start time means
+        # the number was recycled and the real holder is gone.
+        [ "$nowstart" = "$start" ] && return 0
+        return 1
+      fi
+      ;;
+  esac
   now=$(date +%s)
   [ $((now - ts)) -lt "$LOCK_TTL" ] || return 1
   return 0
 }
 
 _acquire_lock() {
-  local kind="$1" i=0
+  local kind="$1" i=0 start
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     if ! _lock_owner_alive; then
       # Rename first: only one waiter can move a given inode, so two processes
@@ -102,19 +132,30 @@ _acquire_lock() {
     fi
     i=$((i + 1))
     if [ "$i" -ge 100 ]; then
-      die "device is busy: another write is still running ($(cat "$LOCK_DIR/owner" 2>/dev/null))"
+      die "device is busy: another write is still running (pid $(awk '{print $1}' "$LOCK_DIR/owner" 2>/dev/null) · $(awk '{print $5}' "$LOCK_DIR/owner" 2>/dev/null))"
     fi
     sleep 0.2 2>/dev/null || sleep 1
   done
-  printf '%s %s %s\n' "$$" "$(date +%s)" "$kind" > "$LOCK_DIR/owner"
-  trap '_release_lock' EXIT INT TERM HUP
+  start=$(_proc_start "$$")
+  [ -n "$start" ] || start='-'
+  MY_LOCK_TOKEN=$(_new_token)
+  [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
+  printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/owner"
+  trap '_release_lock' EXIT
+  trap '_release_lock; exit 130' INT TERM HUP
 }
 
 _release_lock() {
-  local pid _
+  local pid _ start token
   [ -f "$LOCK_DIR/owner" ] || return 0
-  read -r pid _ < "$LOCK_DIR/owner" 2>/dev/null || return 0
-  [ "${pid:-}" = "$$" ] && rm -rf "$LOCK_DIR" 2>/dev/null
+  read -r pid _ start token _ < "$LOCK_DIR/owner" 2>/dev/null || return 0
+  [ "${pid:-}" = "$$" ] || return 0
+  # Pid alone is not identity: after we exit, an unrelated process can inherit
+  # our number and create its own lock. Only remove the lock we created.
+  if [ -n "${token:-}" ] && [ -n "${MY_LOCK_TOKEN:-}" ] && [ "$token" != "$MY_LOCK_TOKEN" ]; then
+    return 0
+  fi
+  rm -rf "$LOCK_DIR" 2>/dev/null
   return 0
 }
 
@@ -206,6 +247,25 @@ _start_pkg() {
   printf 'false'
 }
 
+# Stopping Joyose is the only thing we do to the phone's runtime state, and it
+# is invisible until the user notices the game has no cloud config. Every path
+# that gives up after a successful stop must put the service back; $1 records
+# whether it was running before we touched it, so a phone where Joyose was
+# already stopped is not started by us.
+_abort_after_stop() {
+  if [ "${1:-false}" = "true" ]; then
+    _start_pkg >/dev/null 2>&1 || true
+  fi
+  die "${2:-write aborted}"
+}
+
+# sha256 of a file, or nothing when the ROM has no tool. Callers must treat an
+# empty result as "unverified" and say so — never as "matches".
+_sha256_file() {
+  command -v sha256sum >/dev/null 2>&1 || return 0
+  sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
 # Sidecars are per-database-name, not per-inode: after a replace they still
 # point at the bytes we just threw away.
 _drop_sidecars() {
@@ -269,7 +329,7 @@ _verify_db() {
 # fails. Nothing here may delete the only good copy.
 _install_db() {
   local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
-  local uid gid stopped chk size sha rollback cur
+  local uid gid stopped chk size sha rollback cur was_running=false rb_mode='size' src_sha dst_sha
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
 
@@ -315,29 +375,44 @@ _install_db() {
   chmod 660 "$tmp"
 
   # 2. the consumer must be gone, not merely "am did not throw"
+  if _pid_alive; then was_running=true; fi
   stopped=$(_stop_pkg)
   if [ "$stopped" != "true" ]; then
     rm -f "$tmp"
+    # It is still running, so there is nothing to put back.
     die "Joyose is still running; refusing to replace $target"
   fi
 
-  # 3. rollback copy, verified by size before we trust it
+  # From here on we already stopped Joyose: every exit must restore it.
+  # 3. rollback copy of the live database
   rollback="$target.jedit.rollback.$$"
+  src_sha=$(_sha256_file "$target")
   if ! cp -p "$target" "$rollback" 2>/dev/null; then
     rm -f "$tmp"
-    die "cannot create rollback copy for $target"
+    _abort_after_stop "$was_running" "cannot create rollback copy for $target"
   fi
   if [ "$(stat -c '%s' "$rollback" 2>/dev/null || echo 0)" != "$(stat -c '%s' "$target" 2>/dev/null || echo 0)" ]; then
     rm -f "$tmp" "$rollback"
-    die "rollback copy is incomplete; refusing to write"
+    _abort_after_stop "$was_running" "rollback copy is incomplete; refusing to write"
+  fi
+  # Size alone cannot tell a truncated page from a full one, nor a copy that
+  # was written while the file changed. Compare the digest when the ROM has a
+  # tool; when it does not, say so instead of implying the copy was verified.
+  if [ -n "$src_sha" ]; then
+    dst_sha=$(_sha256_file "$rollback")
+    rb_mode='sha256'
+    if [ "$src_sha" != "$dst_sha" ]; then
+      rm -f "$tmp" "$rollback"
+      _abort_after_stop "$was_running" "rollback copy does not match the original ($(printf '%s' "$src_sha" | cut -c1-12) != $(printf '%s' "${dst_sha:-?}" | cut -c1-12)); refusing to write"
+    fi
   fi
 
   # 4. atomic swap
   _drop_sidecars "$target"
-  mv -f "$tmp" "$target" || {
+  if ! mv -f "$tmp" "$target" 2>/dev/null; then
     mv -f "$rollback" "$target" 2>/dev/null || true
-    die "cannot replace $target; original kept"
-  }
+    _abort_after_stop "$was_running" "cannot replace $target; original kept"
+  fi
   _drop_sidecars "$target"
 
   # 5. post-write check; on failure put the original back
@@ -345,17 +420,17 @@ _install_db() {
   if [ "$chk" = "failed" ]; then
     if mv -f "$rollback" "$target" 2>/dev/null; then
       _drop_sidecars "$target"
-      die "post-write integrity check failed; original database restored"
+      _abort_after_stop "$was_running" "post-write integrity check failed; original database restored"
     fi
-    die "post-write integrity check failed and rollback failed: $rollback kept"
+    _abort_after_stop "$was_running" "post-write integrity check failed and rollback failed: $rollback kept"
   fi
 
   rm -f "$rollback"
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$target" 2>/dev/null || true
   fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":true,"verified":"%s"}\n' \
-    "$target" "$uid" "$gid" "$chk"
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":true,"verified":"%s","rollback":"%s"}\n' \
+    "$target" "$uid" "$gid" "$chk" "$rb_mode"
 }
 
 
@@ -458,14 +533,34 @@ cmd_backup() {
     rm -rf "$dir"
     die "Joyose is still running; refusing to snapshot an open database"
   fi
-  [ -f "$SMARTP" ] && cp -f "$SMARTP" "$dir/SmartP.db"
-  [ -f "$TEG" ] && cp -f "$TEG" "$dir/teg_config.db"
+  # Past this line the service is stopped: every failure has to restart it.
+  # `cp` inside an `&&` list used to fail silently under `set -e`, which both
+  # hid the reason and skipped the restart.
+  local copied=0
+  if [ -f "$SMARTP" ]; then
+    if ! cp -f "$SMARTP" "$dir/SmartP.db" 2>/dev/null; then
+      rm -rf "$dir"
+      _abort_after_stop "$was" "cannot copy SmartP into the backup (disk full or permission denied)"
+    fi
+    copied=$((copied + 1))
+  fi
+  if [ -f "$TEG" ]; then
+    if ! cp -f "$TEG" "$dir/teg_config.db" 2>/dev/null; then
+      rm -rf "$dir"
+      _abort_after_stop "$was" "cannot copy teg into the backup (disk full or permission denied)"
+    fi
+    copied=$((copied + 1))
+  fi
+  if [ "$copied" -eq 0 ]; then
+    rm -rf "$dir"
+    _abort_after_stop "$was" "no database found to back up"
+  fi
   for f in "$dir/SmartP.db" "$dir/teg_config.db"; do
     [ -f "$f" ] || continue
     chk=$(_verify_db "$f")
     if [ "$chk" = "failed" ]; then
       rm -rf "$dir"
-      die "backup snapshot failed integrity check ($(basename "$f"))"
+      _abort_after_stop "$was" "backup snapshot failed integrity check ($(basename "$f"))"
     fi
   done
   prune_backups 10
@@ -493,8 +588,134 @@ prune_backups() {
   done
 }
 
+# Restore SmartP *and* teg as one transaction. Two independent _install_db calls
+# (the old behaviour) could leave one database restored and the other still new
+# if the second one failed — a combination that never existed on the device and
+# that nothing can recover from without guessing. Order here is:
+#   stage+verify both  ->  stop  ->  rollback copies for both  ->  swap both
+#   ->  verify both  ->  on any failure put BOTH back.
+# Leaves Joyose stopped on success; the caller decides whether to start it.
+_restore_pair() {
+  local dir="$1"
+  local sp_bak="$dir/SmartP.db" teg_bak="$dir/teg_config.db"
+  local sp_tmp="$SMARTP.jedit.$$" teg_tmp="$TEG.jedit.$$"
+  local sp_rb="$SMARTP.jedit.rb.$$" teg_rb="$TEG.jedit.rb.$$"
+  local use_sp=false use_teg=false was_running=false failed='' rb_failed=''
+  local chk s1 r1 s2 r2
+
+  [ -f "$sp_bak" ] && [ -f "$SMARTP" ] && use_sp=true
+  [ -f "$teg_bak" ] && [ -f "$TEG" ] && use_teg=true
+  if [ "$use_sp" = false ] && [ "$use_teg" = false ]; then
+    die "backup contains no database that exists on this device: $dir"
+  fi
+
+  # 1. stage and verify everything before a single live file is touched
+  if [ "$use_sp" = true ]; then
+    cp -f "$sp_bak" "$sp_tmp" 2>/dev/null || die "cannot stage the SmartP backup copy"
+    chk=$(_verify_db "$sp_tmp")
+    if [ "$chk" = "failed" ]; then
+      rm -f "$sp_tmp"
+      die "staged SmartP copy failed integrity check"
+    fi
+  fi
+  if [ "$use_teg" = true ]; then
+    cp -f "$teg_bak" "$teg_tmp" 2>/dev/null || { rm -f "$sp_tmp"; die "cannot stage the teg backup copy"; }
+    chk=$(_verify_db "$teg_tmp")
+    if [ "$chk" = "failed" ]; then
+      rm -f "$sp_tmp" "$teg_tmp"
+      die "staged teg copy failed integrity check"
+    fi
+  fi
+
+  # 2. quiesce once for both databases
+  if _pid_alive; then was_running=true; fi
+  # The caller needs this to decide whether to start Joyose afterwards, and it
+  # must come from here: asking _pid_alive again after the stop always says
+  # "not running".
+  _RESTORE_WAS_RUNNING=$was_running
+  if [ "$(_stop_pkg)" != "true" ]; then
+    rm -f "$sp_tmp" "$teg_tmp"
+    die "Joyose is still running; refusing to restore"
+  fi
+
+  # 3. rollback copies for every target we are about to replace
+  if [ "$use_sp" = true ]; then
+    if ! cp -p "$SMARTP" "$sp_rb" 2>/dev/null; then
+      rm -f "$sp_tmp" "$teg_tmp"
+      _abort_after_stop "$was_running" "cannot create rollback copy for SmartP"
+    fi
+    s1=$(_sha256_file "$SMARTP")
+    r1=$(_sha256_file "$sp_rb")
+    if [ -n "$s1" ] && [ "$s1" != "$r1" ]; then
+      rm -f "$sp_tmp" "$teg_tmp" "$sp_rb"
+      _abort_after_stop "$was_running" "rollback copy for SmartP does not match the original; refusing to restore"
+    fi
+  fi
+  if [ "$use_teg" = true ]; then
+    if ! cp -p "$TEG" "$teg_rb" 2>/dev/null; then
+      rm -f "$sp_tmp" "$teg_tmp" "$sp_rb"
+      _abort_after_stop "$was_running" "cannot create rollback copy for teg"
+    fi
+    s2=$(_sha256_file "$TEG")
+    r2=$(_sha256_file "$teg_rb")
+    if [ -n "$s2" ] && [ "$s2" != "$r2" ]; then
+      rm -f "$sp_tmp" "$teg_tmp" "$sp_rb" "$teg_rb"
+      _abort_after_stop "$was_running" "rollback copy for teg does not match the original; refusing to restore"
+    fi
+  fi
+
+  # 4. swap, then verify; the second swap is skipped if the first one failed
+  if [ "$use_sp" = true ]; then
+    _drop_sidecars "$SMARTP"
+    mv -f "$sp_tmp" "$SMARTP" 2>/dev/null || failed='SmartP'
+  fi
+  if [ -z "$failed" ] && [ "$use_teg" = true ]; then
+    _drop_sidecars "$TEG"
+    mv -f "$teg_tmp" "$TEG" 2>/dev/null || failed='teg'
+  fi
+  if [ -z "$failed" ] && [ "$use_sp" = true ] && [ "$(_verify_db "$SMARTP")" = "failed" ]; then
+    failed='SmartP'
+  fi
+  if [ -z "$failed" ] && [ "$use_teg" = true ] && [ "$(_verify_db "$TEG")" = "failed" ]; then
+    failed='teg'
+  fi
+
+  # 5. any failure: put back only what actually changed
+  if [ -n "$failed" ]; then
+    local now_sha
+    if [ "$use_sp" = true ] && [ -f "$sp_rb" ]; then
+      now_sha=$(_sha256_file "$SMARTP")
+      if [ -z "$s1" ] || [ "$now_sha" != "$s1" ]; then
+        mv -f "$sp_rb" "$SMARTP" 2>/dev/null || rb_failed="$rb_failed SmartP"
+        _drop_sidecars "$SMARTP"
+      else
+        # Same bytes as before the swap: nothing to undo, keep it as it is.
+        rm -f "$sp_rb"
+      fi
+    fi
+    if [ "$use_teg" = true ] && [ -f "$teg_rb" ]; then
+      now_sha=$(_sha256_file "$TEG")
+      if [ -z "$s2" ] || [ "$now_sha" != "$s2" ]; then
+        mv -f "$teg_rb" "$TEG" 2>/dev/null || rb_failed="$rb_failed teg"
+        _drop_sidecars "$TEG"
+      else
+        rm -f "$teg_rb"
+      fi
+    fi
+    rm -f "$sp_tmp" "$teg_tmp"
+    if [ -n "$rb_failed" ]; then
+      # Do not start Joyose here: the database state is unknown and a cold start
+      # would only make the failure look like a config problem.
+      die "restore failed on $failed and the original could not be put back for:$rb_failed. Rollback copies kept: $sp_rb $teg_rb — restore them by hand or reboot before using Joyose"
+    fi
+    _abort_after_stop "$was_running" "restore failed on $failed; both databases are back to their previous contents"
+  fi
+
+  rm -f "$sp_rb" "$teg_rb" "$sp_tmp" "$teg_tmp"
+}
+
 _revert_from_dir() {
-  local dir="$1" tmp f chk was started
+  local dir="$1" f chk started
   [ -d "$dir" ] || die "no such backup: $dir"
 
   # Refuse to restore a corrupt backup: the whole point is that this file is
@@ -507,29 +728,18 @@ _revert_from_dir() {
     fi
   done
 
-  was=false
-  if _pid_alive; then was=true; fi
-
-  # Same hand-off rule as push: never overwrite a file Joyose still has open.
-  # _install_db keeps a rollback copy and restores it if the post-check fails,
-  # so a bad restore cannot leave the phone with two broken databases.
-  if [ -f "$dir/SmartP.db" ] && [ -f "$SMARTP" ]; then
-    tmp="$SMARTP.jedit.$$"
-    cp -f "$dir/SmartP.db" "$tmp" || die "cannot stage backup copy"
-    _install_db "$SMARTP" "$tmp" >/dev/null
-  fi
-  if [ -f "$dir/teg_config.db" ] && [ -f "$TEG" ]; then
-    tmp="$TEG.jedit.$$"
-    cp -f "$dir/teg_config.db" "$tmp" || die "cannot stage backup copy"
-    _install_db "$TEG" "$tmp" >/dev/null
-  fi
+  # One transaction for both databases: either the pair is restored, or neither
+  # is. _restore_pair keeps a rollback copy of each live file and puts both back
+  # if any step fails, so a half-restored pair cannot reach the phone.
+  _RESTORE_WAS_RUNNING=false
+  _restore_pair "$dir"
 
   started=false
-  if [ "$was" = "true" ]; then
+  if [ "$_RESTORE_WAS_RUNNING" = "true" ]; then
     started=$(_start_pkg)
   fi
-  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s}\n' \
-    "$dir" "$was" "$started"
+  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"atomic":true}\n' \
+    "$dir" "$_RESTORE_WAS_RUNNING" "$started"
 }
 
 cmd_revert() {
@@ -859,13 +1069,16 @@ cmd_prefs_write() {
 }
 
 cmd_lock_status() {
-  local pid='' ts='' kind='' now age
+  local pid='' ts='' start='' token='' kind='' now age overdue=false
   if _lock_owner_alive; then
-    read -r pid ts kind < "$LOCK_DIR/owner" 2>/dev/null || true
+    read -r pid ts start token kind < "$LOCK_DIR/owner" 2>/dev/null || true
     now=$(date +%s)
     age=$((now - ${ts:-$now}))
-    printf '{"locked":true,"pid":%s,"ageSeconds":%s,"op":%s}\n' \
-      "${pid:-0}" "$age" "$(printf '%s' "${kind:-}" | _json_string)"
+    # Long-running but healthy. Reported instead of acted on: age alone must
+    # never turn a live holder's lock into a free one.
+    [ "$age" -ge "$LOCK_TTL" ] && overdue=true
+    printf '{"locked":true,"pid":%s,"ageSeconds":%s,"op":%s,"overdue":%s}\n' \
+      "${pid:-0}" "$age" "$(printf '%s' "${kind:-}" | _json_string)" "$overdue"
   elif [ -d "$LOCK_DIR" ]; then
     printf '{"locked":false,"stale":true}\n'
   else

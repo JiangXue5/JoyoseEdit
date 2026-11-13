@@ -236,11 +236,14 @@ export async function push(
 
 export interface LockStatus {
   locked: boolean;
-  /** A lock directory exists but its owner is gone (or older than the TTL). */
+  /** A lock directory exists but its owner is gone (or the pid was recycled). */
   stale?: boolean;
   pid?: number;
   ageSeconds?: number;
   op?: string;
+  /** Held longer than the TTL but still owned by a live process. Informational:
+   *  the lock is NOT free, it is only slow. */
+  overdue?: boolean;
 }
 
 /** Whether a write is currently running on the device. Used after a front-end
