@@ -61,6 +61,57 @@ _json_string() {
   } END{printf "\""}'
 }
 
+# ---- device-side write lock ----------------------------------------------
+# Two taps in the WebUI, or a helper that outlives the 30 s front-end timeout,
+# can otherwise interleave two writes: each pulls the same old DB, edits its
+# own copy, and the second swap silently discards the first. Every mutating
+# subcommand takes this lock; the second one waits or fails with the owner.
+LOCK_DIR="$DATA_ROOT/lock"
+LOCK_TTL=180
+
+# A lock is stale only when its owner is gone *and* it is older than the TTL.
+# Age alone is not enough: a slow but healthy upload would lose its lock.
+_lock_owner_alive() {
+  local pid ts now
+  [ -f "$LOCK_DIR/owner" ] || return 1
+  read -r pid ts _ < "$LOCK_DIR/owner" 2>/dev/null || return 1
+  [ -n "${pid:-}" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  now=$(date +%s)
+  [ $((now - ts)) -lt "$LOCK_TTL" ] || return 1
+  return 0
+}
+
+_acquire_lock() {
+  local kind="$1" i=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if ! _lock_owner_alive; then
+      # Rename first: only one waiter can move a given inode, so two processes
+      # that both judged the lock stale cannot both delete a freshly created
+      # one. The loser simply loops and retries.
+      if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
+        rm -rf "$LOCK_DIR.stale.$$" 2>/dev/null || true
+      fi
+      continue
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 100 ]; then
+      die "device is busy: another write is still running ($(cat "$LOCK_DIR/owner" 2>/dev/null))"
+    fi
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  printf '%s %s %s\n' "$$" "$(date +%s)" "$kind" > "$LOCK_DIR/owner"
+  trap '_release_lock' EXIT INT TERM HUP
+}
+
+_release_lock() {
+  local pid _
+  [ -f "$LOCK_DIR/owner" ] || return 0
+  read -r pid _ < "$LOCK_DIR/owner" 2>/dev/null || return 0
+  [ "${pid:-}" = "$$" ] && rm -rf "$LOCK_DIR" 2>/dev/null
+  return 0
+}
+
 resolve_db() {
   case "$1" in
     smartp) printf '%s' "$SMARTP" ;;
@@ -683,6 +734,14 @@ cmd_prefs_write() {
 cmd="${1:-}"
 [ -n "$cmd" ] || die "missing subcommand"
 shift
+
+# Every command that can stop Joyose or change a file takes the device lock.
+# Read-only probes (stat/digest/pull/status) stay lock-free so a long upload
+# never blocks the dashboard.
+case "$cmd" in
+  push|push-from-stage|backup|revert|revert-latest|reset-cloud|teg-freeze|teg-unfreeze|restart)
+    _acquire_lock "$cmd" ;;
+esac
 
 case "$cmd" in
   stat)           cmd_stat ;;

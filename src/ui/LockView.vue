@@ -123,7 +123,7 @@
 
 <script setup lang="ts">
 import { computed, onActivated, reactive, ref } from 'vue';
-import { state, lockCloudVersion, unlockCloudVersion, markDirty } from '@/state/session';
+import { state, lockCloudVersion, unlockCloudVersion, markDirty, freezeTeg, unfreezeTeg } from '@/state/session';
 import { toast } from '@/state/toast';
 import * as bridge from '@/root/bridge';
 import PageHeader from './PageHeader.vue';
@@ -230,7 +230,7 @@ async function refresh() {
 async function doFreeze() {
   busy.value = true;
   try {
-    await bridge.tegFreeze();
+    await freezeTeg();
     toast.success('云控已冻结', 'Joyose 已重启，后续云端下发不会覆盖本地改动');
     await refresh();
   } catch (err) {
@@ -243,7 +243,7 @@ async function doFreeze() {
 async function doUnfreeze() {
   busy.value = true;
   try {
-    await bridge.tegUnfreeze();
+    await unfreezeTeg();
     toast.warn('云控已解冻', '下一次云控拉取可能覆盖本地改动');
     await refresh();
   } finally {

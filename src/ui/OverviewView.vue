@@ -225,7 +225,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { state, pullAll, refreshStat, recordBackupCheckpoint } from '@/state/session';
+import { state, pullAll, refreshStat, recordBackupCheckpoint, backupNow, resetCloudData, revertLatestBackup } from '@/state/session';
 import {
   getBoosterSourcePref,
   setBoosterSourcePref,
@@ -491,7 +491,7 @@ async function handleResetCloud() {
   });
   if (!sure) return;
   try {
-    await bridge.resetCloud();
+    await resetCloudData();
     toast.warn('已重置云控', 'Joyose 数据已清空，等待其重新下载；必要时重启设备');
     await refreshStat();
     await pullAll();
@@ -507,7 +507,7 @@ async function handleRefresh() {
 
 async function handleBackup() {
   try {
-    const r = await bridge.backup();
+    const r = await backupNow();
     await recordBackupCheckpoint(r.name).catch(() => null);
     await refreshStat();
     toast.success('已备份', r.name);
@@ -524,7 +524,7 @@ async function handleRevertLatest() {
   });
   if (!ok) return;
   try {
-    const r = await bridge.revertLatest();
+    const r = await revertLatestBackup();
     let stopped = r.stopped;
     if (stopped !== true) {
       // Older helper: revert did not stop Joyose itself, so ask again.

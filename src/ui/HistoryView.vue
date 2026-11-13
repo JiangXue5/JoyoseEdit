@@ -64,6 +64,7 @@ import {
   restoreToRecord,
   markDirty,
   pullAll,
+  revertToBackup,
 } from '@/state/session';
 import * as bridge from '@/root/bridge';
 import { toast } from '@/state/toast';
@@ -139,7 +140,7 @@ async function revertFromBackup() {
   });
   if (!ok) return;
   try {
-    const reverted = await bridge.revert(backupName);
+    const reverted = await revertToBackup(backupName);
     let stopped = reverted.stopped;
     if (stopped !== true) {
       // Older helper: revert did not stop Joyose itself, so ask again.

@@ -528,6 +528,13 @@ export async function saveJsonTarget(
   target: JsonTarget,
   jsonText: string,
 ): Promise<{ ok: true; target: string }> {
+  return withWriteLock('参数树写入', () => saveJsonTargetLocked(target, jsonText));
+}
+
+async function saveJsonTargetLocked(
+  target: JsonTarget,
+  jsonText: string,
+): Promise<{ ok: true; target: string }> {
   const { name, db: which } = JSON_TARGET_CONFIG[target];
 
   let parsed: unknown;
@@ -901,26 +908,80 @@ async function rebaseOntoLatest(): Promise<void> {
   state.dirty = true;
 }
 
+/** Front-end half of the write lock.
+ *
+ *  The helper's device lock stops two shell commands from interleaving; this
+ *  stops the second UI action from being sent at all, so the user gets an
+ *  immediate "already running" instead of a 20 s wait followed by a failure.
+ *  Both halves are needed: a timeout on the front end does not cancel the
+ *  command that is already running on the device. */
+let writeBusy = false;
+
+async function withWriteLock<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  if (writeBusy) {
+    throw new Error(`上一个写入操作尚未结束，暂时不能${label}，请稍后再试`);
+  }
+  writeBusy = true;
+  try {
+    return await fn();
+  } finally {
+    writeBusy = false;
+  }
+}
+
+export function isWriteBusy(): boolean {
+  return writeBusy;
+}
+
 /** Public commit entry point: on a conflict, rebase onto the fresh DBs and
  *  retry (up to 3 attempts) before surfacing the error. */
 export async function pushAll(opts: PushOptions = {}): Promise<string> {
-  state.loading = true;
-  try {
-    let lastErr: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return await pushCore(opts);
-      } catch (err) {
-        lastErr = err;
-        if (!(err instanceof ConflictError) || opts.force || attempt === 2) throw err;
-        await rebaseOntoLatest();
-        state.rebasedAt = Date.now();
+  return withWriteLock('提交', async () => {
+    state.loading = true;
+    try {
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          return await pushCore(opts);
+        } catch (err) {
+          lastErr = err;
+          if (!(err instanceof ConflictError) || opts.force || attempt === 2) throw err;
+          await rebaseOntoLatest();
+          state.rebasedAt = Date.now();
+        }
       }
+      throw lastErr;
+    } finally {
+      state.loading = false;
     }
-    throw lastErr;
-  } finally {
-    state.loading = false;
-  }
+  });
+}
+
+/* Locked wrappers for the operations the views used to call bridge directly.
+ * Keeping them here means a page cannot bypass the lock by importing the
+ * bridge, and every mutating entry point has exactly one implementation. */
+export async function backupNow(label?: string) {
+  return withWriteLock('备份', () => bridge.backup(label));
+}
+
+export async function revertToBackup(name: string) {
+  return withWriteLock('回滚', () => bridge.revert(name));
+}
+
+export async function revertLatestBackup() {
+  return withWriteLock('回滚', () => bridge.revertLatest());
+}
+
+export async function resetCloudData(): Promise<void> {
+  await withWriteLock('重置云控', () => bridge.resetCloud());
+}
+
+export async function freezeTeg() {
+  return withWriteLock('冻结云控', () => bridge.tegFreeze());
+}
+
+export async function unfreezeTeg() {
+  return withWriteLock('解冻云控', () => bridge.tegUnfreeze());
 }
 
 /** Walk the commit chain from the working tree (`pristineSnapshot`) back to
