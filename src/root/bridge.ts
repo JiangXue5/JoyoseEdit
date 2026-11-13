@@ -176,12 +176,31 @@ export interface WriteResult {
   stopped?: boolean;
 }
 
+/** SHA-256 as lowercase hex, or null when the WebView has no crypto.subtle
+ *  (KernelSU's WebUI is not always a secure context). The size check below is
+ *  the mandatory guard; the digest is an extra one when it is available. */
+async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
+  try {
+    const buf = await crypto.subtle.digest('SHA-256', bytes.slice().buffer);
+    return Array.from(new Uint8Array(buf))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return null;
+  }
+}
+
 export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteResult> {
   assertSelector(which);
   const b64 = bytesToBase64(bytes);
   const stage = `push-${which}-${Date.now().toString(36)}`;
   await stageUpload(stage, b64);
-  return JSON.parse(await runKsu(`sh ${HELPER} push-from-stage ${which} ${stage}`));
+  const sha = await sha256Hex(bytes);
+  // The helper verifies the decoded length (and digest when provided) before
+  // it touches the live database, so a truncated upload can never be swapped in.
+  const args = [`push-from-stage`, which, stage, String(bytes.length)];
+  if (sha) args.push(sha);
+  return JSON.parse(await runKsu(`sh ${HELPER} ${args.join(' ')}`));
 }
 
 export async function backup(label?: string): Promise<{

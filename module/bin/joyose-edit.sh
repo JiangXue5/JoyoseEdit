@@ -155,14 +155,138 @@ _drop_sidecars() {
   rm -f "$1-journal" "$1-wal" "$1-shm" 2>/dev/null || true
 }
 
-# Post-write sanity. sqlite3 is present on most ROMs; when it is missing we
-# fall back to the magic-word check the callers already do.
-_verify_db() {
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  local out
-  out=$(sqlite3 "$1" 'PRAGMA quick_check;' 2>/dev/null || printf 'error')
-  [ "$out" = "ok" ] || die "post-write integrity check failed for $1: $out"
+# Structural fallback for ROMs without sqlite3. A correct magic word is not
+# enough: a truncated copy still starts with "SQLite format 3". Read the page
+# geometry out of the 100-byte header and require the file to hold every page
+# the header promises.
+_db_geometry_ok() {
+  local f="$1" size psize pcount hex
+  size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+  [ "$size" -ge 512 ] || return 1
+  head -c 16 "$f" | grep -qa 'SQLite format 3' || return 1
+  # Page size: big-endian u16 at offset 16 (1 means 65536).
+  hex=$(od -An -tx1 -j16 -N2 "$f" 2>/dev/null | tr -d ' \n')
+  [ -n "$hex" ] || return 1
+  psize=$((0x$hex))
+  [ "$psize" -eq 1 ] && psize=65536
+  case "$psize" in
+    512|1024|2048|4096|8192|16384|32768|65536) ;;
+    *) return 1 ;;
+  esac
+  # Page count: big-endian u32 at offset 28.
+  hex=$(od -An -tx1 -j28 -N4 "$f" 2>/dev/null | tr -d ' \n')
+  [ -n "$hex" ] || return 1
+  pcount=$((0x$hex))
+  [ "$pcount" -gt 0 ] || return 1
+  # The header count can lag behind the physical file (freelist / hot journal),
+  # so only reject files that are *shorter* than the pages they claim.
+  [ "$size" -ge $((psize * pcount)) ] || return 1
+  return 0
 }
+
+# Verify a database file and print the verification mode on stdout:
+#   sqlite3   full PRAGMA quick_check
+#   geometry  no sqlite3 on this ROM; header + page geometry only
+#   failed    definitely not usable
+# Never calls die(): callers decide whether a failure is fatal (pre-write) or
+# needs a rollback (post-write).
+_verify_db() {
+  local f="$1" out
+  if command -v sqlite3 >/dev/null 2>&1; then
+    out=$(sqlite3 "$f" 'PRAGMA quick_check;' 2>/dev/null || printf 'error')
+    [ "$out" = "ok" ] || { printf 'failed'; return 0; }
+    sqlite3 "$f" 'SELECT count(*) FROM sqlite_master;' >/dev/null 2>&1 \
+      || { printf 'failed'; return 0; }
+    printf 'sqlite3'
+    return 0
+  fi
+  if _db_geometry_ok "$f"; then printf 'geometry'; else printf 'failed'; fi
+}
+
+# The single database-replacement path. Both `push` (base64 argv) and
+# `push-from-stage` (chunked upload) decode first and then land here, so the
+# safety checks cannot drift apart between the two entry points.
+#
+# Order matters: validate the candidate *before* the live file is touched, keep
+# a rollback copy across the swap, and restore it if the post-write check
+# fails. Nothing here may delete the only good copy.
+_install_db() {
+  local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}"
+  local uid gid stopped chk size sha rollback
+
+  [ -f "$tmp" ] || die "staged database missing: $tmp"
+
+  if [ -n "$expect_size" ]; then
+    size=$(stat -c '%s' "$tmp" 2>/dev/null || echo 0)
+    if [ "$size" != "$expect_size" ]; then
+      rm -f "$tmp"
+      die "staged database size mismatch ($size != $expect_size)"
+    fi
+  fi
+  if [ -n "$expect_sha" ]; then
+    sha=$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)
+    if [ "$sha" != "$expect_sha" ]; then
+      rm -f "$tmp"
+      die "staged database checksum mismatch"
+    fi
+  fi
+
+  # 1. candidate must be readable *before* it replaces anything
+  chk=$(_verify_db "$tmp")
+  if [ "$chk" = "failed" ]; then
+    rm -f "$tmp"
+    die "staged database failed integrity check"
+  fi
+
+  uid=$(stat -c '%u' "$target")
+  gid=$(stat -c '%g' "$target")
+  chown "$uid:$gid" "$tmp" 2>/dev/null || true
+  chmod 660 "$tmp"
+
+  # 2. the consumer must be gone, not merely "am did not throw"
+  stopped=$(_stop_pkg)
+  if [ "$stopped" != "true" ]; then
+    rm -f "$tmp"
+    die "Joyose is still running; refusing to replace $target"
+  fi
+
+  # 3. rollback copy, verified by size before we trust it
+  rollback="$target.jedit.rollback.$$"
+  if ! cp -p "$target" "$rollback" 2>/dev/null; then
+    rm -f "$tmp"
+    die "cannot create rollback copy for $target"
+  fi
+  if [ "$(stat -c '%s' "$rollback" 2>/dev/null || echo 0)" != "$(stat -c '%s' "$target" 2>/dev/null || echo 0)" ]; then
+    rm -f "$tmp" "$rollback"
+    die "rollback copy is incomplete; refusing to write"
+  fi
+
+  # 4. atomic swap
+  _drop_sidecars "$target"
+  mv -f "$tmp" "$target" || {
+    mv -f "$rollback" "$target" 2>/dev/null || true
+    die "cannot replace $target; original kept"
+  }
+  _drop_sidecars "$target"
+
+  # 5. post-write check; on failure put the original back
+  chk=$(_verify_db "$target")
+  if [ "$chk" = "failed" ]; then
+    if mv -f "$rollback" "$target" 2>/dev/null; then
+      _drop_sidecars "$target"
+      die "post-write integrity check failed; original database restored"
+    fi
+    die "post-write integrity check failed and rollback failed: $rollback kept"
+  fi
+
+  rm -f "$rollback"
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon "$target" 2>/dev/null || true
+  fi
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":true,"verified":"%s"}\n' \
+    "$target" "$uid" "$gid" "$chk"
+}
+
 
 stat_one() {
   local f="$1" key="$2"
@@ -221,37 +345,16 @@ cmd_digest() {
 }
 
 cmd_push() {
-  local sel="$1" b64="$2" target tmp uid gid stopped
+  local sel="$1" b64="$2" target tmp
   [ -n "$b64" ] || die "push: missing base64 payload"
   target=$(resolve_db "$sel")
   [ -f "$target" ] || die "missing: $target"
-  uid=$(stat -c '%u' "$target")
-  gid=$(stat -c '%g' "$target")
   tmp="$target.jedit.$$"
   # decode directly into the sibling tmp, then rename atomically.
   printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
   # quick sanity: must be a SQLite file
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
-  chown "$uid:$gid" "$tmp" 2>/dev/null || true
-  chmod 660 "$tmp"
-  stopped=$(_stop_pkg)
-  # A live consumer still holds the old inode and can roll a journal back over
-  # the file we are about to move in. "Could not prove it stopped" is not good
-  # enough — refuse the swap instead of gambling with the user's database.
-  if [ "$stopped" != "true" ]; then
-    rm -f "$tmp"
-    die "Joyose is still running; refusing to replace $target"
-  fi
-  _drop_sidecars "$target"
-  mv -f "$tmp" "$target"
-  _drop_sidecars "$target"
-  _verify_db "$target"
-  # SELinux labels: copy from sibling file to keep Joyose happy if present.
-  if command -v restorecon >/dev/null 2>&1; then
-    restorecon "$target" 2>/dev/null || true
-  fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":%s}\n' \
-    "$target" "$uid" "$gid" "$stopped"
+  _install_db "$target" "$tmp"
 }
 
 cmd_backup() {
@@ -482,38 +585,20 @@ cmd_stage_append() {
 }
 
 cmd_push_from_stage() {
-  local sel="$1" stage="$2" target tmp uid gid stage_file stopped
+  local sel="$1" stage="$2" expect_size="${3:-}" expect_sha="${4:-}"
+  local target tmp stage_file
   safe_name "$stage" || die "invalid stage name"
   target=$(resolve_db "$sel")
   [ -f "$target" ] || die "missing: $target"
   stage_file="$STAGE_DIR/$stage"
   [ -f "$stage_file" ] || die "stage file missing: $stage"
-  uid=$(stat -c '%u' "$target")
-  gid=$(stat -c '%g' "$target")
   tmp="$target.jedit.$$"
   base64 -d < "$stage_file" > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
-  chown "$uid:$gid" "$tmp" 2>/dev/null || true
-  chmod 660 "$tmp"
-  # Stop the consumer before the swap, and clear sidecars that still describe
-  # the file we are replacing. See the note above _stop_pkg.
-  stopped=$(_stop_pkg)
-  # Same rule as cmd_push: never replace while the process is still alive.
-  # Keep the stage file on purpose so a retry does not have to upload 1 MB again.
-  if [ "$stopped" != "true" ]; then
-    rm -f "$tmp"
-    die "Joyose is still running; refusing to replace $target"
-  fi
-  _drop_sidecars "$target"
-  mv -f "$tmp" "$target"
-  _drop_sidecars "$target"
+  # _install_db keeps its own guarantees (pre-check, rollback copy, post-check).
+  # It exits on failure, so the stage file survives for a retry.
+  _install_db "$target" "$tmp" "$expect_size" "$expect_sha"
   rm -f "$stage_file"
-  _verify_db "$target"
-  if command -v restorecon >/dev/null 2>&1; then
-    restorecon "$target" 2>/dev/null || true
-  fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":%s}\n' \
-    "$target" "$uid" "$gid" "$stopped"
 }
 
 cmd_history_save_from_stage() {
@@ -624,7 +709,7 @@ case "$cmd" in
   teg-unfreeze)   cmd_teg_unfreeze ;;
   stage-clear)    cmd_stage_clear "${1:?}" ;;
   stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
-  push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" ;;
+  push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" ;;
   history-save-from-stage) cmd_history_save_from_stage "${1:?}" "${2:?}" ;;
   *) die "unknown subcommand: $cmd" ;;
 esac
