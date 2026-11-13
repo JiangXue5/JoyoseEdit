@@ -106,6 +106,12 @@ import {
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, invertDelta } from '../src/history/diff';
 import { mergeOntoRaw, pickSmartpVersion } from '../src/db/merge';
+import {
+  IMPORT_SCHEMA,
+  applyImportPackage,
+  validateImportPackage,
+  type ImportPackage,
+} from '../src/import/package';
 import { buildRuleEnvelope, refreshEnvelope } from '../src/history/envelope';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -150,6 +156,7 @@ async function main() {
 
   await runHistoryStoreTest();
   await runDiffTest();
+  await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
   await runActiveBackendEdgeCases();
@@ -1568,6 +1575,216 @@ async function runPrefsTest() {
   } finally {
     delete (globalThis as any).localStorage;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Import package: untrusted JSON coming from a chat or a forum post.
+// The validator has to reject anything that could write outside the declared
+// domains, and applyImportPackage has to touch only what the package declared.
+// ---------------------------------------------------------------------------
+
+function validPackage(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema: IMPORT_SCHEMA,
+    exported_at: 1763000000,
+    source: { backend: 'mifisr', paths: [{ id: 'smartp', active: true, count: 1 }] },
+    domains: ['enhance'],
+    data: {
+      cloudConfig: {
+        booster_config: { params: { game_booster: { fisr_config: [{ pkg: 'a' }] } } },
+      },
+    },
+    ...over,
+  };
+}
+
+function expectReject(obj: unknown, label: string): string {
+  const v = validateImportPackage(obj);
+  if (v.ok) throw new Error(`${label}: 本应被拒绝，却通过了校验`);
+  return v.err;
+}
+
+async function runImportPackageTest() {
+  console.log('\n=== import package validation ===');
+
+  await check('import: 最小合法包通过', () => {
+    const v = validateImportPackage(validPackage());
+    if (!v.ok) throw new Error('合法包被拒绝：' + v.err);
+    return v.pkg.domains.join(',');
+  });
+
+  await check('import: schema 不匹配被拒绝', () => {
+    expectReject(validPackage({ schema: 'joyose-edit.export/v0' }), 'schema');
+    const err = expectReject(validPackage({ schema: undefined }), 'schema undefined');
+    return err.slice(0, 24);
+  });
+
+  await check('import: 未知配置域被拒绝', () => {
+    expectReject(validPackage({ domains: ['enhance', 'thermal_unlock'] }), 'unknown domain');
+    return 'thermal_unlock rejected';
+  });
+
+  await check('import: domains 为空或重复被拒绝', () => {
+    expectReject(validPackage({ domains: [] }), 'empty domains');
+    expectReject(validPackage({ domains: ['enhance', 'enhance'] }), 'duplicate domains');
+    return 'empty / duplicate rejected';
+  });
+
+  await check('import: 只有 teg_freeze_hint 的包被拒绝（无可导入内容）', () => {
+    expectReject(validPackage({ domains: ['teg_freeze_hint'] }), 'hint only');
+    return 'hint-only rejected';
+  });
+
+  await check('import: __proto__ / constructor 出现在任意层级都被拒绝', () => {
+    const proto = JSON.parse('{"game_booster":{"fisr_config":{"__proto__":{"polluted":1}}}}');
+    expectReject(
+      validPackage({
+        data: { cloudConfig: { booster_config: { params: proto } } },
+      }),
+      '__proto__ deep',
+    );
+    const ctor = JSON.parse('{"game_list":[{"constructor":{"x":1}}]}');
+    expectReject(
+      validPackage({
+        domains: ['gamelist'],
+        data: { cloudConfig: { common_config: { params: ctor } } },
+      }),
+      'constructor deep',
+    );
+    return 'prototype keys rejected';
+  });
+
+  await check('import: 跨域写入被拒绝（只声明 enhance 却带 mivk_settings）', () => {
+    const err = expectReject(
+      validPackage({
+        domains: ['enhance'],
+        data: {
+          cloudConfig: {
+            booster_config: {
+              params: { game_booster: { fisr_config: [], mivk_settings: { on: true } } },
+            },
+          },
+        },
+      }),
+      'cross domain',
+    );
+    if (!err.includes('mivk_settings')) throw new Error('错误信息未点名字段：' + err);
+    return err.slice(0, 30);
+  });
+
+  await check('import: 未声明的配置名被拒绝', () => {
+    expectReject(
+      validPackage({
+        data: { cloudConfig: { thermal_config: { params: {} } } },
+      }),
+      'unknown config name',
+    );
+    return 'thermal_config rejected';
+  });
+
+  await check('import: common_config 未声明 gamelist 域被拒绝', () => {
+    expectReject(
+      validPackage({
+        domains: ['enhance'],
+        data: {
+          cloudConfig: {
+            booster_config: { params: { game_booster: { fisr_config: [] } } },
+            common_config: { params: { game_list: ['a'] } },
+          },
+        },
+      }),
+      'common without gamelist',
+    );
+    return 'common needs gamelist';
+  });
+
+  await check('import: params 不是对象 / game_list 不是字符串数组被拒绝', () => {
+    expectReject(
+      validPackage({ data: { cloudConfig: { booster_config: { params: [] } } } }),
+      'params array',
+    );
+    expectReject(
+      validPackage({
+        domains: ['gamelist'],
+        data: { cloudConfig: { common_config: { params: { game_list: [1, 2] } } } },
+      }),
+      'game_list numbers',
+    );
+    return 'shape checks OK';
+  });
+
+  await check('import: 超过 4 MB 的包被拒绝', () => {
+    const big = 'x'.repeat(4 * 1024 * 1024 + 16);
+    const err = expectReject(
+      validPackage({
+        data: { cloudConfig: { booster_config: { params: { game_booster: { fisr_config: [big] } } } } },
+      }),
+      'oversize',
+    );
+    if (!err.includes('过大')) throw new Error('错误信息未说明体积：' + err.slice(0, 40));
+    return err.slice(0, 24);
+  });
+
+  await check('import: 应用时只写声明域内的键，邻居键保持不变', () => {
+    const v = validateImportPackage(
+      validPackage({
+        data: {
+          cloudConfig: {
+            booster_config: {
+              params: { game_booster: { fisr_config: [{ pkg: 'new' }] } },
+            },
+          },
+        },
+      }),
+    );
+    if (!v.ok) throw new Error(v.err);
+    const cc: Record<string, any> = {
+      booster_config: {
+        meta: { version: 7 },
+        params: { game_booster: { fisr_config: [{ pkg: 'old' }], mivk_settings: { keep: 1 }, other: 'x' } },
+      },
+    };
+    applyImportPackage(v.pkg as ImportPackage, cc);
+    const gb = cc.booster_config.params.game_booster;
+    if (gb.fisr_config[0].pkg !== 'new') throw new Error('声明域未写入');
+    if (gb.mivk_settings?.keep !== 1) throw new Error('未声明的邻居键被删除或改写');
+    if (gb.other !== 'x') throw new Error('无关键被改写');
+    if (cc.booster_config.meta.version !== 7) throw new Error('meta 被覆盖');
+    return 'only fisr_config written';
+  });
+
+  await check('import: 应用 common_config 时不动 game_booster', () => {
+    const v = validateImportPackage(
+      validPackage({
+        domains: ['gamelist'],
+        data: { cloudConfig: { common_config: { params: { game_list: ['com.a'] } } } },
+      }),
+    );
+    if (!v.ok) throw new Error(v.err);
+    const cc: Record<string, any> = {
+      booster_config: { meta: {}, params: { game_booster: { fisr_config: [] } } },
+    };
+    applyImportPackage(v.pkg as ImportPackage, cc);
+    if (!Array.isArray(cc.common_config.params.game_list)) throw new Error('game_list 未写入');
+    if (cc.booster_config.params.game_booster.fisr_config.length !== 0) {
+      throw new Error('booster_config 被意外修改');
+    }
+    return 'gamelist only';
+  });
+
+  await check('import: 应用后原始包对象未被修改（预览可复用同一份）', () => {
+    const raw = validPackage({
+      data: { cloudConfig: { booster_config: { params: { game_booster: { fisr_config: [{ pkg: 'a', n: 1 }] } } } } },
+    });
+    const v = validateImportPackage(raw);
+    if (!v.ok) throw new Error(v.err);
+    const before = JSON.stringify(raw);
+    const cc: Record<string, any> = {};
+    applyImportPackage(v.pkg as ImportPackage, cc);
+    cc.booster_config.params.game_booster.fisr_config[0].n = 99;
+    if (JSON.stringify(raw) !== before) throw new Error('导入包对象被写入方改动了');
+    return 'package stays immutable';
+  });
 }
 
 main().catch((err) => {

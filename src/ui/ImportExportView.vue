@@ -112,51 +112,30 @@ import { dialog } from '@/state/dialog';
 import { diff, summarizeRecord } from '@/history/diff';
 import { snapshotFromMaps } from '@/history/store';
 import type { ActiveBackend } from '@/db/schema';
+import {
+  DOMAIN_GB_KEYS,
+  applyImportPackage,
+  validateImportPackage,
+  type DomainId,
+  type ImportPackage,
+} from '@/import/package';
 
 // ---- schema ---------------------------------------------------------------
 
-const SCHEMA = 'joyose-edit.export/v1';
-
-type DomainId = 'enhance' | 'render' | 'gamelist' | 'teg_freeze_hint' | 'raw';
-
-interface ExportFile {
-  schema: typeof SCHEMA;
-  exported_at: number;
+// Export keeps richer source typing than the import validator needs.
+interface ExportFile extends ImportPackage {
   source: {
     backend: ActiveBackend;
     paths: { id: string; active: boolean; count: number }[];
   };
   domains: DomainId[];
-  data: {
-    cloudConfig: Record<string, { params: Record<string, unknown> }>;
-    rulesByModule?: Record<string, unknown[]>;
-  };
-  note?: string;
 }
-
-// Key subtrees under booster_config.params.game_booster that each domain covers.
-// Used both for export (pick from current state) and import (overwrite per-key).
-const DOMAIN_GB_KEYS: Record<Exclude<DomainId, 'gamelist' | 'teg_freeze_hint' | 'raw'>, string[]> = {
-  enhance: [
-    'fisr_config',
-    'fisr_mqs_v2',
-    'mqs_enhance_list',
-    'customize_game_params',
-    'frc_game_params',
-    'novatek_game_params',
-    'novatek_extend_config',
-    'novatek_black_app',
-    'novatek_gex_fps_limit',
-    'support_highfps_app',
-  ],
-  render: ['mivk_settings', 'migl_settings'],
-};
 
 // ---- state ----------------------------------------------------------------
 
 const selectedDomains = ref<Set<DomainId>>(new Set());
 const exportNote = ref('');
-const pendingPackage = ref<ExportFile | null>(null);
+const pendingPackage = ref<ImportPackage | null>(null);
 const importError = ref('');
 
 // ---- domain availability + defaults ---------------------------------------
@@ -244,7 +223,7 @@ function buildExportPackage(): ExportFile {
   }
 
   return {
-    schema: SCHEMA,
+    schema: 'joyose-edit.export/v1',
     exported_at: Math.floor(Date.now() / 1000),
     source: {
       backend: state.activeBackend,
@@ -298,18 +277,6 @@ async function copyExport() {
 
 // ---- import ---------------------------------------------------------------
 
-function validatePackage(obj: unknown): { ok: true; pkg: ExportFile } | { ok: false; err: string } {
-  if (!obj || typeof obj !== 'object') return { ok: false, err: '不是有效的 JSON 对象' };
-  const raw = obj as Record<string, unknown>;
-  if (raw.schema !== SCHEMA) {
-    return { ok: false, err: `schema 不匹配，期望 ${SCHEMA}，实际 ${String(raw.schema)}` };
-  }
-  if (!raw.data || typeof raw.data !== 'object') return { ok: false, err: '缺少 data 字段' };
-  if (!Array.isArray(raw.domains)) return { ok: false, err: '缺少 domains 字段' };
-  if (!raw.source || typeof raw.source !== 'object') return { ok: false, err: '缺少 source 字段' };
-  return { ok: true, pkg: raw as unknown as ExportFile };
-}
-
 function onFilePicked(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
@@ -343,7 +310,7 @@ function loadImportText(text: string) {
     pendingPackage.value = null;
     return;
   }
-  const v = validatePackage(parsed);
+  const v = validateImportPackage(parsed);
   if (!v.ok) {
     importError.value = v.err;
     pendingPackage.value = null;
@@ -412,41 +379,16 @@ function summarizeDiff(r: Parameters<typeof summarizeRecord>[0]): string {
 
 // Compute what state.cloudConfig / state.rulesByModule would look like if we
 // applied `pkg` now — without actually mutating. Used for the preview diff.
-function simulateMerge(pkg: ExportFile): {
+function simulateMerge(pkg: ImportPackage): {
   cloudConfig: Record<string, unknown>;
   rulesByModule: Record<string, unknown[]>;
 } {
   const cc = deepClone(state.cloudConfig);
   const rules = deepClone(state.rulesByModule);
-  applyMerge(pkg, cc, rules);
+  // Same function the real import uses: the preview cannot diverge from what
+  // lands in the working state.
+  applyImportPackage(pkg, cc);
   return { cloudConfig: cc, rulesByModule: rules };
-}
-
-function applyMerge(
-  pkg: ExportFile,
-  cc: Record<string, any>,
-  _rules: Record<string, any[]>,
-): void {
-  for (const [cfgName, cfgBody] of Object.entries(pkg.data.cloudConfig)) {
-    if (!cc[cfgName]) cc[cfgName] = { meta: {}, params: {} };
-    if (!cc[cfgName].params) cc[cfgName].params = {};
-    const target = cc[cfgName].params;
-    const src = (cfgBody as any).params ?? {};
-
-    if (cfgName === 'booster_config') {
-      if (!target.game_booster) target.game_booster = {};
-      const srcGb = src.game_booster ?? {};
-      for (const [k, v] of Object.entries(srcGb)) {
-        target.game_booster[k] = deepClone(v);
-      }
-    } else {
-      for (const [k, v] of Object.entries(src)) {
-        target[k] = deepClone(v);
-      }
-    }
-  }
-  // rules are auto-synced from cloud_config during pushAll via syncRuleContent,
-  // so we don't need to touch rulesByModule here for the preview or apply.
 }
 
 function deepClone<T>(v: T): T {
@@ -465,7 +407,7 @@ async function doImport() {
   });
   if (!ok) return;
 
-  applyMerge(pkg, state.cloudConfig as Record<string, any>, state.rulesByModule);
+  applyImportPackage(pkg, state.cloudConfig as Record<string, any>);
   markDirty();
   pendingPackage.value = null;
   importError.value = '';
@@ -474,7 +416,7 @@ async function doImport() {
 
 // ---- helpers --------------------------------------------------------------
 
-function backendLabel(b: ActiveBackend | null | undefined): string {
+function backendLabel(b: string | null | undefined): string {
   switch (b) {
     case 'mifisr': return 'MIFISR（17 系列）';
     case 'qualcomm': return '高通老通路（15 系列）';
