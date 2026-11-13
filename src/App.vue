@@ -66,6 +66,12 @@
           </div>
         </div>
 
+        <div v-if="state.parseIssues.length" class="banner warn">
+          <strong>有 {{ state.parseIssues.length }} 行配置无法解析</strong>
+          <span>{{ parseIssueSummary }}</span>
+          <span class="tiny">这些行的原始内容仍保留在数据库里，本模块不会写回它们；其余配置可以正常查看和提交。</span>
+        </div>
+
         <KeepAlive :max="14">
           <component :is="currentView" />
         </KeepAlive>
@@ -336,6 +342,15 @@ function pathCount(id: string): string {
   return p ? String(p.count) : '—';
 }
 
+const parseIssueSummary = computed(() => {
+  const issues = state.parseIssues;
+  const shown = issues
+    .slice(0, 4)
+    .map((i) => `${i.db === 'smartp' ? 'SmartP' : 'teg'}:${i.config}（${i.message}）`)
+    .join('；');
+  return issues.length > 4 ? `${shown} 等 ${issues.length} 行` : shown;
+});
+
 const themeIcon = computed(() => (theme.mode === 'auto' ? 'auto' : theme.mode === 'light' ? 'sun' : 'moon'));
 const themeLabel = computed(() => {
   if (theme.mode === 'auto') return `跟随系统 · ${theme.effective === 'light' ? '浅' : '深'}`;
@@ -358,7 +373,19 @@ async function handlePush() {
   });
   if (note === null) return;
   try {
-    const name = await pushAll({ note });
+    const res = await pushAll({ note });
+    if (res.reason === 'no-change') {
+      toast.info('没有改动', '工作区与设备上的配置一致，未写入数据库、未写历史、未重启 Joyose');
+      return;
+    }
+    if (res.reason === 'out-of-scope') {
+      toast.warn(
+        '改动没有被写入',
+        '被修改的配置不在当前「写入目标」范围内，请到概览页调整后重新提交',
+      );
+      return;
+    }
+    const name = res.file ?? '';
     const rebased = state.rebasedAt !== null;
     const applied = state.applyStatus;
     if (applied?.stopped === false) {
@@ -391,7 +418,11 @@ async function handleDiscard() {
   });
   if (!ok) return;
   try {
-    await pullAll();
+    const r = await pullAll();
+    if (!r.ok) {
+      toast.fromError(new Error(r.error), '拉取失败');
+      return;
+    }
     toast.info('已重新从设备拉取');
   } catch (err) {
     toast.fromError(err, '拉取失败');

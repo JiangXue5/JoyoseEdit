@@ -98,3 +98,21 @@ export function pickSmartpVersion(meta: VersionMeta | undefined): number | undef
     ? meta.smartpVersion
     : undefined;
 }
+
+/** What a commit should report, given the structural diff and whether either
+ *  database actually changed.
+ *
+ *  `no-change` must not write history or restart Joyose: an empty delta used to
+ *  produce a history entry and a restart anyway, so a no-op looked exactly like
+ *  a real submit. `out-of-scope` means the user did edit something, but the
+ *  current write target excludes the config that changed — reporting success
+ *  there is a lie, and the working copy must stay dirty. */
+export function commitOutcome(
+  deltaCount: number,
+  wroteSmartp: boolean,
+  wroteTeg: boolean,
+): 'no-change' | 'out-of-scope' | 'written' {
+  if (deltaCount === 0) return 'no-change';
+  if (!wroteSmartp && !wroteTeg) return 'out-of-scope';
+  return 'written';
+}

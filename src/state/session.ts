@@ -19,7 +19,8 @@ import {
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
-import { mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '@/db/merge';
+import { commitOutcome, mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '@/db/merge';
+import { isEmptyCloudParams, parseCloudConfigRows, type ParseIssue } from '@/db/parse-rows';
 import {
   detectActiveBackend,
   detectPaths,
@@ -58,14 +59,6 @@ import {
   whenPrefsPersisted,
 } from '@/state/source';
 
-/** "Empty config": params null / not an object / no keys at all (the cloud
- *  did ship a row but only `{}`). Treated as "not yet delivered" — no version
- *  shown, not lockable, not written back. */
-function isEmptyCloudParams(p: unknown): boolean {
-  return (
-    !p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p as object).length === 0
-  );
-}
 
 export interface SessionState {
   connected: boolean;
@@ -95,6 +88,10 @@ export interface SessionState {
   };
   /** Parsed rule_content JSON arrays grouped by rule_module. */
   rulesByModule: Record<string, any[]>;
+  /** Rows whose JSON could not be parsed. A broken row keeps its metadata and
+   *  is reported to the UI instead of aborting the whole pull: one malformed
+   *  cloud_config row used to blank every page. */
+  parseIssues: ParseIssue[];
   /** V3 path detection result (refreshed whenever booster_config is re-parsed). */
   paths: V3PathStatus[];
   /** Which insertion backend this device actually uses. Drives which editor
@@ -126,6 +123,7 @@ export const state = reactive<SessionState>({
   tegRaw: {},
   baselines: { smartp: {}, teg: {}, history: null },
   rulesByModule: {},
+  parseIssues: [],
   paths: [],
   activeBackend: null,
   pristineSnapshot: null,
@@ -186,7 +184,15 @@ export async function refreshStat(): Promise<void> {
   }
 }
 
-export async function pullAll(): Promise<void> {
+/** Result of a pull. Callers must be able to tell "refreshed" from "refresh
+ *  failed": silently keeping the old state made the next action work on stale
+ *  data while the UI said the refresh succeeded. */
+export interface PullResult {
+  ok: boolean;
+  error?: string;
+}
+
+export async function pullAll(): Promise<PullResult> {
   state.loading = true;
   try {
     const [smartpBytes, tegBytes] = await Promise.all([
@@ -226,8 +232,11 @@ export async function pullAll(): Promise<void> {
     state.applyStatus = null;
     state.rebasedAt = null;
     state.lastError = null;
+    return { ok: true };
   } catch (err: any) {
-    state.lastError = err?.message ?? String(err);
+    const message = err?.message ?? String(err);
+    state.lastError = message;
+    return { ok: false, error: message };
   } finally {
     state.loading = false;
   }
@@ -255,14 +264,13 @@ function tegParamsByModule(): Record<string, unknown> {
 function readIntoState(dbS: Database | null, dbT: Database | null) {
   const cc: Record<string, any> = {};
   const smartpRaw: Record<string, any> = {};
+  const issues: ParseIssue[] = [];
   if (dbS) {
-    for (const row of listCloudConfig(dbS)) {
-      const params = parseParams(row.params);
-      // `{}` is not "never delivered": keep the row, flag it empty, and let the
-      // UI / lock / push treat it as "nothing to work with" explicitly.
-      const empty = isEmptyCloudParams(params);
-      cc[row.config_name] = { meta: { ...row, _real: true, empty }, params };
-      smartpRaw[row.config_name] = JSON.parse(JSON.stringify(params));
+    const parsed = parseCloudConfigRows(listCloudConfig(dbS) as Array<Record<string, any>>);
+    Object.assign(cc, parsed.configs);
+    issues.push(...parsed.issues);
+    for (const [name, cfg] of Object.entries(parsed.configs)) {
+      smartpRaw[name] = cfg.meta?.broken ? {} : JSON.parse(JSON.stringify(cfg.params));
     }
   }
   state.cloudConfig = cc;
@@ -289,11 +297,17 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
           meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
           content: JSON.parse(JSON.stringify(content)),
         });
-      } catch {
-        // keep the raw row even if JSON is malformed
-        byModule[mod].push({ meta: { ...row, _real: true, empty: false }, content: row.rule_content });
+      } catch (err: any) {
+        // keep the raw row even if JSON is malformed, and report it: a rule
+        // row that silently vanished looked like "this module has no config".
+        const message = err?.message ?? String(err);
+        issues.push({ db: 'teg', config: mod, message });
+        byModule[mod].push({
+          meta: { ...row, _real: true, empty: false, broken: true, parseError: message },
+          content: row.rule_content,
+        });
         tegRaw[mod].push({
-          meta: { ...row, _real: true, empty: false },
+          meta: { ...row, _real: true, empty: false, broken: true, parseError: message },
           content: row.rule_content,
         });
       }
@@ -301,6 +315,7 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
   }
   state.rulesByModule = byModule;
   state.tegRaw = tegRaw;
+  state.parseIssues = issues;
 
   // ---- fallback: SmartP has no row (or an empty one) but teg does ----
   // Lets a device whose SmartP was never populated keep working instead of
@@ -580,14 +595,14 @@ const JSON_TARGET_CONFIG: Record<JsonTarget, { name: string; db: 'smartp' | 'teg
 export async function saveJsonTarget(
   target: JsonTarget,
   jsonText: string,
-): Promise<{ ok: true; target: string }> {
+): Promise<{ ok: true; target: string; refreshError?: string }> {
   return withWriteLock('参数树写入', () => saveJsonTargetLocked(target, jsonText));
 }
 
 async function saveJsonTargetLocked(
   target: JsonTarget,
   jsonText: string,
-): Promise<{ ok: true; target: string }> {
+): Promise<{ ok: true; target: string; refreshError?: string }> {
   const { name, db: which } = JSON_TARGET_CONFIG[target];
 
   let parsed: unknown;
@@ -678,9 +693,10 @@ async function saveJsonTargetLocked(
   }
 
   // Rebuild from the DB so the editor shows what actually landed. A failure
-  // here does not invalidate the write.
-  await pullAll().catch(() => null);
-  return { ok: true, target };
+  // here does not invalidate the write, but it must not be swallowed: the
+  // editor would keep showing pre-write values while claiming to be current.
+  const pulled = await pullAll();
+  return { ok: true, target, refreshError: pulled.ok ? undefined : pulled.error };
 }
 
 /** How many history files / backup directories to keep on the device. */
@@ -736,9 +752,25 @@ export class ConflictError extends Error {
   }
 }
 
+/** What a commit actually did. A commit that found no structural difference
+ *  must not write a history record or restart Joyose: an empty delta plus a
+ *  restart is indistinguishable from a real edit in the UI, and it also costs
+ *  the user a Joyose cold start. */
+export interface CommitResult {
+  /** History file written, or null when nothing was written. */
+  file: string | null;
+  changed: boolean;
+  /** `written` = at least one DB changed, `no-change` = working copy equals the
+   *  base, `out-of-scope` = there are edits but they fall outside the current
+   *  write target, so the DBs came back byte-identical. */
+  reason: 'written' | 'no-change' | 'out-of-scope';
+  wroteSmartp: boolean;
+  wroteTeg: boolean;
+}
+
 /** Commit the in-memory edits: build history record, write both DBs, save
  * history, refresh state. Returns the history filename written. */
-async function pushCore(opts: PushOptions = {}): Promise<string> {
+async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
   try {
     // Which database(s) this commit may touch. Global setting, honoured by
     // every page — see the "来源与写入" panel.
@@ -773,9 +805,29 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       }
     }
 
-    // auto-backup — abort when it does not land. A commit whose restore point
-    // silently failed is exactly the commit the user cannot walk back later.
-    await ensureBackup();
+    // Structural diff first: a commit with an empty delta must not take a
+    // backup, write a history record or restart Joyose. It used to do all
+    // three, so the UI reported a successful submit for a no-op and the user
+    // paid a Joyose cold start for nothing.
+    const recordBefore =
+      state.pristineSnapshot ??
+      snapshotFromMaps({ cloudConfig: state.cloudConfig, rulesByModule: state.rulesByModule });
+    const recordAfter = snapshotFromMaps({
+      cloudConfig: state.cloudConfig,
+      rulesByModule: state.rulesByModule,
+    });
+    const delta = diff(recordBefore, recordAfter);
+    if (commitOutcome(delta.length, false, false) === 'no-change') {
+      state.dirty = false;
+      state.pristineSnapshot = recordAfter;
+      return {
+        file: null,
+        changed: false,
+        reason: 'no-change',
+        wroteSmartp: false,
+        wroteTeg: false,
+      };
+    }
 
     // re-pull current bytes, mutate, write back
     const [smartpBytes, tegBytes] = await Promise.all([
@@ -809,8 +861,11 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       for (const [name, obj] of dbS ? Object.entries(state.cloudConfig) : []) {
         // Only rows that genuinely exist in SmartP and carry content: a config
         // that arrived from the teg fallback must never be written into SmartP,
-        // and an empty row has nothing to write.
-        if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.fromTeg) continue;
+        // an empty row has nothing to write, and a row whose JSON we could not
+        // parse must keep its original bytes.
+        if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.broken || obj.meta?.fromTeg) {
+          continue;
+        }
         const raw = diskParams[name];
         const plan = planSmartpWrite({
           raw,
@@ -833,9 +888,10 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
         if (rows.length === 0) continue;
         const row = currentRuleRow(rows);
         if (!row) continue;
-        // Same rule for the mirror: never write a row the DB does not have, and
-        // skip empty envelopes so a placeholder cannot erase real content.
-        if (row.meta?._real !== true || row.meta?.empty) continue;
+        // Same rule for the mirror: never write a row the DB does not have,
+        // skip empty envelopes so a placeholder cannot erase real content, and
+        // never re-serialise a row we failed to parse.
+        if (row.meta?._real !== true || row.meta?.empty || row.meta?.broken) continue;
         // Resolve the target *against the DB we are about to write*, not
         // against our (possibly stale) in-memory copy: Joyose may have
         // appended a newer revision between pull and push.
@@ -857,12 +913,25 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       if (dbT) closeDb(dbT);
     }
 
-    const recordBefore = state.pristineSnapshot ??
-      snapshotFromMaps({ cloudConfig: state.cloudConfig, rulesByModule: state.rulesByModule });
-    const recordAfter = snapshotFromMaps({
-      cloudConfig: state.cloudConfig,
-      rulesByModule: state.rulesByModule,
-    });
+    const wroteSmartp = !!(outSmartp && smartpBytes && !sameBytes(outSmartp, smartpBytes));
+    const wroteTeg = !!(
+      outTeg &&
+      tegBytes &&
+      Object.values(state.rulesByModule).some((rows) => rows.length > 0) &&
+      !sameBytes(outTeg, tegBytes)
+    );
+    // There are edits, but none of them land in the databases this commit is
+    // allowed to write (e.g. the user edited a teg-only config while the write
+    // target is SmartP-only). Say so instead of reporting a successful write.
+    if (commitOutcome(delta.length, wroteSmartp, wroteTeg) === 'out-of-scope') {
+      return { file: null, changed: false, reason: 'out-of-scope', wroteSmartp, wroteTeg };
+    }
+
+    // auto-backup — abort when it does not land. A commit whose restore point
+    // silently failed is exactly the commit the user cannot walk back later.
+    // Runs after the diff so a no-op never creates a backup, and immediately
+    // before the write so the restore point is as close as possible to it.
+    await ensureBackup();
 
     // persist DBs first, so if anything fails we can re-sync
     const stops: boolean[] = [];
@@ -872,8 +941,8 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     // Uploading a DB costs one ksu.exec round-trip per 48 KB of base64 — about
     // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
     // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
-    if (outSmartp && smartpBytes && !sameBytes(outSmartp, smartpBytes)) {
-      recordStop(await bridge.push('smartp', outSmartp));
+    if (wroteSmartp) {
+      recordStop(await bridge.push('smartp', outSmartp!));
       // The row on disk is now what we just wrote. Keeping the pre-commit copy
       // would make the next commit in this session merge onto a stale base.
       for (const [name, params] of Object.entries(writtenRaw)) {
@@ -881,19 +950,13 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       }
     }
     // only touch teg if we actually have rows to write
-    if (
-      outTeg &&
-      tegBytes &&
-      Object.values(state.rulesByModule).some((rows) => rows.length > 0) &&
-      !sameBytes(outTeg, tegBytes)
-    ) {
-      recordStop(await bridge.push('teg', outTeg));
+    if (wroteTeg) {
+      recordStop(await bridge.push('teg', outTeg!));
     }
 
     // write history after successful DB push. v2 records store only the
     // forward delta (parent -> this); reconstruction walks the chain from
     // pristineSnapshot. Keeps each file in the KB range.
-    const delta = diff(recordBefore, recordAfter);
     const existing = await bridge.historyList();
     const seq = nextSeq(existing);
     const ts = Math.floor(Date.now() / 1000);
@@ -924,7 +987,7 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     state.dirty = false;
     await refreshStat();
     await refreshBaseline();
-    return fname;
+    return { file: fname, changed: true, reason: 'written', wroteSmartp, wroteTeg };
   } catch (err) {
     // ConflictError bubbles to pushAll, which rebases and retries; anything
     // else is a genuine failure and must reach the user.
@@ -1005,7 +1068,7 @@ export function isWriteBusy(): boolean {
 
 /** Public commit entry point: on a conflict, rebase onto the fresh DBs and
  *  retry (up to 3 attempts) before surfacing the error. */
-export async function pushAll(opts: PushOptions = {}): Promise<string> {
+export async function pushAll(opts: PushOptions = {}): Promise<CommitResult> {
   return withWriteLock('提交', async () => {
     state.loading = true;
     try {

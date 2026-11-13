@@ -90,6 +90,7 @@
               :title="row.cfg.meta?.empty ? '' : `原始版本号 ${row.cfg.meta?.version ?? '—'}`"
             ><span class="lbl">{{ isVersionLocked(row.cfg.meta?.version) ? '锁定' : '生效' }}</span>{{ currentLabel(row.cfg) }}</span>
             <span v-if="row.cfg.meta?.empty" class="pill off">空配置</span>
+            <span v-if="row.cfg.meta?.broken" class="pill danger">JSON 损坏</span>
           </div>
           <dl class="cfg-sources">
             <div class="cfg-source">
@@ -118,6 +119,10 @@
               </dd>
             </div>
           </dl>
+          <div v-if="row.cfg.meta?.broken" class="cfg-conflict">
+            这一行的 JSON 无法解析（{{ row.cfg.meta?.parseError }}）。它的原始内容仍保存在数据库里，
+            本模块不会写回这一行；需要修复时请到「参数树」按原始文本处理。
+          </div>
           <div v-if="sourceConflict(row.name)" class="cfg-conflict">
             {{ sourceConflict(row.name) }}
           </div>
@@ -426,7 +431,11 @@ async function reportPersist() {
 
 async function applyPull(label: string) {
   try {
-    await pullAll();
+    const r = await pullAll();
+    if (!r.ok) {
+      toast.fromError(new Error(r.error), '切换失败');
+      return;
+    }
     toast.info('已切换来源并重新拉取', label);
   } catch (err) {
     toast.fromError(err, '切换失败');
@@ -555,7 +564,8 @@ async function handleResetCloud() {
     await resetCloudData();
     toast.warn('已重置云控', 'Joyose 数据已清空，等待其重新下载；必要时重启设备');
     await refreshStat();
-    await pullAll();
+    const r = await pullAll();
+    if (!r.ok) toast.warn('已重置，但界面刷新失败', `${r.error} · 请手动刷新`);
   } catch (err) {
     toast.fromError(err, '重置失败');
   }
@@ -563,7 +573,8 @@ async function handleResetCloud() {
 
 async function handleRefresh() {
   await refreshStat();
-  await pullAll();
+  const r = await pullAll();
+  if (!r.ok) toast.fromError(new Error(r.error), '刷新失败');
 }
 
 async function handleBackup() {
@@ -590,9 +601,11 @@ async function handleRevertLatest() {
   if (!ok) return;
   try {
     const r = await revertLatestBackup();
-    await pullAll();
+    const pulled = await pullAll();
     if (r.wasRunning && r.restarted === false) {
       toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', r.from);
+    } else if (!pulled.ok) {
+      toast.warn('已回滚，但界面刷新失败', `${pulled.error} · 请手动刷新`);
     } else {
       toast.success('已回滚到备份', r.from);
     }

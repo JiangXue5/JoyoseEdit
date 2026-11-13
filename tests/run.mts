@@ -107,7 +107,8 @@ import {
   nextSeq,
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, invertDelta } from '../src/history/diff';
-import { mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '../src/db/merge';
+import { commitOutcome, mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '../src/db/merge';
+import { parseCloudConfigRows } from '../src/db/parse-rows';
 import {
   IMPORT_SCHEMA,
   applyImportPackage,
@@ -863,6 +864,40 @@ async function runDiffTest() {
       throw new Error('zero must mean unknown, not a version');
     }
     return 'teg dropped / own kept / lock wins';
+  });
+
+  await check('rows: one broken JSON row does not blank the others', () => {
+    const rows = [
+      { config_name: 'booster_config', params: '{"a":1}', version: 1 },
+      { config_name: 'common_config', params: '{"game_list":["com.x"]', version: 2 },
+      { config_name: 'thermal_config', params: '{}', version: 3 },
+    ];
+    const { configs, issues } = parseCloudConfigRows(rows);
+    if (Object.keys(configs).length !== 3) throw new Error('a row was dropped');
+    if (configs.booster_config.params.a !== 1) throw new Error('good row not parsed');
+    if (!configs.common_config.meta.broken) throw new Error('broken row not flagged');
+    if (configs.common_config.meta.version !== 2) throw new Error('broken row lost its metadata');
+    if (configs.common_config.meta.parseError === undefined) throw new Error('no parse error kept');
+    if (issues.length !== 1 || issues[0].config !== 'common_config') {
+      throw new Error('issue not reported: ' + JSON.stringify(issues));
+    }
+    // `{}` is "not delivered yet", not "corrupt" — it must stay writable.
+    if (configs.thermal_config.meta.broken) throw new Error('empty row marked broken');
+    if (!configs.thermal_config.meta.empty) throw new Error('empty row not flagged empty');
+    return '3 rows / 1 broken / 1 empty';
+  });
+
+  await check('commit: no-op means no history and no restart', () => {
+    if (commitOutcome(0, false, true) !== 'no-change') throw new Error('empty delta not no-change');
+    if (commitOutcome(0, true, true) !== 'no-change') throw new Error('empty delta with writes');
+    return 'no-change';
+  });
+
+  await check('commit: edits outside the write target are reported, not written', () => {
+    if (commitOutcome(2, false, false) !== 'out-of-scope') throw new Error('not out-of-scope');
+    if (commitOutcome(2, true, false) !== 'written') throw new Error('smartp write misclassified');
+    if (commitOutcome(1, false, true) !== 'written') throw new Error('teg write misclassified');
+    return 'scope respected';
   });
 
   await check('merge: no edits returns the raw value unchanged', () => {

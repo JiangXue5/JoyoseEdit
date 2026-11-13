@@ -149,7 +149,13 @@ function reset() {
  *  without a pull can restore a snapshot that is already stale. */
 async function resetLatest(withInfo = false) {
   try {
-    await pullAll();
+    const r = await pullAll();
+    // Resetting onto a failed pull would restore a snapshot that is older than
+    // what is on the device — the exact opposite of "reset to latest".
+    if (!r.ok) {
+      toast.fromError(new Error(r.error), '重置失败');
+      return;
+    }
     reset();
     if (withInfo) toast.info('已重置为数据库最新值');
   } catch (err) {
@@ -254,11 +260,15 @@ async function save() {
   const text = editor.value.state.doc.toString();
   busy.value = true;
   try {
-    await saveJsonTarget(target.value, text);
-    toast.success(
-      '已写入设备',
-      `${targetLabel()} · Joyose 已重启，进游戏即生效`,
-    );
+    const res = await saveJsonTarget(target.value, text);
+    if (res.refreshError) {
+      toast.warn(
+        '已写入设备，但界面刷新失败',
+        `${targetLabel()} · ${res.refreshError} · 请手动刷新后再继续编辑`,
+      );
+    } else {
+      toast.success('已写入设备', `${targetLabel()} · Joyose 已重启，进游戏即生效`);
+    }
     reset();
   } catch (err) {
     toast.fromError(err, '保存失败');
