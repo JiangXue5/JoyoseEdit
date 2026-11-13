@@ -44,8 +44,41 @@ export const activeView = ref<ViewId>(restore());
  * both the shell and the header need to read this. */
 export const drawerOpen = ref(false);
 
-export function navigate(view: ViewId): void {
+export function navigate(view: ViewId): Promise<boolean> {
+  return requestNavigate(view);
+}
+
+/** A view with unsaved work registers itself here while it is on screen.
+ *  Tab switches are the only way out and KeepAlive never unmounts the leaving
+ *  view, so an unmount hook cannot block anything — the guard has to run
+ *  *before* the ref changes, otherwise "取消" comes too late to keep the draft
+ *  and the user is told their edits are gone after they already are. */
+type LeaveGuard = () => boolean | Promise<boolean>;
+let leaveGuard: LeaveGuard | null = null;
+
+/** Pass null on deactivate so a background view cannot veto navigation. */
+export function setLeaveGuard(fn: LeaveGuard | null): void {
+  leaveGuard = fn;
+}
+
+/** Returns false when the guard refused, i.e. the active tab did not change. */
+async function requestNavigate(view: ViewId): Promise<boolean> {
+  if (view === activeView.value) {
+    drawerOpen.value = false;
+    return true;
+  }
+  if (leaveGuard) {
+    let allowed = false;
+    try {
+      allowed = await leaveGuard();
+    } catch {
+      allowed = false;
+    }
+    if (!allowed) return false;
+  }
   activeView.value = view;
+  drawerOpen.value = false;
+  return true;
 }
 
 watch(activeView, (v) => {

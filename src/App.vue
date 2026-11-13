@@ -14,7 +14,7 @@
       <template v-for="group in navGroups" :key="group.label">
         <div class="nav-group">{{ group.label }}</div>
         <button v-for="item in group.items" :key="item.id" class="nav-btn" :class="{ active: view === item.id }"
-          @click="view = item.id">
+          @click="go(item.id)">
           <AppIcon :name="item.icon" />
           <span class="nav-label">{{ item.label }}</span>
           <span v-if="item.badge" class="badge" :class="item.badgeTone">{{ item.badge }}</span>
@@ -112,7 +112,7 @@ import DialogStack from '@/ui/DialogStack.vue';
 import AppIcon from '@/ui/AppIcon.vue';
 import { dialog } from '@/state/dialog';
 import { theme, cycleTheme } from '@/state/theme';
-import { activeView as view, drawerOpen, type ViewId } from '@/state/nav';
+import { activeView as view, drawerOpen, navigate, type ViewId } from '@/state/nav';
 
 // Async chunks can fail inside the WebView (stale cache → 404 on a hashed
 // chunk, or MIME rejection). Rather than parking the UI on "加载中…" forever,
@@ -305,6 +305,12 @@ watch(
 function onNavClick(event: Event) {
   const target = event.target as HTMLElement | null;
   if (target?.closest('.nav-btn')) drawerOpen.value = false;
+}
+
+/** The only user-facing way to change tabs, so a view with unsaved work gets
+ *  to veto the switch (see setLeaveGuard in state/nav). */
+function go(id: ViewId) {
+  void navigate(id);
 }
 
 onMounted(async () => {

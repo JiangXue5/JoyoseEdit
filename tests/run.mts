@@ -123,6 +123,7 @@ import {
   type ImportPackage,
 } from '../src/import/package';
 import { buildRuleEnvelope, refreshEnvelope } from '../src/history/envelope';
+import { activeView, drawerOpen, navigate, setLeaveGuard } from '../src/state/nav';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,6 +179,7 @@ async function main() {
   await runThermalUnlockTest();
   await runNovatekComplexTest();
   await runRuleMirrorTest(SQL);
+  await runNavGuardTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1791,6 +1793,77 @@ async function runNovatekComplexTest() {
     if (!out.includes('_61#144#')) throw new Error('setB targetFps not applied');
     if (serializeNovatek(parseNovatek(out)) !== out) throw new Error('round-trip broken after edit');
     return 'standard short format editable';
+  });
+}
+
+/* B9: the tab guard is the only thing that can keep an unsaved JSON draft
+ * alive. KeepAlive never unmounts the leaving view, so before this the user was
+ * asked *after* the switch had already happened — a prompt that could not undo
+ * anything, while the draft was overwritten on the next activation. */
+async function runNavGuardTest() {
+  console.log('\n=== nav guard ===');
+
+  await check('nav: 拒绝的守卫保持当前标签页不变', async () => {
+    setLeaveGuard(null);
+    await navigate('overview');
+    let asked = 0;
+    setLeaveGuard(() => {
+      asked++;
+      return false;
+    });
+    const ok = await navigate('json');
+    setLeaveGuard(null);
+    if (ok !== false) throw new Error('navigate 返回了 true');
+    if (activeView.value !== 'overview') throw new Error(`标签页变成了 ${activeView.value}`);
+    if (asked !== 1) throw new Error(`守卫被调用 ${asked} 次`);
+    return 'stayed on overview, guard asked once';
+  });
+
+  await check('nav: 接受的守卫放行并关闭抽屉', async () => {
+    setLeaveGuard(null);
+    await navigate('overview');
+    drawerOpen.value = true;
+    let asked = 0;
+    setLeaveGuard(async () => {
+      asked++;
+      return true;
+    });
+    const ok = await navigate('json');
+    setLeaveGuard(null);
+    if (!ok) throw new Error('navigate 返回了 false');
+    if (activeView.value !== 'json') throw new Error(`标签页是 ${activeView.value}`);
+    if (drawerOpen.value) throw new Error('抽屉没有关闭');
+    if (asked !== 1) throw new Error(`守卫被调用 ${asked} 次`);
+    return 'switched to json, drawer closed';
+  });
+
+  await check('nav: 守卫抛错按拒绝处理', async () => {
+    setLeaveGuard(null);
+    await navigate('json');
+    setLeaveGuard(() => {
+      throw new Error('boom');
+    });
+    const ok = await navigate('overview');
+    setLeaveGuard(null);
+    if (ok !== false || activeView.value !== 'json') {
+      throw new Error('守卫抛错后仍然切换了页面');
+    }
+    return 'treated as refusal';
+  });
+
+  await check('nav: 同一标签页不打扰用户', async () => {
+    setLeaveGuard(null);
+    await navigate('history');
+    let asked = 0;
+    setLeaveGuard(() => {
+      asked++;
+      return false;
+    });
+    const ok = await navigate('history');
+    setLeaveGuard(null);
+    if (!ok) throw new Error('同页导航被拒绝');
+    if (asked) throw new Error('同页也问了守卫');
+    return 'no prompt';
   });
 }
 

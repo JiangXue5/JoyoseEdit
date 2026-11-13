@@ -55,10 +55,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue';
 import { state, saveJsonTarget, pullAll, currentRuleRow, type JsonTarget } from '@/state/session';
 import * as bridge from '@/root/bridge';
 import { toast } from '@/state/toast';
+import { dialog } from '@/state/dialog';
+import { setLeaveGuard } from '@/state/nav';
 import { theme } from '@/state/theme';
 import PageHeader from './PageHeader.vue';
 import AppIcon from './AppIcon.vue';
@@ -146,21 +148,35 @@ function reset() {
 }
 
 /** Re-pull first: the in-memory copies are only rebuilt on pull, so "reset"
- *  without a pull can restore a snapshot that is already stale. */
-async function resetLatest(withInfo = false) {
+ *  without a pull can restore a snapshot that is already stale.
+ *  Returns false when the pull failed — the caller must not pretend the editor
+ *  now shows the selected target. */
+async function resetLatest(withInfo = false): Promise<boolean> {
   try {
     const r = await pullAll();
     // Resetting onto a failed pull would restore a snapshot that is older than
     // what is on the device — the exact opposite of "reset to latest".
     if (!r.ok) {
       toast.fromError(new Error(r.error), '重置失败');
-      return;
+      return false;
     }
     reset();
     if (withInfo) toast.info('已重置为数据库最新值');
+    return true;
   } catch (err) {
     toast.fromError(err, '重置失败');
+    return false;
   }
+}
+
+/** Shared by the target switcher and the tab guard: a draft only survives if
+ *  the user explicitly says "discard". */
+function confirmDiscard(action: string): Promise<boolean> {
+  return dialog.confirm('编辑器有未保存的修改', {
+    detail: `${action}会丢弃这些修改。需要保留的话先点「保存到设备」。`,
+    okText: '丢弃并继续',
+    destructive: true,
+  });
 }
 
 let cancelSwitch = false;
@@ -175,14 +191,24 @@ watch(
       cancelSwitch = false;
       return;
     }
-    if (dirty.value && !window.confirm('编辑器有未保存的修改，切换目标会丢弃它们。继续？')) {
-      dirty.value = false;
+    const wasDirty = dirty.value;
+    if (wasDirty && !(await confirmDiscard('切换编辑目标'))) {
+      // Put the selector back, but keep the document AND the dirty flag: the
+      // old code cleared dirty here, so the "未保存" pill vanished, the tab
+      // guard went quiet and a later activation happily overwrote the draft
+      // with a fresh pull.
       cancelSwitch = true;
       target.value = ov;
       return;
     }
     dirty.value = false;
-    await resetLatest();
+    if (await resetLatest()) return;
+    // The pull failed, so the document still holds the previous target's
+    // content. Leaving `target` on the new value would make the next save write
+    // that content into the wrong row.
+    cancelSwitch = true;
+    target.value = ov;
+    dirty.value = wasDirty;
   },
   { immediate: true },
 );
@@ -243,15 +269,23 @@ watch(
 );
 
 onActivated(() => {
+  // Only while this tab is on screen may it veto a switch.
+  setLeaveGuard(() => (dirty.value ? confirmDiscard('离开这个页面') : true));
   // Coming back to the tab: refresh the baseline content quietly, but never
   // clobber unsaved edits.
   if (!dirty.value) void resetLatest();
 });
 
+onDeactivated(() => {
+  setLeaveGuard(null);
+});
+
 onBeforeUnmount(() => {
-  if (dirty.value) {
-    window.confirm('编辑器有未保存的修改，离开页面会丢失');
-  }
+  // No confirm here. The tab is already switching (KeepAlive means this only
+  // runs on teardown anyway), so a prompt cannot undo anything — it just told
+  // the user their draft was gone after it already was. The guard above does
+  // the blocking, before the navigation happens.
+  setLeaveGuard(null);
   editor.value?.destroy();
 });
 
