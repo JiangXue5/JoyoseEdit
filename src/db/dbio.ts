@@ -157,7 +157,21 @@ export function updateRuleContentById(db: Database, id: number, content: string)
 /** Insert one row for `module` when none exists (the teg mirror of a config
  * that SmartP has but teg never received). Returns 0 when the table is absent
  * (redmi-style DB) instead of throwing — pushing must not fail over a mirror. */
-export function insertRuleRow(db: Database, module: string, content: string, version?: number): number {
+export interface InsertRuleResult {
+  /** Rows actually inserted (1 on success). */
+  inserted: number;
+  /** Why it failed, when it did. Callers on the write path must not ignore a
+   *  zero here: it used to be a bare `0` and the commit carried on as if the
+   *  mirror row existed. */
+  error?: string;
+}
+
+export function insertRuleRow(
+  db: Database,
+  module: string,
+  content: string,
+  version?: number,
+): InsertRuleResult {
   try {
     db.run(
       `INSERT INTO rules (rule_module, rule_content, rule_version) VALUES (:m, :c, :v)`,
@@ -168,9 +182,10 @@ export function insertRuleRow(db: Database, module: string, content: string, ver
       },
     );
     const res = db.exec(`SELECT changes() as n`);
-    return Number(res[0]?.values?.[0]?.[0] ?? 0);
-  } catch {
-    return 0;
+    const inserted = Number(res[0]?.values?.[0]?.[0] ?? 0);
+    return inserted === 1 ? { inserted } : { inserted, error: 'changes() reported no row' };
+  } catch (err: any) {
+    return { inserted: 0, error: err?.message ?? String(err) };
   }
 }
 

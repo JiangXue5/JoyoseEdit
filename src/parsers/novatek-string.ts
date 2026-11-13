@@ -68,19 +68,25 @@ function splitBlocks(raw: string): NovatekBlock[] {
     const join = chunk[0] === '&' || chunk[0] === '|' ? chunk[0] : '';
     const body = join ? chunk.slice(1) : chunk;
     const fields = body.split('#');
-    if (fields.length < 7) {
+    // Exactly 7, not ">= 7": the old code silently kept the first seven and
+    // dropped the rest on the next serialise, so an extended block lost data
+    // without any error. If Joyose ever ships an 8-field format, it must be
+    // modelled explicitly instead of being truncated here.
+    if (fields.length !== 7) {
       throw new Error(
-        `novatek: block "${body.slice(0, 40)}" has ${fields.length} fields, expected >= 7`,
+        `novatek: block "${body.slice(0, 40)}" has ${fields.length} fields, expected exactly 7`,
       );
     }
     blocks.push({
       minFps: fields[0],
       targetFps: fields[1],
-      csv: (fields[2] ?? '').split(',').map((s) => s.trim()),
-      t1: fields[3] ?? '',
-      t2: fields[4] ?? '',
-      t3: fields[5] ?? '',
-      t4: fields[6] ?? '',
+      // No trimming: `"48, 144"` and `"48,144"` are different bytes and the
+      // editor promises a byte-for-byte round trip.
+      csv: fields[2].split(','),
+      t1: fields[3],
+      t2: fields[4],
+      t3: fields[5],
+      t4: fields[6],
       join,
     });
   }

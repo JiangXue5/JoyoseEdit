@@ -22,26 +22,55 @@
 // The lift maps the tens digit 3..5 -> 9 within the temperature part:
 //  45→95, 43→93, 41.5→91.5, 40&41→90&41 (41 preserved), 46.7→96.7.
 
-const TEMP_ATOM = '(?:[3-5][0-9](?:\.[0-9])?)';
+// String.raw: in a normal string literal `\.` collapses to `.`, which turned
+// the decimal point into "any character" and matched things like `451`.
+const TEMP_ATOM = String.raw`(?:[3-5][0-9](?:\.[0-9])?)`;
 const ATOM_RE = new RegExp(`^${TEMP_ATOM}$`);
+
+/** Fields that are KNOWN to carry temperature runs. Everything else is only
+ *  previewed: "lift every number that looks like 30–59 somewhere in the tree"
+ *  would rewrite unknown cloud fields the day Xiaomi reuses the same shape for
+ *  something else. Paths are relative to `game_booster`. */
+export const THERMAL_FIELDS: readonly string[][] = [
+  ['novatek_game_params'],
+  ['novatek_extend_config', 'novatek_non_playing_config'],
+  ['novatek_extend_config', 'novatek_game_params_ext'],
+  ['frc_game_params'],
+  ['customize_game_params', 'game_mifisr_config'],
+];
+
+/** True when a string's location is inside one of the known thermal carriers.
+ *  Tolerant of the `game_booster` wrapper and of element properties such as
+ *  `frc_game_params[].raw`. */
+export function isKnownThermalPath(segments: string[]): boolean {
+  const clean = segments.filter((s) => !/^\[\d+\]$/.test(s));
+  return THERMAL_FIELDS.some((p) => {
+    if (clean.length < p.length) return false;
+    // The carrier may sit at any depth inside `params` (with or without the
+    // `game_booster` wrapper) and the string may be a property of the array
+    // element (`frc_game_params[].raw`). Match the field path as a contiguous
+    // run rather than requiring it at the exact tail.
+    for (let off = 0; off + p.length <= clean.length; off++) {
+      if (p.every((k, i) => k === clean[off + i])) return true;
+    }
+    return false;
+  });
+}
 
 function isTempAtom(t: string): boolean {
   return ATOM_RE.test(t);
 }
 
-/** Lift the tens digit of the TEMPERATURE part of an atom; anything after a
- *  `&` (the next block's minFps) is preserved verbatim. */
+/** Lift the tens digit of a temperature atom. `splitParts()` already treats
+ *  `&` as a delimiter, so an atom never carries the next block's FPS head —
+ *  the old `&` handling here was unreachable. */
 function liftAtom(t: string): string {
-  const amp = t.indexOf('&');
-  const head = amp === -1 ? t : t.slice(0, amp);
-  const tail = amp === -1 ? '' : t.slice(amp);
-  return head.replace(/[3-5](?=\d)/g, () => '9') + tail;
+  return t.replace(/[3-5](?=\d)/g, () => '9');
 }
 
-/** Temperature value without the `&…` FPS head (for display). */
+/** Display helper (kept for callers that print a temp atom). */
 export function tempDisplay(t: string): string {
-  const amp = t.indexOf('&');
-  return amp === -1 ? t : t.slice(0, amp);
+  return t;
 }
 
 interface Part {
@@ -145,14 +174,16 @@ export function liftTempGroupsInString(s: string): { out: string; count: number 
 }
 
 export interface ThermalScan {
-  /** Distinct string fields that contain at least one temperature group. */
+  /** String values that contain at least one temperature group. */
   fieldsAffected: number;
-  /** Total matched fields (each field counts once). */
+  /** Total temperature groups across those values (same unit as apply). */
   groupsTotal: number;
-  /** Field-key (last property name) → field count. */
+  /** Field-key (last property name) → number of matching strings. */
   byField: Record<string, number>;
+  /** Values OUTSIDE the known thermal fields. Previewed, never rewritten. */
+  unknownFields: number;
   /** One example per field for the UI preview. */
-  examples: { field: string; path: string; temps: string[] }[];
+  examples: { field: string; path: string; temps: string[]; known: boolean }[];
 }
 
 export interface ThermalUnlockResult {
@@ -167,6 +198,8 @@ export interface ThermalUnlockResult {
 interface Hit {
   path: string[];
   temps: string[];
+  groups: number;
+  known: boolean;
 }
 
 function collectStringHits(node: unknown, pathArr: string[], out: Hit[]): void {
@@ -180,11 +213,16 @@ function collectStringHits(node: unknown, pathArr: string[], out: Hit[]): void {
     }
     return;
   }
-  if (typeof node === 'string' && findTempGroups(node).length > 0) {
-    out.push({
-      path: pathArr,
-      temps: findTempGroups(node).flatMap((g) => g.temps.map((t) => tempDisplay(t))),
-    });
+  if (typeof node === 'string') {
+    const groups = findTempGroups(node);
+    if (groups.length > 0) {
+      out.push({
+        path: pathArr,
+        temps: groups.flatMap((g) => g.temps.map((t) => tempDisplay(t))),
+        groups: groups.length,
+        known: isKnownThermalPath(pathArr),
+      });
+    }
   }
 }
 
@@ -196,18 +234,28 @@ export function scanThermalUnlock(params: unknown): ThermalScan {
 
   const byField: Record<string, number> = {};
   const examples: ThermalScan['examples'] = [];
+  let groupsTotal = 0;
+  let unknownFields = 0;
   for (const h of hits) {
+    groupsTotal += h.groups;
+    if (!h.known) unknownFields++;
     const segs = h.path.filter((s) => !/^\[\d+\]$/.test(s));
     const field = segs[segs.length - 1] ?? '';
     byField[field] = (byField[field] ?? 0) + 1;
     if (examples.length < 8) {
-      examples.push({ field, path: h.path.join('.'), temps: h.temps.slice(0, 8) });
+      examples.push({
+        field,
+        path: h.path.join('.'),
+        temps: h.temps.slice(0, 8),
+        known: h.known,
+      });
     }
   }
   return {
     fieldsAffected: hits.length,
-    groupsTotal: hits.length,
+    groupsTotal,
     byField,
+    unknownFields,
     examples,
   };
 }
@@ -218,19 +266,28 @@ export function scanThermalUnlock(params: unknown): ThermalScan {
 export function applyThermalUnlock(params: unknown): ThermalUnlockResult {
   const liftedByField: Record<string, number> = {};
   let groupsTotal = 0;
+  let fieldsAffected = 0;
 
-  const walk = (node: unknown, field: string): void => {
+  // `pathArr` is relative to `game_booster`, mirroring scanThermalUnlock().
+  const walk = (node: unknown, pathArr: string[]): void => {
     if (Array.isArray(node)) {
       for (let i = 0; i < node.length; i++) {
-        if (typeof node[i] === 'string') {
-          const { out, count } = liftTempGroupsInString(node[i]);
+        const p = pathArr.length ? pathArr : [];
+        const el = node[i];
+        if (typeof el === 'string') {
+          // Only the known thermal carriers are rewritten. An unknown string
+          // that happens to contain 45#43#41 is left untouched.
+          if (!isKnownThermalPath(p)) continue;
+          const { out, count } = liftTempGroupsInString(el);
           if (count > 0) {
             node[i] = out;
             groupsTotal += count;
+            fieldsAffected++;
+            const field = p[p.length - 1] ?? '';
             liftedByField[field] = (liftedByField[field] ?? 0) + count;
           }
-        } else if (node[i] && typeof node[i] === 'object') {
-          walk(node[i], field);
+        } else if (el && typeof el === 'object') {
+          walk(el, p);
         }
       }
       return;
@@ -238,26 +295,54 @@ export function applyThermalUnlock(params: unknown): ThermalUnlockResult {
     if (node && typeof node === 'object') {
       const obj = node as Record<string, unknown>;
       for (const k of Object.keys(obj)) {
+        const p = [...pathArr, k];
         if (typeof obj[k] === 'string') {
+          if (!isKnownThermalPath(p)) continue;
           const { out, count } = liftTempGroupsInString(obj[k]);
           if (count > 0) {
             obj[k] = out;
             groupsTotal += count;
+            fieldsAffected++;
             liftedByField[k] = (liftedByField[k] ?? 0) + count;
           }
         } else if (obj[k] && typeof obj[k] === 'object') {
-          walk(obj[k], k);
+          walk(obj[k], p);
         }
       }
     }
   };
 
-  walk(params, 'booster_config');
+  // Callers pass `game_booster`, so paths start empty.
+  walk(params, []);
 
   return {
-    fieldsAffected: Object.keys(liftedByField).length,
+    fieldsAffected,
     groupsTotal,
     liftedByField,
     changed: groupsTotal > 0,
   };
+}
+/** Distinct temperature groups that `applyThermalUnlock()` would actually lift,
+ *  with the value each becomes. Unknown fields are excluded on purpose, so the
+ *  preview cannot show a rewrite that will not happen. */
+export function knownTempGroups(params: unknown): { raw: string; lifted: string }[] {
+  const seen = new Map<string, string>();
+  const walk = (node: unknown, pathArr: string[]): void => {
+    if (Array.isArray(node)) {
+      for (const el of node) walk(el, pathArr);
+      return;
+    }
+    if (node && typeof node === 'object') {
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        walk(v, [...pathArr, k]);
+      }
+      return;
+    }
+    if (typeof node !== 'string' || !isKnownThermalPath(pathArr)) return;
+    for (const g of findTempGroups(node)) {
+      if (!seen.has(g.raw)) seen.set(g.raw, liftTempGroupsInString(g.raw).out);
+    }
+  };
+  walk(params, []);
+  return [...seen.entries()].map(([raw, lifted]) => ({ raw, lifted }));
 }

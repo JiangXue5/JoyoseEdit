@@ -39,10 +39,14 @@ export interface FpsLockScan {
   cgameEnables: boolean | null;
   /** Whether game_booster.dynamic_fps_global is present. */
   hasDynamicFpsGlobal: boolean;
-  /** Total number of lock-frame keys found in the whole booster tree. */
+  /** Lock-frame keys at known locations — these are the ones apply removes. */
   totalKeys: number;
-  /** Count per key name, over the whole tree. */
+  /** Count per key name at known locations. */
   countByKey: Record<string, number>;
+  /** Keys that look like lock-frame fields but sit somewhere else. Reported,
+   *  never removed: a future cloud rule may reuse `PID_*` for something else. */
+  unknownKeys: number;
+  unknownByKey: Record<string, number>;
   /** ovrride_config entries that carry at least one lock-frame key. */
   entries: FpsLockEntry[];
 }
@@ -62,36 +66,66 @@ export interface UnlockFpsResult {
   changed: boolean;
 }
 
-function collectLockKeys(node: unknown, countByKey: Record<string, number>): void {
+/** Containers where these keys are actually read by Joyose. Anything else that
+ *  happens to be named `PID_*` is left in place. */
+const KNOWN_CONTAINERS: readonly string[][] = [
+  ['game_booster'],
+  ['game_booster', 'booster_config'],
+  ['game_booster', 'booster_config', 'ovrride_config'],
+];
+
+function isKnownContainer(pathArr: string[]): boolean {
+  const clean = pathArr.filter((s) => !/^\[\d+\]$/.test(s));
+  return KNOWN_CONTAINERS.some((p) => {
+    if (clean.length < p.length) return false;
+    const off = clean.length - p.length;
+    return p.every((k, i) => k === clean[off + i]);
+  });
+}
+
+function collectLockKeys(
+  node: unknown,
+  pathArr: string[],
+  known: Record<string, number>,
+  unknown: Record<string, number>,
+): void {
   if (Array.isArray(node)) {
-    for (const item of node) collectLockKeys(item, countByKey);
+    for (const item of node) collectLockKeys(item, pathArr, known, unknown);
     return;
   }
   if (!node || typeof node !== 'object') return;
+  const ok = isKnownContainer(pathArr);
   const obj = node as Record<string, unknown>;
   for (const k of Object.keys(obj)) {
-    if (isFpsLockKey(k)) countByKey[k] = (countByKey[k] ?? 0) + 1;
+    if (!isFpsLockKey(k)) continue;
+    if (ok) known[k] = (known[k] ?? 0) + 1;
+    else unknown[k] = (unknown[k] ?? 0) + 1;
   }
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') collectLockKeys(v, countByKey);
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object') collectLockKeys(v, [...pathArr, k], known, unknown);
   }
 }
 
-function stripLockKeys(node: unknown, removedByKey: Record<string, number>): void {
+function stripLockKeys(
+  node: unknown,
+  pathArr: string[],
+  removedByKey: Record<string, number>,
+): void {
   if (Array.isArray(node)) {
-    for (const item of node) stripLockKeys(item, removedByKey);
+    for (const item of node) stripLockKeys(item, pathArr, removedByKey);
     return;
   }
   if (!node || typeof node !== 'object') return;
+  const ok = isKnownContainer(pathArr);
   const obj = node as Record<string, unknown>;
   for (const k of Object.keys(obj)) {
-    if (isFpsLockKey(k)) {
+    if (isFpsLockKey(k) && ok) {
       delete obj[k];
       removedByKey[k] = (removedByKey[k] ?? 0) + 1;
     }
   }
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') stripLockKeys(v, removedByKey);
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object') stripLockKeys(v, [...pathArr, k], removedByKey);
   }
 }
 
@@ -121,14 +155,18 @@ export function scanFpsLock(params: unknown): FpsLockScan {
   const gb = (booster.game_booster ?? {}) as Record<string, any>;
 
   const countByKey: Record<string, number> = {};
-  collectLockKeys(params, countByKey);
+  const unknownByKey: Record<string, number> = {};
+  collectLockKeys(params, [], countByKey, unknownByKey);
   const totalKeys = Object.values(countByKey).reduce((a, b) => a + b, 0);
+  const unknownKeys = Object.values(unknownByKey).reduce((a, b) => a + b, 0);
 
   return {
     cgameEnables: typeof gb.cgame_enable === 'boolean' ? gb.cgame_enable : null,
     hasDynamicFpsGlobal: 'dynamic_fps_global' in gb,
     totalKeys,
     countByKey,
+    unknownKeys,
+    unknownByKey,
     entries: collectOverrideEntries(params),
   };
 }
@@ -145,7 +183,7 @@ export function applyUnlockFps(params: unknown): UnlockFpsResult {
   const beforeEntries = collectOverrideEntries(params);
 
   const removedByKey: Record<string, number> = {};
-  stripLockKeys(params, removedByKey);
+  stripLockKeys(params, [], removedByKey);
 
   let cgameDisabled = false;
   if ('cgame_enable' in gb) {

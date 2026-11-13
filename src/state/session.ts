@@ -502,8 +502,9 @@ export function currentRuleRow<T extends { meta: { rule_version?: unknown } }>(
   return best;
 }
 
-/** Version used when teg needs a new mirror row and SmartP offers none. */
-export const COMMON_CONFIG_VERSION = 2024010101;
+/** Last-resort version for a mirror row. `0` means "unknown" and is written as
+ *  0, not as a plausible-looking 2024 date that Joyose might treat as real. */
+export const UNKNOWN_CONFIG_VERSION = 0;
 
 /** teg carries `rules` but has no common_config mirror at all (common on
  *  devices whose teg sync only ever delivered booster_config). Create the row
@@ -515,10 +516,19 @@ function ensureCommonConfigMirror(): void {
   if (!cc || cc.meta?._real !== true || cc.meta?.empty || cc.meta?.fromTeg) return;
   if ((state.rulesByModule[name]?.length ?? 0) > 0) return;
   if (!Object.values(state.rulesByModule).some((rows) => rows.length > 0)) return;
+  // Take the version from the SmartP row this mirror is built from. The old
+  // hard-coded 2024010101 was not the cloud's version for any module on any
+  // sample; writing it made the mirror look like a real release.
+  const rawVersion = Number(cc.meta?.version ?? 0);
+  const version = Number.isFinite(rawVersion) && rawVersion > 0 ? rawVersion : undefined;
   state.rulesByModule[name] = [
     {
-      meta: { rule_version: COMMON_CONFIG_VERSION, _real: true, empty: false },
-      content: refreshEnvelope(null, cc.params, COMMON_CONFIG_VERSION, name),
+      meta: {
+        rule_version: version ?? UNKNOWN_CONFIG_VERSION,
+        _real: true,
+        empty: false,
+      },
+      content: refreshEnvelope(null, cc.params, version, name),
     },
   ];
 }
@@ -923,7 +933,21 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
         if (id === null) {
           // The mirror row was created in memory above; insert it now instead of
           // silently dropping the write.
-          insertRuleRow(dbT, module, JSON.stringify(row.content), COMMON_CONFIG_VERSION);
+          // Same rule for the inserted row: use the envelope's own version when
+          // it has one, otherwise leave the column unknown.
+          const mirrorVersion =
+            Number(row.meta?.rule_version ?? 0) || Number((row.content as any)?.version ?? 0);
+          const ins = insertRuleRow(
+            dbT,
+            module,
+            JSON.stringify(row.content),
+            mirrorVersion > 0 ? mirrorVersion : undefined,
+          );
+          if (ins.inserted !== 1) {
+            throw new Error(
+              `teg 镜像行写入失败（${module}）：${ins.error ?? '没有插入任何行'}`,
+            );
+          }
           continue;
         }
         updateRuleContentById(dbT, id, JSON.stringify(row.content));

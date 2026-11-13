@@ -37,6 +37,10 @@
           云控里没有可识别的温度组 —— 要么已处理过，要么这套配置不含插帧温控。
         </div>
         <div v-else class="hint mono" style="margin-top: 12px">{{ fieldSummary }}</div>
+        <div v-if="scan.unknownFields" class="banner warn" style="margin-top: 12px">
+          <strong>另有 {{ scan.unknownFields }} 处不在已知温控字段内</strong>
+          <span>这些字符串看起来像温度段，但所在地段不是已确认的温控字段。它们只会在下方预览里出现，本次抬升不会改动它们。</span>
+        </div>
       </section>
 
       <section v-if="uniqueGroups.length" class="panel">
@@ -87,6 +91,7 @@ import AppIcon from './AppIcon.vue';
 import {
   scanThermalUnlock,
   applyThermalUnlock,
+  knownTempGroups,
   findTempGroups,
   liftTempGroupsInString,
   type ThermalScan,
@@ -100,27 +105,14 @@ const scan = computed<ThermalScan>(() =>
 );
 
 function emptyScan(): ThermalScan {
-  return { fieldsAffected: 0, groupsTotal: 0, byField: {}, examples: [] };
+  return { fieldsAffected: 0, groupsTotal: 0, byField: {}, unknownFields: 0, examples: [] };
 }
 
 /** Every distinct temperature group in the tree, with the value it would
  *  become, so the user sees exactly what a 90 °C lift means before applying. */
-const uniqueGroups = computed<{ raw: string; lifted: string }[]>(() => {
-  const seen = new Map<string, string>();
-  const walk = (node: unknown) => {
-    if (Array.isArray(node)) {
-      node.forEach(walk);
-    } else if (node && typeof node === 'object') {
-      Object.values(node as Record<string, unknown>).forEach(walk);
-    } else if (typeof node === 'string') {
-      for (const g of findTempGroups(node)) {
-        if (!seen.has(g.raw)) seen.set(g.raw, liftTempGroupsInString(g.raw).out);
-      }
-    }
-  };
-  if (boosterSource.value) walk(boosterSource.value);
-  return [...seen.entries()].slice(0, 12).map(([raw, lifted]) => ({ raw, lifted }));
-});
+const uniqueGroups = computed<{ raw: string; lifted: string }[]>(() =>
+  boosterSource.value ? knownTempGroups(boosterSource.value).slice(0, 12) : [],
+);
 
 const fieldSummary = computed(() =>
   Object.entries(scan.value.byField)

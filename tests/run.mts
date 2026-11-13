@@ -1536,6 +1536,25 @@ async function runFpsLockPrefixTest() {
     for (const k of noMatch) if (isFpsLockKey(k)) throw new Error(k + ' should NOT match');
     return 'prefix matching OK';
   });
+  await check('fpslock: same-named keys outside known containers stay', () => {
+    const tree: any = {
+      game_booster: {
+        mifisr_settings: { PID_T: 1, dynamic_fps: 'x' },
+        booster_config: { ovrride_config: [{ PID_T: 2 }] },
+      },
+    };
+    const scan = scanFpsLock(tree);
+    if (scan.unknownKeys !== 2) throw new Error('unknownKeys=' + scan.unknownKeys);
+    if (scan.totalKeys !== 1) throw new Error('totalKeys=' + scan.totalKeys);
+    applyUnlockFps(tree);
+    if (tree.game_booster.mifisr_settings.PID_T !== 1) throw new Error('unknown PID_T was removed');
+    if (tree.game_booster.mifisr_settings.dynamic_fps !== 'x') throw new Error('unknown dynamic_fps removed');
+    if ('PID_T' in tree.game_booster.booster_config.ovrride_config[0]) {
+      throw new Error('known PID_T not removed');
+    }
+    return '2 unknown kept / 1 known removed';
+  });
+
   await check('fpslock: apply removes only lock keys and is idempotent', () => {
     const tree: any = {
       game_booster: {
@@ -1675,6 +1694,26 @@ async function runThermalUnlockTest() {
     if (findTempGroups('a#45_b#43').length !== 0) throw new Error('crossed section boundary');
     return 'grouping OK';
   });
+  await check('thermal: unknown fields are previewed but never rewritten', () => {
+    const tree: any = {
+      game_booster: {
+        future_thermal_field: ['x#45#43#41'],
+        frc_game_params: ['com.a_45_90_30_60_47_46_43_41'],
+      },
+    };
+    const scan = scanThermalUnlock(tree);
+    if (!scan.unknownFields) throw new Error('unknown field not reported');
+    const r = applyThermalUnlock(tree);
+    if (!r.changed) throw new Error('apply did nothing');
+    if (tree.game_booster.future_thermal_field[0] !== 'x#45#43#41') {
+      throw new Error('unknown field was rewritten: ' + tree.game_booster.future_thermal_field[0]);
+    }
+    if (!tree.game_booster.frc_game_params[0].includes('_96_93_91')) {
+      throw new Error('known field not lifted');
+    }
+    return 'unknown kept / known lifted';
+  });
+
   await check('thermal: scan + apply round trip on a synthetic tree', () => {
     const tree: any = {
       game_booster: {
@@ -1719,6 +1758,26 @@ async function runNovatekComplexTest() {
     if (!out.includes('#95#93#93#91&41#120')) throw new Error('temps not lifted / join lost');
     return 'temps lifted, block joins preserved';
   });
+  await check('novatek: a block with 8 fields is rejected, not truncated', () => {
+    const raw = 'com.x_49#144#48,144,1,0x2114,1,1,1,0x1#45#43#43#41#EXTRA_49#144#48,144,1,0x2114,1,1,1,0x1#45#43#43#41_49#144#48,144,1,0x2114,1,1,1,0x1#45#43#43#41';
+    let msg = '';
+    try {
+      parseNovatek(raw);
+    } catch (err: any) {
+      msg = String(err.message);
+    }
+    if (!/expected exactly 7/.test(msg)) throw new Error('accepted 8 fields: ' + msg);
+    return 'rejected';
+  });
+
+  await check('novatek: csv whitespace round-trips byte-for-byte', () => {
+    const raw = 'com.x_49#144#48, 144,1,0x2114,1,1,1,0x1#45#43#43#41_49#144#48,144,1,0x2114,1,1,1,0x1#45#43#43#41_49#144#48,144,1,0x2114,1,1,1,0x1#45#43#43#41';
+    const p = parseNovatek(raw);
+    if (p.setA.csv[1] !== ' 144') throw new Error('whitespace was trimmed: ' + JSON.stringify(p.setA.csv));
+    if (serializeNovatek(p) !== raw) throw new Error('round trip changed the bytes');
+    return 'verbatim';
+  });
+
   await check('novatek: surface edits on a short set actually persist', () => {
     const p = parseNovatek(
       'com.miHoYo.Nap_61#120#60,120,1,0x2314#95#93#93#91_0#0#0,0,0,0,1,0x44,1,0x222,0,0,0,0,0x52,1,0x2#95#93#93#91_61#120#60,120,1,0x2314,1,0x44,1,0x222,0,0,0,0,0x52,1,0x2#95#93#93#91',
@@ -1740,6 +1799,18 @@ async function runRuleMirrorTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
   const sample = SAMPLES.find((s) => s.label.includes('Xiaomi 15'));
   if (!sample) return;
   const bytes = new Uint8Array(readFileSync(path.join(ROOT, sample.teg)));
+  await check('rules: a failed insert is reported, not silently zero', () => {
+    const empty = new SQL.Database();
+    try {
+      const r = insertRuleRow(empty, 'common_config', '{}', 1);
+      if (r.inserted !== 0) throw new Error('inserted a row into a database with no tables');
+      if (!r.error) throw new Error('failure carried no reason');
+      return 'reported: ' + r.error.slice(0, 30);
+    } finally {
+      empty.close();
+    }
+  });
+
   await check('rules: insert a mirror row only when the module has none', () => {
     const db = new SQL.Database(bytes);
     try {
@@ -1749,8 +1820,8 @@ async function runRuleMirrorTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
       if (latestRuleIdForModule(db, 'common_config') !== null) {
         throw new Error('row should be gone');
       }
-      const n = insertRuleRow(db, 'common_config', JSON.stringify({ version: 2024010101, params: { a: 1 } }), 2024010101);
-      if (n !== 1) throw new Error('insert reported ' + n);
+      const ins = insertRuleRow(db, 'common_config', JSON.stringify({ version: 2024010101, params: { a: 1 } }), 2024010101);
+      if (ins.inserted !== 1) throw new Error('insert reported ' + ins.inserted + ': ' + (ins.error ?? ''));
       const id = latestRuleIdForModule(db, 'common_config');
       if (id === null) throw new Error('row not found after insert');
       const rows = listRules(db).filter((r) => r.rule_module === 'common_config');

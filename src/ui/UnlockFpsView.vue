@@ -43,6 +43,10 @@
         </div>
 
         <div v-if="keySummary" class="hint mono" style="margin-top: 12px">{{ keySummary }}</div>
+        <div v-if="scan.unknownKeys" class="banner warn" style="margin-top: 12px">
+          <strong>另有 {{ scan.unknownKeys }} 个同名字段不在已知位置</strong>
+          <span>它们不在 game_booster / booster_config / ovrride_config 下，可能是别的用途。本次只会显示，不会删除。</span>
+        </div>
       </section>
 
       <section class="panel">
@@ -169,6 +173,8 @@ function emptyScan(): FpsLockScan {
     hasDynamicFpsGlobal: false,
     totalKeys: 0,
     countByKey: {},
+    unknownKeys: 0,
+    unknownByKey: {},
     entries: [],
   };
 }
