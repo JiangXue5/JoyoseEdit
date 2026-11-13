@@ -105,7 +105,7 @@ import {
   nextSeq,
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, invertDelta } from '../src/history/diff';
-import { mergeOntoRaw, pickSmartpVersion } from '../src/db/merge';
+import { mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '../src/db/merge';
 import {
   IMPORT_SCHEMA,
   applyImportPackage,
@@ -869,6 +869,74 @@ async function runDiffTest() {
     if (changed) throw new Error('reported a change with identical copies');
     if (value !== raw) throw new Error('raw value was cloned or replaced');
     return 'unchanged';
+  });
+
+  await check('writeback: 第二次提交以磁盘为准，不会回滚第一次的改动', () => {
+    // Pull sees {a:1,b:1}. The user edits a, commits: disk becomes {a:2,b:1}.
+    // Then edits b. Merging onto the *old* raw would emit {a:1,b:2} and quietly
+    // undo the first commit — the in-memory raw copy has to follow the write.
+    const disk: any = { a: 1, b: 1 };
+    const first = planSmartpWrite({
+      raw: disk,
+      workBefore: { a: 1, b: 1 },
+      workAfter: { a: 2, b: 1 },
+      source: 'smartp',
+    });
+    if (!first.write) throw new Error('first commit was skipped: ' + first.reason);
+    Object.assign(disk, first.params as any);
+
+    const second = planSmartpWrite({
+      raw: disk,
+      workBefore: { a: 2, b: 1 },
+      workAfter: { a: 2, b: 2 },
+      source: 'smartp',
+    });
+    if (!second.write) throw new Error('second commit was skipped: ' + second.reason);
+    const out = second.params as any;
+    if (out.a !== 2 || out.b !== 2) throw new Error('earlier edit rolled back: ' + JSON.stringify(out));
+
+    // Same call with the stale base reproduces the bug — kept as documentation.
+    const stale = mergeOntoRaw({ raw: { a: 1, b: 1 }, before: { a: 2, b: 1 }, after: { a: 2, b: 2 } });
+    if ((stale.value as any).a !== 1) throw new Error('expected the stale base to drop a=2');
+    return 'a=2 & b=2 kept';
+  });
+
+  await check('writeback: 无 SmartP 行 / teg 来源 / 无改动 都不写', () => {
+    const noRow = planSmartpWrite({ raw: undefined, workBefore: { a: 1 }, workAfter: { a: 2 } });
+    if (noRow.write || noRow.reason !== 'no-row') throw new Error('missing row not skipped');
+    const tegSourced = planSmartpWrite({
+      raw: { a: 1 },
+      workBefore: undefined,
+      workAfter: { a: 2, fromTeg: true },
+      source: 'teg',
+    });
+    if (tegSourced.write) throw new Error('teg working copy written into SmartP');
+    const unchanged = planSmartpWrite({
+      raw: { a: 1 },
+      workBefore: { a: 1 },
+      workAfter: { a: 1 },
+      source: 'smartp',
+    });
+    if (unchanged.write || unchanged.reason !== 'unchanged') throw new Error('no-op not skipped');
+    return 'no-row / teg / unchanged skipped';
+  });
+
+  await check('writeback: 没有工作基线时只允许 SmartP 来源整份写入', () => {
+    const whole = planSmartpWrite({
+      raw: { a: 1 },
+      workBefore: undefined,
+      workAfter: { a: 2, b: 3 },
+      source: 'smartp',
+    });
+    if (!whole.write || whole.reason !== 'wholesale') throw new Error('smartp wholesale rejected');
+    const same = planSmartpWrite({
+      raw: { a: 1 },
+      workBefore: undefined,
+      workAfter: { a: 1 },
+      source: 'smartp',
+    });
+    if (same.write) throw new Error('identical wholesale copy was still written');
+    return 'wholesale only for smartp source';
   });
 
   await check('diff: array trailing remove is correctly inverted', () => {

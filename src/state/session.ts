@@ -19,7 +19,7 @@ import {
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
-import { mergeOntoRaw, pickSmartpVersion } from '@/db/merge';
+import { mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '@/db/merge';
 import {
   detectActiveBackend,
   detectPaths,
@@ -81,6 +81,18 @@ export interface SessionState {
    *  source-selection / teg-fallback reconciliation. The JSON editor's
    *  SmartP_* targets read and write this: the target really is SmartP. */
   smartpRaw: Record<string, any>;
+  /** Raw deep copy of teg_config's rule envelopes, grouped by module. Edited
+   *  rows live in `rulesByModule`; this copy never changes while the page is
+   *  open, so "what teg actually had" stays answerable after an edit. */
+  tegRaw: Record<string, any[]>;
+  /** Per-source baselines captured at pull time. `history` is the working copy
+   *  the history delta is computed against; `smartp` / `teg` are the two source
+   *  copies, kept apart so a write target can be diffed against its own DB. */
+  baselines: {
+    smartp: Record<string, unknown>;
+    teg: Record<string, unknown>;
+    history: ReturnType<typeof snapshotFromMaps> | null;
+  };
   /** Parsed rule_content JSON arrays grouped by rule_module. */
   rulesByModule: Record<string, any[]>;
   /** V3 path detection result (refreshed whenever booster_config is re-parsed). */
@@ -111,6 +123,8 @@ export const state = reactive<SessionState>({
   baselineTeg: null,
   cloudConfig: {},
   smartpRaw: {},
+  tegRaw: {},
+  baselines: { smartp: {}, teg: {}, history: null },
   rulesByModule: {},
   paths: [],
   activeBackend: null,
@@ -200,6 +214,14 @@ export async function pullAll(): Promise<void> {
       cloudConfig: state.cloudConfig,
       rulesByModule: state.rulesByModule,
     });
+    // Freeze the two source copies separately from the working copy. Written
+    // here (not inside readIntoState) so a rebase mid-commit does not reset
+    // them: a rebase deliberately keeps the user's working copy.
+    state.baselines = {
+      smartp: JSON.parse(JSON.stringify(state.smartpRaw)),
+      teg: tegParamsByModule(),
+      history: state.pristineSnapshot,
+    };
     state.dirty = false;
     state.applyStatus = null;
     state.rebasedAt = null;
@@ -209,6 +231,25 @@ export async function pullAll(): Promise<void> {
   } finally {
     state.loading = false;
   }
+}
+
+/** The params of teg's newest envelope, per module, as read at pull time. */
+function tegParamsByModule(): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [mod, rows] of Object.entries(state.tegRaw)) {
+    let best: any = null;
+    let bestV = -1;
+    for (const r of rows) {
+      const v = Number(r?.content?.version ?? r?.meta?.rule_version ?? 0);
+      if (v >= bestV) {
+        bestV = v;
+        best = r;
+      }
+    }
+    const p = best?.content?.params;
+    if (p !== undefined) out[mod] = JSON.parse(JSON.stringify(p));
+  }
+  return out;
 }
 
 function readIntoState(dbS: Database | null, dbT: Database | null) {
@@ -228,10 +269,12 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
   state.smartpRaw = smartpRaw;
 
   const byModule: Record<string, any[]> = {};
+  const tegRaw: Record<string, any[]> = {};
   if (dbT) {
     for (const row of listRules(dbT)) {
       const mod = row.rule_module ?? 'unknown';
       if (!byModule[mod]) byModule[mod] = [];
+      if (!tegRaw[mod]) tegRaw[mod] = [];
       try {
         const content = parseParams(row.rule_content);
         const envParams =
@@ -242,13 +285,22 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
           meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
           content,
         });
+        tegRaw[mod].push({
+          meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
+          content: JSON.parse(JSON.stringify(content)),
+        });
       } catch {
         // keep the raw row even if JSON is malformed
         byModule[mod].push({ meta: { ...row, _real: true, empty: false }, content: row.rule_content });
+        tegRaw[mod].push({
+          meta: { ...row, _real: true, empty: false },
+          content: row.rule_content,
+        });
       }
     }
   }
   state.rulesByModule = byModule;
+  state.tegRaw = tegRaw;
 
   // ---- fallback: SmartP has no row (or an empty one) but teg does ----
   // Lets a device whose SmartP was never populated keep working instead of
@@ -735,42 +787,46 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
 
     let outSmartp: Uint8Array | null = null;
     let outTeg: Uint8Array | null = null;
+    /** Params we actually wrote into SmartP, so the in-memory raw copy keeps
+     *  matching the database after this commit. */
+    const writtenRaw: Record<string, any> = {};
     try {
       // Only rewrite rows the user actually touched. Re-serialising every row
       // meant that a cloud push landing between our pull and our commit was
       // silently rolled back on every unrelated config, because we wrote the
       // whole in-memory snapshot back.
       const workBase = state.pristineSnapshot?.smartp?.cloud_config ?? {};
+      // Read the merge base from the bytes we are about to write, not from
+      // `state.smartpRaw`: that copy is whatever the last pull saw, so after a
+      // second edit in the same session it no longer matches the row on disk
+      // and the merge would silently undo the previous commit.
+      const diskParams: Record<string, any> = {};
+      if (dbS) {
+        for (const row of listCloudConfig(dbS)) {
+          diskParams[row.config_name] = parseParams(row.params);
+        }
+      }
       for (const [name, obj] of dbS ? Object.entries(state.cloudConfig) : []) {
         // Only rows that genuinely exist in SmartP and carry content: a config
         // that arrived from the teg fallback must never be written into SmartP,
         // and an empty row has nothing to write.
         if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.fromTeg) continue;
-        // SmartP's own bytes, not the working copy: `cloudConfig[name].params`
-        // may be the teg version chosen by the data-source setting. Merging the
-        // user's edits onto this raw base keeps every untouched SmartP field
-        // (including ones teg has never heard of) exactly as it was.
-        const raw = state.smartpRaw[name];
-        if (raw === undefined) continue;
-        const before = workBase[name];
-        let targetParams: any;
-        if (before === undefined) {
-          // No working baseline to diff against. Only a SmartP-sourced working
-          // copy can be written wholesale; a teg-sourced one would overwrite
-          // the SmartP row with content that never came from it.
-          if (obj.meta?.source !== 'smartp') continue;
-          targetParams = obj.params;
-        } else {
-          const merged = mergeOntoRaw({ raw, before, after: obj.params });
-          targetParams = merged.value;
-        }
-        const serialized = stringifyParams(targetParams);
-        if (JSON.stringify(raw) === serialized) continue;
+        const raw = diskParams[name];
+        const plan = planSmartpWrite({
+          raw,
+          workBefore: workBase[name],
+          workAfter: obj.params,
+          source: obj.meta?.source,
+        });
+        if (!plan.write) continue;
+        const serialized = stringifyParams(plan.params);
+        if (stringifyParams(raw) === serialized) continue;
         // Keep SmartP's own version column unless the user locked it: the
         // reconciled meta.version may come from teg, and copying it here would
         // silently move SmartP's version forward on every source switch.
         const version = pickSmartpVersion(obj.meta);
         if (dbS) updateCloudConfigParams(dbS, name, serialized, version);
+        writtenRaw[name] = plan.params;
       }
       for (const [module, rows] of dbT ? Object.entries(state.rulesByModule) : []) {
         // When rules table is empty (redmi style), skip.
@@ -818,6 +874,11 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
     // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
     if (outSmartp && smartpBytes && !sameBytes(outSmartp, smartpBytes)) {
       recordStop(await bridge.push('smartp', outSmartp));
+      // The row on disk is now what we just wrote. Keeping the pre-commit copy
+      // would make the next commit in this session merge onto a stale base.
+      for (const [name, params] of Object.entries(writtenRaw)) {
+        state.smartpRaw[name] = JSON.parse(JSON.stringify(params));
+      }
     }
     // only touch teg if we actually have rows to write
     if (

@@ -33,6 +33,49 @@ export function mergeOntoRaw({ raw, before, after }: MergeInput): MergeResult {
   return { value: (applyDelta({ v: raw }, edits) as { v: unknown }).v, changed: true };
 }
 
+export interface PlanSmartpWriteInput {
+  /** The params currently stored in SmartP, read from the bytes we are about
+   *  to write — not from anything cached in memory at pull time. */
+  raw: unknown;
+  /** Working copy at the moment of the last pull (the diff baseline). */
+  workBefore: unknown;
+  /** Working copy now, i.e. with the user's edits applied. */
+  workAfter: unknown;
+  /** meta.source of the working copy: 'smartp' | 'teg' | undefined. */
+  source?: string | null;
+}
+
+export type SmartpWritePlan =
+  | { write: false; reason: 'no-row' | 'teg-sourced' | 'unchanged' }
+  | { write: true; params: unknown; reason: 'merged' | 'wholesale' };
+
+/** Decide what (if anything) to write into SmartP's cloud_config row.
+ *
+ *  Two rules that the old inline code got wrong once the raw copy went stale:
+ *    * the merge base is what is on disk *now*, so a second commit in the same
+ *      session cannot roll back the first one;
+ *    * a working copy that came from teg is never written wholesale, because
+ *      that would replace SmartP's params with content SmartP never had. */
+export function planSmartpWrite({
+  raw,
+  workBefore,
+  workAfter,
+  source,
+}: PlanSmartpWriteInput): SmartpWritePlan {
+  if (raw === undefined) return { write: false, reason: 'no-row' };
+  if (workBefore === undefined) {
+    if (source !== 'smartp') return { write: false, reason: 'teg-sourced' };
+    const same = JSON.stringify(raw) === JSON.stringify(workAfter);
+    return same
+      ? { write: false, reason: 'unchanged' }
+      : { write: true, params: workAfter, reason: 'wholesale' };
+  }
+  const merged = mergeOntoRaw({ raw, before: workBefore, after: workAfter });
+  return merged.changed
+    ? { write: true, params: merged.value, reason: 'merged' }
+    : { write: false, reason: 'unchanged' };
+}
+
 export interface VersionMeta {
   fromTeg?: boolean;
   originalVersion?: unknown;
