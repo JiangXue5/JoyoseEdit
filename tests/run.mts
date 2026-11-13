@@ -111,6 +111,8 @@ import {
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
 import { planRestore, digestDrift } from '../src/history/restore-plan';
+import { previewThermalUnlock } from '../src/parsers/thermal-unlock';
+import { isPlaceholderPkg, preflightCloudConfig } from '../src/db/preflight';
 import { makeResult, commitCode, defaultMessage } from '../src/state/result';
 import { CAPABILITIES, VERIFICATION_LABEL } from '../src/compat/matrix';
 import { VIEW_IDS } from '../src/state/nav';
@@ -1811,6 +1813,58 @@ async function runThermalUnlockTest() {
       throw new Error('known field not lifted');
     }
     return 'unknown kept / known lifted';
+  });
+
+  await check('thermal: 预览列出字段与前后值，且不动原树', () => {
+    const tree: any = {
+      game_booster: {
+        frc_game_params: [{ pkg: 'com.b', raw: 'com.b_45_90_30_60_47_46_43_41' }],
+        future_thermal_field: ['x#45#43#41'],
+      },
+    };
+    const snapshot = JSON.stringify(tree);
+    const rows = previewThermalUnlock(tree);
+    if (JSON.stringify(tree) !== snapshot) throw new Error('preview mutated the tree');
+    if (rows.length !== 1) throw new Error('expected 1 row, got ' + rows.length);
+    if (rows[0].field !== 'raw') throw new Error('wrong field: ' + rows[0].field);
+    if (!rows[0].before.includes('_47_46_43_41')) throw new Error('before is wrong: ' + rows[0].before);
+    if (!rows[0].after.includes('_97_96_93_91')) throw new Error('after is wrong: ' + rows[0].after);
+    return '1 row, tree untouched';
+  });
+
+  await check('thermal: 预览对已处理过的树返回空', () => {
+    const tree: any = { game_booster: { frc_game_params: ['com.b_45_90_30_60_97_96_93_91'] } };
+    const rows = previewThermalUnlock(tree);
+    if (rows.length) throw new Error('preview invented a change');
+    return 'empty';
+  });
+
+  await check('preflight: 占位包名与真实包名的边界', () => {
+    const bad = ['', 'com.example.newgame', 'com.example.game', 'your.package.name', 'your.company.app'];
+    for (const p of bad) {
+      if (!isPlaceholderPkg(p)) throw new Error('missed placeholder: ' + p);
+    }
+    const good = ['com.miHoYo.Yuanshen', 'com.tencent.tmgp.sgame', 'com.miHoYo.cloudgame.GI'];
+    for (const p of good) {
+      if (isPlaceholderPkg(p)) throw new Error('false positive: ' + p);
+    }
+    return `${bad.length} rejected / ${good.length} accepted`;
+  });
+
+  await check('preflight: 重复占位条目只报一次，正常条目通过', () => {
+    const raw = (p: string) => serializeMifisr(blankMifisr(p));
+    const dup = {
+      game_mifisr_config: {
+        params: { game_mifisr_config: [raw('com.example.newgame'), raw('com.example.newgame')] },
+      },
+    };
+    const issues = preflightCloudConfig(dup);
+    if (issues.length !== 1) throw new Error('expected one issue, got ' + issues.length);
+    const clean = {
+      game_mifisr_config: { params: { game_mifisr_config: [raw('com.miHoYo.Yuanshen')] } },
+    };
+    if (preflightCloudConfig(clean).length) throw new Error('clean config flagged');
+    return 'deduped, clean passes';
   });
 
   await check('thermal: scan + apply round trip on a synthetic tree', () => {

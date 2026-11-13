@@ -92,10 +92,12 @@ import {
   scanThermalUnlock,
   applyThermalUnlock,
   knownTempGroups,
+  previewThermalUnlock,
   findTempGroups,
   liftTempGroupsInString,
   type ThermalScan,
 } from '@/parsers/thermal-unlock';
+import { dialog } from '@/state/dialog';
 
 const boosterSource = computed(() => state.cloudConfig.booster_config?.params ?? null);
 const hasBooster = computed(() => sourceUsable('booster_config'));
@@ -124,9 +126,31 @@ function rescan() {
   toast.info('已重新扫描', `命中 ${scan.value.fieldsAffected} 个字段`);
 }
 
-function doApply() {
-  if (!state.cloudConfig.booster_config) return;
-  const result = applyThermalUnlock(state.cloudConfig.booster_config.params);
+async function doApply() {
+  const booster = state.cloudConfig.booster_config;
+  if (!booster) return;
+  // Show where the change lands before touching anything. The panel above
+  // lists distinct values; two fields can share one value, so the confirmation
+  // names the fields too.
+  const rows = previewThermalUnlock(booster.params);
+  if (!rows.length) {
+    toast.info('未发现可抬升的温度组', '当前云控已经很凉快了');
+    return;
+  }
+  const fields = [...new Set(rows.map((r) => r.field))];
+  const clip = (v: string) => (v.length > 60 ? `${v.slice(0, 57)}…` : v);
+  const sample = rows
+    .slice(0, 5)
+    .map((r) => `${r.field}\n  ${clip(r.before)} → ${clip(r.after)}`)
+    .join('\n');
+  const ok = await dialog.confirm(`将改动 ${fields.length} 个字段、${rows.length} 处字符串`, {
+    detail: `${sample}${rows.length > 5 ? `\n… 另有 ${rows.length - 5} 处` : ''}\n\n`
+      + '只改已确认的温控字段，未知字段不动。确认后只是改了工作区，仍需点顶栏「提交到设备」才会写入数据库。',
+    okText: '抬升',
+  });
+  if (!ok) return;
+
+  const result = applyThermalUnlock(booster.params);
   markDirty();
   if (!result.changed) {
     toast.info('未发现可抬升的温度组', '当前云控已经很凉快了');

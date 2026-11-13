@@ -103,6 +103,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
 import { state, initialize, pullAll, pushAll } from '@/state/session';
+import { preflightCloudConfig } from '@/db/preflight';
 import { isCloudLocked } from '@/db/merge';
 import { scanFpsLock } from '@/parsers/fpslock';
 import { toast } from '@/state/toast';
@@ -331,6 +332,18 @@ async function retryConnect() {
 }
 
 async function handlePush() {
+  // Stop before the note prompt: no point collecting a message for a commit
+  // that would land rows Joyose cannot match to any game.
+  const issues = preflightCloudConfig(state.cloudConfig);
+  if (issues.length) {
+    const lines = issues.slice(0, 5).map((i) => `· ${i.where}：${i.message}`);
+    if (issues.length > 5) lines.push(`… 另有 ${issues.length - 5} 条`);
+    await dialog.alert(
+      `有 ${issues.length} 处配置还是占位内容`,
+      `${lines.join('\n')}\n\n请先到对应页面改成真实包名，再提交。`,
+    );
+    return;
+  }
   const note = await dialog.prompt('提交修改到设备', {
     detail: '给本次修改加一段备注（可留空），会写进历史记录。',
     placeholder: '例如：开启 17 PM MIFISR 原神插帧',

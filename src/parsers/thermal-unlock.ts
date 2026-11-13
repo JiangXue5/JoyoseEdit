@@ -324,8 +324,7 @@ export function applyThermalUnlock(params: unknown): ThermalUnlockResult {
 }
 /** Distinct temperature groups that `applyThermalUnlock()` would actually lift,
  *  with the value each becomes. Unknown fields are excluded on purpose, so the
- *  preview cannot show a rewrite that will not happen. */
-export function knownTempGroups(params: unknown): { raw: string; lifted: string }[] {
+ *  preview cannot show a rewrite that will not happen. */export function knownTempGroups(params: unknown): { raw: string; lifted: string }[] {
   const seen = new Map<string, string>();
   const walk = (node: unknown, pathArr: string[]): void => {
     if (Array.isArray(node)) {
@@ -345,4 +344,66 @@ export function knownTempGroups(params: unknown): { raw: string; lifted: string 
   };
   walk(params, []);
   return [...seen.entries()].map(([raw, lifted]) => ({ raw, lifted }));
+}
+
+export interface ThermalChange {
+  /** Last property name of the carrier, e.g. `fps_threshold`. */
+  field: string;
+  /** Full path from the booster params root, for disambiguation. */
+  path: string;
+  before: string;
+  after: string;
+}
+
+/** Every string the lift would rewrite, with the field that owns it.
+ *
+ *  `knownTempGroups()` answers "what values change"; this answers "where".
+ *  The confirmation dialog needs the second one: two different fields can
+ *  carry the same `45#43#41`, and a user who sees only the values cannot tell
+ *  whether the change lands in the game they meant.
+ *
+ *  Pure: works on a deep copy, never touches the caller's tree. */
+export function previewThermalUnlock(params: unknown): ThermalChange[] {
+  if (!params || typeof params !== 'object') return [];
+  const clone = JSON.parse(JSON.stringify(params)) as unknown;
+  const result = applyThermalUnlock(clone);
+  if (!result.changed) return [];
+
+  const before: { path: string; value: string }[] = [];
+  const after: { path: string; value: string }[] = [];
+  flattenStrings(params, [], before);
+  flattenStrings(clone, [], after);
+
+  const rows: ThermalChange[] = [];
+  const n = Math.min(before.length, after.length);
+  for (let i = 0; i < n; i++) {
+    if (before[i].path !== after[i].path) break; // shapes diverged: stop, do not guess
+    if (before[i].value === after[i].value) continue;
+    const segs = before[i].path.split('.').filter((s) => !/^\[\d+\]$/.test(s));
+    rows.push({
+      field: segs[segs.length - 1] ?? '',
+      path: before[i].path,
+      before: before[i].value,
+      after: after[i].value,
+    });
+  }
+  return rows;
+}
+
+function flattenStrings(
+  node: unknown,
+  pathArr: string[],
+  out: { path: string; value: string }[],
+): void {
+  if (Array.isArray(node)) {
+    node.forEach((el, i) => flattenStrings(el, [...pathArr, `[${i}]`], out));
+    return;
+  }
+  if (node && typeof node === 'object') {
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      flattenStrings(v, [...pathArr, k], out);
+    }
+    return;
+  }
+  if (typeof node === 'string') out.push({ path: pathArr.join('.'), value: node });
 }
