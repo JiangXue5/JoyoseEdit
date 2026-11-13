@@ -85,18 +85,6 @@ export interface SessionState {
    *  source-selection / teg-fallback reconciliation. The JSON editor's
    *  SmartP_* targets read and write this: the target really is SmartP. */
   smartpRaw: Record<string, any>;
-  /** Raw deep copy of teg_config's rule envelopes, grouped by module. Edited
-   *  rows live in `rulesByModule`; this copy never changes while the page is
-   *  open, so "what teg actually had" stays answerable after an edit. */
-  tegRaw: Record<string, any[]>;
-  /** Per-source baselines captured at pull time. `history` is the working copy
-   *  the history delta is computed against; `smartp` / `teg` are the two source
-   *  copies, kept apart so a write target can be diffed against its own DB. */
-  baselines: {
-    smartp: Record<string, unknown>;
-    teg: Record<string, unknown>;
-    history: ReturnType<typeof snapshotFromMaps> | null;
-  };
   /** Parsed rule_content JSON arrays grouped by rule_module. */
   rulesByModule: Record<string, any[]>;
   /** Rows whose JSON could not be parsed. A broken row keeps its metadata and
@@ -109,7 +97,13 @@ export interface SessionState {
    * panel the UI surfaces. `null` until a pull completes or when no backend
    * is detectable (e.g. unrelated ROM). */
   activeBackend: ActiveBackend;
-  /** Snapshot of the state captured on pull — used as `before` for history records. */
+  /** The on-disk base: the working copy as it was at the last successful
+   *  pull/commit. This is the single `before` for history records and for the
+   *  merge in pushCore. (The other copies have narrower jobs: `cloudConfig` /
+   *  `rulesByModule` are the *working* copy the UI edits, `smartpRaw` is
+   *  SmartP's own bytes for the JSON editor's SmartP_* targets.) It is not
+   *  called "pristine" in the sense of "untouched by the user" — the name is
+   *  kept for compatibility. */
   pristineSnapshot: ReturnType<typeof snapshotFromMaps> | null;
   dirty: boolean;
   /** Outcome of the last write: whether Joyose was confirmed stopped, and
@@ -131,8 +125,6 @@ export const state = reactive<SessionState>({
   baselineTeg: null,
   cloudConfig: {},
   smartpRaw: {},
-  tegRaw: {},
-  baselines: { smartp: {}, teg: {}, history: null },
   rulesByModule: {},
   parseIssues: [],
   paths: [],
@@ -231,14 +223,6 @@ export async function pullAll(): Promise<PullResult> {
       cloudConfig: state.cloudConfig,
       rulesByModule: state.rulesByModule,
     });
-    // Freeze the two source copies separately from the working copy. Written
-    // here (not inside readIntoState) so a rebase mid-commit does not reset
-    // them: a rebase deliberately keeps the user's working copy.
-    state.baselines = {
-      smartp: JSON.parse(JSON.stringify(state.smartpRaw)),
-      teg: tegParamsByModule(),
-      history: state.pristineSnapshot,
-    };
     state.dirty = false;
     state.applyStatus = null;
     state.rebasedAt = null;
@@ -251,25 +235,6 @@ export async function pullAll(): Promise<PullResult> {
   } finally {
     state.loading = false;
   }
-}
-
-/** The params of teg's newest envelope, per module, as read at pull time. */
-function tegParamsByModule(): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [mod, rows] of Object.entries(state.tegRaw)) {
-    let best: any = null;
-    let bestV = -1;
-    for (const r of rows) {
-      const v = Number(r?.content?.version ?? r?.meta?.rule_version ?? 0);
-      if (v >= bestV) {
-        bestV = v;
-        best = r;
-      }
-    }
-    const p = best?.content?.params;
-    if (p !== undefined) out[mod] = JSON.parse(JSON.stringify(p));
-  }
-  return out;
 }
 
 function readIntoState(dbS: Database | null, dbT: Database | null) {
@@ -294,12 +259,10 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
   state.smartpRaw = smartpRaw;
 
   const byModule: Record<string, any[]> = {};
-  const tegRaw: Record<string, any[]> = {};
   if (dbT) {
     for (const row of listRules(dbT)) {
       const mod = row.rule_module ?? 'unknown';
       if (!byModule[mod]) byModule[mod] = [];
-      if (!tegRaw[mod]) tegRaw[mod] = [];
       try {
         const content = parseParams(row.rule_content);
         const envParams =
@@ -310,10 +273,6 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
           meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
           content,
         });
-        tegRaw[mod].push({
-          meta: { ...row, _real: true, empty: isEmptyCloudParams(envParams) },
-          content: JSON.parse(JSON.stringify(content)),
-        });
       } catch (err: any) {
         // keep the raw row even if JSON is malformed, and report it: a rule
         // row that silently vanished looked like "this module has no config".
@@ -323,15 +282,10 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
           meta: { ...row, _real: true, empty: false, broken: true, parseError: message },
           content: row.rule_content,
         });
-        tegRaw[mod].push({
-          meta: { ...row, _real: true, empty: false, broken: true, parseError: message },
-          content: row.rule_content,
-        });
       }
     }
   }
   state.rulesByModule = byModule;
-  state.tegRaw = tegRaw;
   state.parseIssues = issues;
 
   // ---- fallback: SmartP has no row (or an empty one) but teg does ----
@@ -799,6 +753,12 @@ export interface CommitResult {
   reason: 'written' | 'no-change' | 'out-of-scope';
   wroteSmartp: boolean;
   wroteTeg: boolean;
+  /** The DB write succeeded but the history record could not be saved. The
+   *  device has already changed — reporting the whole commit as failed would
+   *  be wrong. */
+  historyError?: string;
+  /** The DB write succeeded but the restart call failed. */
+  restartError?: string;
 }
 
 /** Commit the in-memory edits: build history record, write both DBs, save
@@ -989,7 +949,10 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
     // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
     if (wroteSmartp) {
-      recordStop(await bridge.push('smartp', outSmartp!));
+      const currentSha = await bridge.sha256Hex(smartpBytes!);
+      recordStop(
+        await bridge.push('smartp', outSmartp!, { expectCurrent: currentSha }),
+      );
       // The row on disk is now what we just wrote. Keeping the pre-commit copy
       // would make the next commit in this session merge onto a stale base.
       for (const [name, params] of Object.entries(writtenRaw)) {
@@ -998,31 +961,47 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     }
     // only touch teg if we actually have rows to write
     if (wroteTeg) {
-      recordStop(await bridge.push('teg', outTeg!));
+      const currentSha = await bridge.sha256Hex(tegBytes!);
+      recordStop(await bridge.push('teg', outTeg!, { expectCurrent: currentSha }));
     }
 
     // write history after successful DB push. v2 records store only the
     // forward delta (parent -> this); reconstruction walks the chain from
     // pristineSnapshot. Keeps each file in the KB range.
-    const existing = await bridge.historyList();
-    const seq = nextSeq(existing);
-    const ts = Math.floor(Date.now() / 1000);
-    const rec = buildRecord({
-      seq,
-      timestamp: ts,
-      source: opts.source ?? 'webui',
-      note: opts.note ?? '',
-      delta,
-    });
-    const fname = buildHistoryFilename(ts, seq);
-    await bridge.historySave(fname, JSON.stringify(rec));
-    // Keep the timeline short: one delta record per commit adds up on a phone
-    // with a 1 MB cloud config, and ten entries is plenty to walk back.
-    await bridge.historyClear(HISTORY_KEEP).catch(() => null);
+    //
+    // A failure here must not turn a completed device write into "提交失败":
+    // the DB is already changed at this point, and telling the user otherwise
+    // invites them to retry a write that has landed.
+    let fname: string | null = null;
+    let historyError: string | undefined;
+    try {
+      const existing = await bridge.historyList();
+      const seq = nextSeq(existing);
+      const ts = Math.floor(Date.now() / 1000);
+      const rec = buildRecord({
+        seq,
+        timestamp: ts,
+        source: opts.source ?? 'webui',
+        note: opts.note ?? '',
+        delta,
+      });
+      fname = buildHistoryFilename(ts, seq);
+      await bridge.historySave(fname, JSON.stringify(rec));
+      // Keep the timeline short: one delta record per commit adds up on a phone
+      // with a 1 MB cloud config, and ten entries is plenty to walk back.
+      await bridge.historyClear(HISTORY_KEEP).catch(() => null);
+    } catch (err: any) {
+      historyError = err?.message ?? String(err);
+      fname = null;
+    }
 
     // Restart Joyose so it re-reads the DB. Report the result instead of
     // swallowing it: a silent failure here looks like "the edit did nothing".
-    const restarted = await bridge.restart().catch(() => null);
+    let restartError: string | undefined;
+    const restarted = await bridge.restart().catch((err) => {
+      restartError = err?.message ?? String(err);
+      return null;
+    });
     if (restarted) recordStop(restarted);
     state.applyStatus = {
       stopped: stops.length > 0 ? stops.every(Boolean) : null,
@@ -1034,7 +1013,15 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     state.dirty = false;
     await refreshStat();
     await refreshBaseline();
-    return { file: fname, changed: true, reason: 'written', wroteSmartp, wroteTeg };
+    return {
+      file: fname,
+      changed: true,
+      reason: 'written',
+      wroteSmartp,
+      wroteTeg,
+      historyError,
+      restartError,
+    };
   } catch (err) {
     // ConflictError bubbles to pushAll, which rebases and retries; anything
     // else is a genuine failure and must reach the user.
@@ -1097,15 +1084,57 @@ async function rebaseOntoLatest(): Promise<void> {
  *  command that is already running on the device. */
 let writeBusy = false;
 
+const TIMEOUT_RE = /超时|timeout/i;
+
+/** After a front-end timeout the shell command is still running: `Promise.race`
+ *  only rejects our side. Poll the device lock before letting the user start
+ *  another write, otherwise the retry queues behind — or interleaves with — the
+ *  command that "timed out". Returns false when the device is still busy. */
+async function waitForDeviceIdle(maxMs = 30000): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    try {
+      const st = await bridge.lockStatus();
+      if (!st.locked) return true;
+    } catch {
+      // Helper too old for lock-status: nothing to wait on.
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  return false;
+}
+
 async function withWriteLock<T>(label: string, fn: () => Promise<T>): Promise<T> {
   if (writeBusy) {
     throw new Error(`上一个写入操作尚未结束，暂时不能${label}，请稍后再试`);
   }
   writeBusy = true;
+  let timedOut = false;
   try {
     return await fn();
+  } catch (err) {
+    timedOut = TIMEOUT_RE.test(String((err as Error)?.message ?? ''));
+    throw err;
   } finally {
-    writeBusy = false;
+    if (!timedOut) {
+      writeBusy = false;
+    } else {
+      // Do NOT await here: the user must see "timed out" now, not in 30 s.
+      // The lock stays held in the background until the device reports idle,
+      // so a retry is refused locally instead of stacking on top of the
+      // command that never answered us.
+      void waitForDeviceIdle()
+        .then((idle) => {
+          if (!idle) {
+            state.lastError =
+              '设备侧的写入在超时后仍未结束。已保持互斥锁，请等它完成或重启手机后再操作。';
+          }
+        })
+        .finally(() => {
+          writeBusy = false;
+        });
+    }
   }
 }
 

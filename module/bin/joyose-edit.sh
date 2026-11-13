@@ -57,10 +57,13 @@ die() { printf '{"ok":false,"error":%s}\n' "$(printf '%s' "$1" | _json_string)" 
 
 # ---- helpers --------------------------------------------------------------
 _json_string() {
-  # stdin -> JSON string literal (quote + escape)
+  # stdin -> JSON string literal (quote + escape). Joins lines with \n but does
+  # not append one: a single-line message used to come back as "text\n",
+  # which the WebUI then showed or compared with a stray newline attached.
   awk 'BEGIN{printf "\""} {
+    if (NR > 1) printf "\\n";
     gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t");
-    gsub(/\r/,"\\r"); printf "%s\\n", $0
+    gsub(/\r/,"\\r"); printf "%s", $0
   } END{printf "\""}'
 }
 
@@ -265,8 +268,8 @@ _verify_db() {
 # a rollback copy across the swap, and restore it if the post-write check
 # fails. Nothing here may delete the only good copy.
 _install_db() {
-  local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}"
-  local uid gid stopped chk size sha rollback
+  local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
+  local uid gid stopped chk size sha rollback cur
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
 
@@ -277,11 +280,25 @@ _install_db() {
       die "staged database size mismatch ($size != $expect_size)"
     fi
   fi
-  if [ -n "$expect_sha" ]; then
+  # "none" == the WebView has no crypto.subtle, so the caller could not
+  # compute a digest. The size check above is then the only guard.
+  if [ -n "$expect_sha" ] && [ "$expect_sha" != "none" ]; then
     sha=$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)
     if [ "$sha" != "$expect_sha" ]; then
       rm -f "$tmp"
       die "staged database checksum mismatch"
+    fi
+  fi
+
+  # TOCTOU guard: the caller read this file, built a new one, and is now
+  # asking us to swap it in. If the live file changed in between (Joyose pulled
+  # a fresh cloud config), the new bytes were computed on a stale base and
+  # applying them would silently roll that update back.
+  if [ -n "$expect_current" ] && [ "$expect_current" != "none" ]; then
+    cur=$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)
+    if [ "$cur" != "$expect_current" ]; then
+      rm -f "$tmp"
+      die "database changed after it was read ($(printf '%s' "$cur" | cut -c1-12) != $(printf '%s' "$expect_current" | cut -c1-12)); refusing to overwrite"
     fi
   fi
 
@@ -722,7 +739,7 @@ cmd_stage_append() {
 }
 
 cmd_push_from_stage() {
-  local sel="$1" stage="$2" expect_size="${3:-}" expect_sha="${4:-}"
+  local sel="$1" stage="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
   local target tmp stage_file
   safe_name "$stage" || die "invalid stage name"
   target=$(resolve_db "$sel")
@@ -734,7 +751,7 @@ cmd_push_from_stage() {
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
   # _install_db keeps its own guarantees (pre-check, rollback copy, post-check).
   # It exits on failure, so the stage file survives for a retry.
-  _install_db "$target" "$tmp" "$expect_size" "$expect_sha"
+  _install_db "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
   rm -f "$stage_file"
 }
 
@@ -841,6 +858,21 @@ cmd_prefs_write() {
   printf 'ok'
 }
 
+cmd_lock_status() {
+  local pid='' ts='' kind='' now age
+  if _lock_owner_alive; then
+    read -r pid ts kind < "$LOCK_DIR/owner" 2>/dev/null || true
+    now=$(date +%s)
+    age=$((now - ${ts:-$now}))
+    printf '{"locked":true,"pid":%s,"ageSeconds":%s,"op":%s}\n' \
+      "${pid:-0}" "$age" "$(printf '%s' "${kind:-}" | _json_string)"
+  elif [ -d "$LOCK_DIR" ]; then
+    printf '{"locked":false,"stale":true}\n'
+  else
+    printf '{"locked":false}\n'
+  fi
+}
+
 # ---- dispatch -------------------------------------------------------------
 cmd="${1:-}"
 [ -n "$cmd" ] || die "missing subcommand"
@@ -879,7 +911,8 @@ case "$cmd" in
   teg-unfreeze)   cmd_teg_unfreeze ;;
   stage-clear)    cmd_stage_clear "${1:?}" ;;
   stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
-  push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" ;;
+  push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
+  lock-status)             cmd_lock_status ;;
   history-save-from-stage) cmd_history_save_from_stage "${1:?}" "${2:?}" ;;
   *) die "unknown subcommand: $cmd" ;;
 esac

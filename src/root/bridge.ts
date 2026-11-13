@@ -64,8 +64,12 @@ async function runKsu(cmd: string): Promise<string> {
       ),
     ]);
   } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    // A timeout is our own guard, not a bridge crash. Wrapping it produced
+    // "ksu.exec threw: ksu.exec 超时（30000ms）" — the same thing twice, in the
+    // one message the user is most likely to read.
     throw new RootBridgeError(
-      `ksu.exec threw: ${(err as Error)?.message ?? String(err)}`,
+      msg.startsWith('ksu.exec 超时') ? msg : `ksu.exec threw: ${msg}`,
       -1,
       '',
     );
@@ -199,7 +203,7 @@ export interface WriteResult {
 /** SHA-256 as lowercase hex, or null when the WebView has no crypto.subtle
  *  (KernelSU's WebUI is not always a secure context). The size check below is
  *  the mandatory guard; the digest is an extra one when it is available. */
-async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
+export async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
   try {
     const buf = await crypto.subtle.digest('SHA-256', bytes.slice().buffer);
     return Array.from(new Uint8Array(buf))
@@ -210,7 +214,11 @@ async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
   }
 }
 
-export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteResult> {
+export async function push(
+  which: DbSelector,
+  bytes: Uint8Array,
+  opts: { expectCurrent?: string | null } = {},
+): Promise<WriteResult> {
   assertSelector(which);
   const b64 = bytesToBase64(bytes);
   const stage = `push-${which}-${Date.now().toString(36)}`;
@@ -218,9 +226,28 @@ export async function push(which: DbSelector, bytes: Uint8Array): Promise<WriteR
   const sha = await sha256Hex(bytes);
   // The helper verifies the decoded length (and digest when provided) before
   // it touches the live database, so a truncated upload can never be swapped in.
-  const args = [`push-from-stage`, which, stage, String(bytes.length)];
-  if (sha) args.push(sha);
+  const args = [`push-from-stage`, which, stage, String(bytes.length), sha ?? 'none'];
+  // Digest of the file as we read it. The helper re-hashes the live file right
+  // before the swap and refuses if it moved — closes the window between our
+  // conflict check and the actual write.
+  if (opts.expectCurrent) args.push(opts.expectCurrent);
   return JSON.parse(await runKsu(`sh ${HELPER} ${args.join(' ')}`));
+}
+
+export interface LockStatus {
+  locked: boolean;
+  /** A lock directory exists but its owner is gone (or older than the TTL). */
+  stale?: boolean;
+  pid?: number;
+  ageSeconds?: number;
+  op?: string;
+}
+
+/** Whether a write is currently running on the device. Used after a front-end
+ *  timeout: the Promise may have been rejected while the shell command is
+ *  still going, and letting the user retry into that would interleave writes. */
+export async function lockStatus(): Promise<LockStatus> {
+  return JSON.parse(await runKsu(`sh ${HELPER} lock-status`));
 }
 
 export interface BackupResult {

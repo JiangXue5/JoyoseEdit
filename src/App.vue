@@ -383,6 +383,20 @@ async function handlePush() {
       );
       return;
     }
+    if (res.historyError) {
+      toast.warn(
+        '已写入设备，但历史记录没有保存',
+        `${res.historyError} · 配置已经生效，只是这次提交不在历史里`,
+      );
+      return;
+    }
+    if (res.restartError) {
+      toast.warn(
+        '已写入设备，但 Joyose 重启失败',
+        `${res.restartError} · 请手动重启 Joyose 或手机后再进游戏`,
+      );
+      return;
+    }
     const name = res.file ?? '';
     const rebased = state.rebasedAt !== null;
     const applied = state.applyStatus;
