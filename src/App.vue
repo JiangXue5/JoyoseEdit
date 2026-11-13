@@ -103,6 +103,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
 import { state, initialize, pullAll, pushAll } from '@/state/session';
+import { isVersionLocked } from '@/db/merge';
 import { scanFpsLock } from '@/parsers/fpslock';
 import { toast } from '@/state/toast';
 import OverviewView from '@/ui/OverviewView.vue';
@@ -320,10 +321,7 @@ onMounted(async () => {
 });
 
 const pathsActive = computed(() => state.paths.filter((p) => p.active).length);
-const isLocked = computed(() => {
-  const v = state.cloudConfig.booster_config?.meta.version;
-  return typeof v === 'number' && String(v).startsWith('2099');
-});
+const isLocked = computed(() => isVersionLocked(state.cloudConfig.booster_config?.meta.version));
 
 const fpsLockBadge = computed(() => {
   const booster = state.cloudConfig.booster_config?.params;

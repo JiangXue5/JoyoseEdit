@@ -106,8 +106,15 @@ import {
   parseHistoryFilename,
   nextSeq,
 } from '../src/history/store';
-import { diff, summarizeRecord, applyDelta, invertDelta } from '../src/history/diff';
-import { commitOutcome, mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '../src/db/merge';
+import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
+import {
+  applyLockedOriginals,
+  commitOutcome,
+  isVersionLocked,
+  mergeOntoRaw,
+  pickSmartpVersion,
+  planSmartpWrite,
+} from '../src/db/merge';
 import { parseCloudConfigRows } from '../src/db/parse-rows';
 import {
   IMPORT_SCHEMA,
@@ -817,6 +824,74 @@ async function runDiffTest() {
     if (JSON.stringify(twice) !== JSON.stringify(d)) throw new Error('double-invert drift');
   });
 
+  await check('diff: insertion by stable id does not renumber siblings', () => {
+    const before = { groups: [{ pkg: 'a', v: 1 }, { pkg: 'b', v: 2 }] };
+    const after = { groups: [{ pkg: 'new', v: 0 }, { pkg: 'a', v: 1 }, { pkg: 'b', v: 2 }] };
+    const d = diff(before, after);
+    const added = d.filter((r) => r.kind === 'added');
+    const changed = d.filter((r) => r.kind === 'changed');
+    if (added.length !== 1) throw new Error('added records: ' + JSON.stringify(d));
+    if (changed.length !== 0) throw new Error('insertion renumbered siblings: ' + JSON.stringify(d));
+    const got = applyDelta(before, d);
+    if (JSON.stringify(got) !== JSON.stringify(after)) throw new Error('apply mismatch');
+    return '1 added / 0 spurious';
+  });
+
+  await check('diff: removal by stable id leaves the neighbours alone', () => {
+    const before = { groups: [{ pkg: 'a', v: 1 }, { pkg: 'b', v: 2 }, { pkg: 'c', v: 3 }] };
+    const after = { groups: [{ pkg: 'a', v: 1 }, { pkg: 'c', v: 3 }] };
+    const d = diff(before, after);
+    if (d.length !== 1 || d[0].kind !== 'removed') throw new Error('records: ' + JSON.stringify(d));
+    const got = applyDelta(before, d);
+    if (JSON.stringify(got) !== JSON.stringify(after)) throw new Error('apply mismatch');
+    return '1 removed';
+  });
+
+  await check('diff: arrays without identity are replaced wholesale', () => {
+    const before = { list: ['a', 'b'] };
+    const after = { list: ['x', 'a', 'b'] };
+    const d = diff(before, after);
+    if (d.length !== 1 || d[0].kind !== 'changed') {
+      throw new Error('expected one whole-array record, got ' + JSON.stringify(d));
+    }
+    if (JSON.stringify(applyDelta(before, d)) !== JSON.stringify(after)) {
+      throw new Error('apply mismatch');
+    }
+    return 'whole array';
+  });
+
+  await check('diff: keys containing dots stay unambiguous', () => {
+    const before: any = { 'a.b': 1, a: { b: 2 } };
+    const after: any = { 'a.b': 9, a: { b: 2 } };
+    const d = diff(before, after);
+    if (d.length !== 1) throw new Error('records: ' + JSON.stringify(d));
+    if (JSON.stringify(d[0].path) !== JSON.stringify(['a.b'])) {
+      throw new Error('path wrong: ' + JSON.stringify(d[0].path));
+    }
+    const got: any = applyDelta(before, d);
+    if (got['a.b'] !== 9) throw new Error('literal key not updated');
+    if (got.a.b !== 2) throw new Error('nested key was hit instead');
+    return 'literal dot key';
+  });
+
+  await check('apply: a missing keyed element is reported, not skipped', () => {
+    const before = { groups: [{ pkg: 'a', v: 1 }] };
+    const after = { groups: [{ pkg: 'a', v: 2 }] };
+    const d = diff(before, after);
+    const rep = applyDeltaReport({ groups: [{ pkg: 'zzz', v: 1 }] }, d);
+    if (!rep.missing.length) throw new Error('missing path not reported');
+    const good = applyDeltaReport(before, d);
+    if (good.missing.length) throw new Error('healthy replay reported missing: ' + JSON.stringify(good.missing));
+    return 'reported';
+  });
+
+  await check('apply: legacy string paths still replay', () => {
+    const legacy: any = [{ path: 'groups[0].v', kind: 'changed', before: 1, after: 5 }];
+    const got: any = applyDelta({ groups: [{ pkg: 'a', v: 1 }] }, legacy);
+    if (got.groups[0].v !== 5) throw new Error('legacy path failed');
+    return 'legacy ok';
+  });
+
   await check('diff: chain round-trip across 3 commits (walk back)', () => {
     // Simulates the restore path: working-tree (sN) + reverse-applying N forward
     // deltas must land on the original base state.
@@ -885,6 +960,27 @@ async function runDiffTest() {
     if (configs.thermal_config.meta.broken) throw new Error('empty row marked broken');
     if (!configs.thermal_config.meta.empty) throw new Error('empty row not flagged empty');
     return '3 rows / 1 broken / 1 empty';
+  });
+
+  await check('lock: persisted originals are re-attached, stale ones reported', () => {
+    const configs: any = {
+      booster_config: { meta: { version: 2099220930 } },
+      common_config: { meta: { version: 2024010101 } },
+    };
+    const { applied, stale } = applyLockedOriginals(configs, {
+      booster_config: 2025090830,
+      common_config: 2024010101,
+      missing_config: 1,
+    });
+    if (applied.join(',') !== 'booster_config') throw new Error('applied: ' + applied.join(','));
+    if (stale.join(',') !== 'common_config') throw new Error('stale: ' + stale.join(','));
+    if (configs.booster_config.meta.originalVersion !== 2025090830) {
+      throw new Error('original version not restored');
+    }
+    if (!isVersionLocked(2099220930) || isVersionLocked(2025090830)) {
+      throw new Error('lock detection wrong');
+    }
+    return '1 applied / 1 stale / 1 missing ignored';
   });
 
   await check('commit: no-op means no history and no restart', () => {

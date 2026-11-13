@@ -116,3 +116,34 @@ export function commitOutcome(
   if (!wroteSmartp && !wroteTeg) return 'out-of-scope';
   return 'written';
 }
+
+/** A version the module itself locked (leading `2099`). Used by the UI badges,
+ *  the unlock path and the persisted pre-lock value. */
+export function isVersionLocked(v: unknown): boolean {
+  return typeof v === 'number' && String(v).startsWith('2099');
+}
+
+/** Re-attach persisted pre-lock versions after a pull.
+ *
+ *  The database only carries the `2099*` value, so the working copy has no way
+ *  to know what the version was before locking. `locked` comes from the
+ *  settings file. A config whose version is no longer locked is reported as
+ *  stale so the caller can drop the record instead of resurrecting it later. */
+export function applyLockedOriginals(
+  configs: Record<string, any>,
+  locked: Record<string, number>,
+): { applied: string[]; stale: string[] } {
+  const applied: string[] = [];
+  const stale: string[] = [];
+  for (const [name, original] of Object.entries(locked)) {
+    const cfg = configs[name];
+    if (!cfg) continue;
+    if (isVersionLocked(cfg.meta?.version)) {
+      cfg.meta.originalVersion = original;
+      applied.push(name);
+    } else {
+      stale.push(name);
+    }
+  }
+  return { applied, stale };
+}

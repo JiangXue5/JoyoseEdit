@@ -8,6 +8,11 @@
       <button class="danger" @click="handleClear" :disabled="loading">清理旧历史</button>
     </PageHeader>
 
+    <div v-if="floor > 0" class="banner warn">
+      <strong>早于 seq {{ floor }} 的记录已失效</strong>
+      <span>最近一次「从此备份回滚」直接替换了数据库，之前的增量记录对应的是另一份基准，不能再按增量回放。它们仍可查看；需要回到更早的状态请用备份回滚。</span>
+    </div>
+
     <div class="twopane">
       <div class="list">
         <button v-for="item in listing" :key="item.name" class="item" :class="{ active: selected?.name === item.name }"
@@ -27,9 +32,11 @@
           <span class="pill">{{ record.source }}</span>
           <span class="pill">{{ formatTime(record.timestamp) }}</span>
           <button v-if="record.source !== 'backup'" class="primary" @click="restore"
-            style="margin-left: auto" :disabled="detailLoading"
-            title="把内存状态回溯到此次提交完成后的状态；还需点顶栏「提交到设备」才真正生效。想看此提交之前的状态，请选前一条记录恢复">
-            恢复到此提交
+            style="margin-left: auto" :disabled="detailLoading || restoreDisabled"
+            :title="restoreDisabled
+              ? '这条记录早于最近一次文件级回滚，基准已失效，不能再按增量回放'
+              : '把内存状态回溯到此次提交完成后的状态；还需点顶栏「提交到设备」才真正生效。想看此提交之前的状态，请选前一条记录恢复'">
+            {{ restoreDisabled ? '基准已失效' : '恢复到此提交' }}
           </button>
           <button v-else class="danger" @click="revertFromBackup" style="margin-left: auto"
             title="直接把此时间点的 DB 字节拷贝回 Joyose（文件级恢复，立即生效）">
@@ -73,6 +80,7 @@ import AppIcon from './AppIcon.vue';
 import { dialog } from '@/state/dialog';
 import type { HistoryFileMeta, HistoryRecord } from '@/history/store';
 import { summarizeRecord } from '@/history/diff';
+import { getHistoryFloor } from '@/state/source';
 
 const listing = ref<HistoryFileMeta[]>([]);
 const selected = ref<HistoryFileMeta | null>(null);
@@ -81,6 +89,11 @@ const loading = ref(false);
 const detailLoading = ref(false);
 
 const diffEntries = computed(() => record.value?.delta ?? []);
+/** Newest seq that predates a file-level revert; 0 when none happened. */
+const floor = ref(0);
+const restoreDisabled = computed(
+  () => floor.value > 0 && record.value !== null && record.value.seq <= floor.value,
+);
 
 // Views live inside <KeepAlive>, so refresh whenever the tab is re-entered —
 // a commit in another tab adds files that this list must pick up.
@@ -90,6 +103,7 @@ async function refresh() {
   loading.value = true;
   try {
     listing.value = await listHistory();
+    floor.value = getHistoryFloor();
     selected.value = null;
     record.value = null;
   } catch (err) {

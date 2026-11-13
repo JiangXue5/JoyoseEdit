@@ -81,7 +81,7 @@
             </td>
             <td data-label="云控版本">
               <span v-if="row.cfg.meta?.empty" class="muted">—</span>
-              <span v-else class="pill" :class="isLocked(row.cfg.meta.version) ? 'warn' : ''">
+              <span v-else class="pill" :class="isVersionLocked(row.cfg.meta.version) ? 'warn' : ''">
                 {{ row.cfg.meta.version ?? '—' }}
               </span>
             </td>
@@ -101,7 +101,7 @@
               <template v-if="row.cfg.meta?.empty">
                 <span class="muted">—</span>
               </template>
-              <button v-else-if="!isLocked(row.cfg.meta.version)" class="primary sm" @click="lock(row.name)"
+              <button v-else-if="!isVersionLocked(row.cfg.meta.version)" class="primary sm" @click="lock(row.name)"
                 :disabled="state.loading">锁定</button>
               <button v-else class="ghost sm" @click="unlock(row.name)" :disabled="state.loading">还原</button>
             </td>
@@ -124,6 +124,7 @@
 <script setup lang="ts">
 import { computed, onActivated, reactive, ref } from 'vue';
 import { state, lockCloudVersion, unlockCloudVersion, markDirty, freezeTeg, unfreezeTeg } from '@/state/session';
+import { isVersionLocked } from '@/db/merge';
 import { toast } from '@/state/toast';
 import * as bridge from '@/root/bridge';
 import PageHeader from './PageHeader.vue';
@@ -133,9 +134,6 @@ import { orderedCloudConfig } from './cloudOrder';
 /** 和概览页同一个次序：booster_config 在上、common_config 在下。 */
 const cfgRows = computed(() => orderedCloudConfig(state.cloudConfig));
 
-function isLocked(v: unknown): boolean {
-  return typeof v === 'number' && String(v).startsWith('2099');
-}
 
 interface RuleVersionItem {
   v: string;

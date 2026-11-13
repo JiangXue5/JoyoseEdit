@@ -28,8 +28,24 @@ const COMMON_KEY = 'joyose-edit.commonSource';
 const WRITE_KEY = 'joyose-edit.writeTarget';
 const DATA_SOURCE_KEY = 'joyose-edit.dataSource';
 const INSTALL_TS_KEY = 'joyose-edit.installTs';
+/** Highest history seq that must not be replayed: a file-level revert replaced
+ *  the databases underneath the old delta chain. Persisted so the guard still
+ *  holds after the WebUI is reopened. */
+const HISTORY_FLOOR_KEY = 'joyose-edit.historyFloor';
+/** Pre-lock version per config. Without this, a refresh rebuilt the working
+ *  copy from the DB and "unlock" could only see the 2099 value it was trying to
+ *  undo. */
+const LOCKED_VERSIONS_KEY = 'joyose-edit.lockedVersions';
 
-const ALL_KEYS = [BOOSTER_KEY, COMMON_KEY, WRITE_KEY, DATA_SOURCE_KEY, INSTALL_TS_KEY];
+const ALL_KEYS = [
+  BOOSTER_KEY,
+  COMMON_KEY,
+  WRITE_KEY,
+  DATA_SOURCE_KEY,
+  INSTALL_TS_KEY,
+  HISTORY_FLOOR_KEY,
+  LOCKED_VERSIONS_KEY,
+];
 
 // Preferences live in /data/adb/joyose-edit/settings.json (see prefs-read /
 // prefs-write in the helper), *not* only in localStorage.
@@ -157,6 +173,50 @@ export function prefsFileExisted(): boolean {
 /** Flush any queued write. Exported for tests / shutdown paths. */
 export function whenPrefsPersisted(): Promise<void> {
   return writeChain;
+}
+
+/** The newest seq that predates a file-level revert, or 0 when no revert has
+ *  happened. Records at or below it describe a database that no longer exists. */
+export function getHistoryFloor(): number {
+  const v = cache.get(HISTORY_FLOOR_KEY) ?? lsGet(HISTORY_FLOOR_KEY);
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function setHistoryFloor(seq: number): void {
+  if (!Number.isFinite(seq) || seq <= 0) return;
+  writePref(HISTORY_FLOOR_KEY, String(seq));
+}
+
+/** Config name → the version that was in place before the user locked it. */
+export function getLockedVersions(): Record<string, number> {
+  const raw = cache.get(LOCKED_VERSIONS_KEY) ?? lsGet(LOCKED_VERSIONS_KEY);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function setLockedVersion(config: string, original: number): void {
+  if (!Number.isFinite(original)) return;
+  const map = getLockedVersions();
+  if (typeof map[config] === 'number') return;
+  map[config] = original;
+  writePref(LOCKED_VERSIONS_KEY, JSON.stringify(map));
+}
+
+export function clearLockedVersion(config: string): void {
+  const map = getLockedVersions();
+  if (!(config in map)) return;
+  delete map[config];
+  writePref(LOCKED_VERSIONS_KEY, JSON.stringify(map));
 }
 
 // ----- booster_config source -------------------------------------------------

@@ -19,7 +19,13 @@ import {
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
-import { commitOutcome, mergeOntoRaw, pickSmartpVersion, planSmartpWrite } from '@/db/merge';
+import {
+  applyLockedOriginals,
+  commitOutcome,
+  mergeOntoRaw,
+  pickSmartpVersion,
+  planSmartpWrite,
+} from '@/db/merge';
 import { isEmptyCloudParams, parseCloudConfigRows, type ParseIssue } from '@/db/parse-rows';
 import {
   detectActiveBackend,
@@ -42,7 +48,7 @@ import {
   type HistoryRecord,
   type HistorySource,
 } from '@/history/store';
-import { diff, applyDelta, invertDelta } from '@/history/diff';
+import { diff, applyDelta, applyDeltaReport, formatPath, invertDelta } from '@/history/diff';
 import { refreshEnvelope } from '@/history/envelope';
 import {
   pickBoosterParams,
@@ -57,6 +63,11 @@ import {
   hydratePrefs,
   prefsFileExisted,
   whenPrefsPersisted,
+  getHistoryFloor,
+  setHistoryFloor,
+  getLockedVersions,
+  setLockedVersion,
+  clearLockedVersion,
 } from '@/state/source';
 
 
@@ -273,6 +284,12 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
       smartpRaw[name] = cfg.meta?.broken ? {} : JSON.parse(JSON.stringify(cfg.params));
     }
   }
+  // Re-attach the pre-lock version to rows that are still locked. The DB only
+  // stores the 2099* value, so without this a refresh made "unlock" restore the
+  // locked number itself.
+  const restoredLocks = applyLockedOriginals(cc, getLockedVersions());
+  for (const name of restoredLocks.stale) clearLockedVersion(name);
+
   state.cloudConfig = cc;
   state.smartpRaw = smartpRaw;
 
@@ -549,6 +566,9 @@ export function lockCloudVersion(configName: string): number {
   if (cc.meta.originalVersion === undefined) {
     cc.meta.originalVersion = current;
   }
+  // Persist it: a refresh rebuilds cloudConfig from the DB, where the version is
+  // already 2099*, and the in-memory pre-lock value would be gone.
+  setLockedVersion(configName, current);
   cc.meta.version = locked;
   if (cc.params.header) cc.params.header.version = String(locked);
   syncRuleContent(configName, locked);
@@ -562,6 +582,9 @@ export function unlockCloudVersion(configName: string, restored: number): void {
   cc.meta.version = restored;
   if (cc.params.header) cc.params.header.version = String(restored);
   syncRuleContent(configName, restored);
+  // The pre-lock value has been used; keeping it would resurrect a stale number
+  // if the user locks again later from a different cloud version.
+  clearLockedVersion(configName);
   markDirty();
 }
 
@@ -1098,11 +1121,19 @@ export async function backupNow(label?: string) {
 }
 
 export async function revertToBackup(name: string) {
-  return withWriteLock('回滚', () => bridge.revert(name));
+  return withWriteLock('回滚', async () => {
+    const r = await bridge.revert(name);
+    await markHistoryFloor();
+    return r;
+  });
 }
 
 export async function revertLatestBackup() {
-  return withWriteLock('回滚', () => bridge.revertLatest());
+  return withWriteLock('回滚', async () => {
+    const r = await bridge.revertLatest();
+    await markHistoryFloor();
+    return r;
+  });
 }
 
 export async function resetCloudData(): Promise<bridge.ResetCloudResult> {
@@ -1135,6 +1166,16 @@ export async function restoreToRecord(targetSeq: number): Promise<void> {
   if (!state.pristineSnapshot) {
     throw new Error('working tree 未初始化，先在概览点刷新');
   }
+  // A file-level revert replaced the DBs underneath the old delta chain. Those
+  // records describe a base that no longer exists; replaying them would apply
+  // changes to the wrong starting point and still report success.
+  const floor = getHistoryFloor();
+  if (floor > 0 && targetSeq <= floor) {
+    throw new Error(
+      `这条记录（seq=${targetSeq}）早于最近一次文件级回滚（seq=${floor}），`
+        + '它对应的数据库基准已经不存在，不能直接回滚。请用备份回滚，或只回滚回滚之后的新记录。',
+    );
+  }
   const meta = await listHistory();
   const newer = meta.filter((m) => m.seq > targetSeq);
   if (!meta.some((m) => m.seq === targetSeq)) {
@@ -1142,12 +1183,37 @@ export async function restoreToRecord(targetSeq: number): Promise<void> {
   }
 
   let snap: ConfigSnapshot = JSON.parse(JSON.stringify(state.pristineSnapshot));
+  const missing: string[] = [];
   for (const m of newer) {
     const rec = await readHistory(m.name);
-    snap = applyDelta(snap, invertDelta(rec.delta));
+    const rep = applyDeltaReport(snap, invertDelta(rec.delta));
+    snap = rep.value;
+    for (const p of rep.missing) missing.push(formatPath(p));
+  }
+  if (missing.length) {
+    // Do not write a partially replayed state: the caller may then commit it.
+    const sample = missing.slice(0, 3).join('、');
+    throw new Error(
+      `历史记录与当前数据库不匹配（${missing.length} 处路径不存在：${sample}`
+        + `${missing.length > 3 ? ' …' : ''}）。已停止回滚，请先刷新后再试。`,
+    );
   }
   rehydrateFromSnapshot(snap);
   state.dirty = true;
+}
+
+/** After a file-level revert the old delta chain is no longer replayable.
+ *  Record the newest seq that predates it; new commits continue above it. */
+async function markHistoryFloor(): Promise<void> {
+  try {
+    const hist = await listHistory();
+    const max = hist.reduce((m, h) => Math.max(m, h.seq), 0);
+    if (max > 0) setHistoryFloor(max);
+    await whenPrefsPersisted();
+  } catch {
+    // History unreadable: the revert itself already succeeded and reported its
+    // own status; do not turn a successful restore into a failure.
+  }
 }
 
 function rehydrateFromSnapshot(snap: ConfigSnapshot): void {

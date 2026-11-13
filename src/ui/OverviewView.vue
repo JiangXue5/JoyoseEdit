@@ -241,6 +241,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { state, pullAll, refreshStat, recordBackupCheckpoint, backupNow, resetCloudData, revertLatestBackup } from '@/state/session';
+import { isVersionLocked } from '@/db/merge';
 import {
   getBoosterSourcePref,
   setBoosterSourcePref,
@@ -460,10 +461,7 @@ async function onWriteTargetChange() {
   }
   toast.info('写入目标已更新', WRITE_TARGET_LABELS[writeTarget.value]);
 }
-const isLocked = computed(() => {
-  const v = state.cloudConfig.booster_config?.meta.version;
-  return typeof v === 'number' && String(v).startsWith('2099');
-});
+const isLocked = computed(() => isVersionLocked(state.cloudConfig.booster_config?.meta.version));
 
 const backendIcon = computed(() => {
   switch (state.activeBackend) {
@@ -501,10 +499,6 @@ function pathLabel(id: string): string {
     case 'migl': return 'MIGL (OpenGL)';
     default: return id;
   }
-}
-
-function isVersionLocked(v: unknown): boolean {
-  return typeof v === 'number' && String(v).startsWith('2099');
 }
 
 /** Revisions left behind in teg's `rules` table. The newest one is already
