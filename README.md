@@ -72,11 +72,14 @@
 ```bash
 npm install
 
-# 对 5 台样本 DB 全路径 round-trip
+# 对 5 台样本 DB 全路径 round-trip + 单元测试 + shell 边界测试
 npm test
 
 # 类型检查 + 生产构建 → dist/
 npm run build
+
+# 样本库发布前脱敏检查（Wi-Fi / 账号 / MAC 等字段非空即失败）
+npm run scan:samples
 
 # 打包 KernelSU 安装 zip → release/joyose-edit-<ver>-<count>[-dirty]-<sha>.zip
 # commit-count 写入 module.prop 的 versionCode，KernelSU 据此识别更新
@@ -85,6 +88,17 @@ npm run package
 # 浏览器热更新（无 KernelSU 桥，root 操作会报 unavailable）
 npm run dev
 ```
+
+### 测试能证明什么，不能证明什么
+
+| 层 | 覆盖 | 能证明 | 不能证明 |
+| --- | --- | --- | --- |
+| `npm test` 样本 round-trip | 5 台机型样本 DB 的全部解析器 | 读写不会破坏**这些样本**的字节 | 真机 Joyose 是否采纳改动 |
+| 单元测试 | diff / 合并 / 导入校验 / 历史 / 锁 / shell 边界 | 纯逻辑与输入边界 | KernelSU、SELinux、WebView 行为 |
+| Playwright + mock bridge | 页面渲染、提交状态文案、超时与锁交互 | 前端在**模拟** root 下的行为 | 真机上的 `ksu.exec` 时序 |
+| 真机验证 | 见「实测情况」 | 端到端生效 | 其他机型 / ROM |
+
+CI 只跑前三层。**「测试通过」不等于「真机可用」**，发版说明里请按这个边界描述。
 
 ## 源码导航
 
@@ -96,9 +110,12 @@ src/db/                   sql.js 封装 + DB 路径探测 + 磁盘指纹
 src/history/              累积式历史 + diff + rule_content 信封同步
 src/root/bridge.ts        ksu.exec 封装 + shell 白名单类型化包装
 src/ui/                   Vue 3 SFC（各功能页 + Overview / Lock / History …）
+src/ui/views.ts           页面注册表：label / icon / 分组 / 标题 / loader 的唯一来源
 tests/run.mts             端到端 harness（npm test）
 tests/<device>/           5 台机型的样本 SmartP.db / teg_config.db
 scripts/package-module.mjs 打包脚本（dist/ + module/ → zip）
+scripts/scan-samples.mjs  样本脱敏检查（CI 与本地共用）
+.github/workflows/ci.yml  类型检查 + 测试 + 构建 + ShellCheck + 脱敏
 CLAUDE.md                 反编译笔记 + 维护者手册
 ```
 

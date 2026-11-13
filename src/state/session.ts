@@ -15,7 +15,6 @@ import {
   listCloudConfig,
   listRules,
   latestRuleIdForModule,
-  insertRuleRow,
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
@@ -24,9 +23,15 @@ import {
   commitOutcome,
   mergeOntoRaw,
   pickSmartpVersion,
-  planSmartpWrite,
 } from '@/db/merge';
 import { isEmptyCloudParams, parseCloudConfigRows, type ParseIssue } from '@/db/parse-rows';
+import {
+  currentRuleRow,
+  planSmartpWrites,
+  applySmartpWrites,
+  planTegWrites,
+  applyTegWrites,
+} from '@/db/commit-writes';
 import {
   detectActiveBackend,
   detectPaths,
@@ -70,6 +75,10 @@ import {
   clearLockedVersion,
 } from '@/state/source';
 
+/** Re-exported so views can keep importing it from the store that owns the
+ *  rules, while the implementation lives next to the write planner that needs
+ *  the same "current revision" rule. */
+export { currentRuleRow };
 
 export interface SessionState {
   connected: boolean;
@@ -109,8 +118,22 @@ export interface SessionState {
   /** Outcome of the last write: whether Joyose was confirmed stopped, and
    *  whether it was brought back afterwards (i.e. it has already re-read the
    *  DBs, so the next game launch picks the edit up). `null` while unknown
-   *  (helper too old to report it). */
-  applyStatus: { stopped: boolean | null; started: boolean | null; at: number } | null;
+   *  (helper too old to report it).
+   *
+   *  Four separate facts, because one boolean kept being read as another:
+   *  "we confirmed it stopped" is not "it is stopped now", and "we asked it to
+   *  start" is not "it came back". */
+  applyStatus: {
+    /** Helper confirmed the consumer was gone before the swap. */
+    stopConfirmed: boolean | null;
+    /** Whether it was up before we quiesced it. */
+    wasRunningBefore: boolean | null;
+    /** Whether a restart was actually issued. */
+    restartAttempted: boolean;
+    /** Whether it was observed running again; null when not attempted/failed. */
+    startedAfter: boolean | null;
+    at: number;
+  } | null;
   /** When the last commit had to rebase onto a fresher DB, the timestamp of
    *  that merge; null when the last commit applied directly. */
   rebasedAt: number | null;
@@ -436,25 +459,6 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-/** The row Joyose treats as current for a module: highest `rule_version`
- * (an insert ordinal), not highest envelope version. The rules table keeps
- * every historical release, so "the module" is ambiguous without this. */
-export function currentRuleRow<T extends { meta: { rule_version?: unknown } }>(
-  rows: T[],
-): T | null {
-  if (rows.length === 0) return null;
-  let best = rows[0];
-  let bestVersion = Number(best.meta?.rule_version ?? 0);
-  if (!Number.isFinite(bestVersion)) bestVersion = 0;
-  for (const row of rows.slice(1)) {
-    const v = Number(row.meta?.rule_version ?? 0);
-    if (Number.isFinite(v) && v > bestVersion) {
-      best = row;
-      bestVersion = v;
-    }
-  }
-  return best;
-}
 
 /** Last-resort version for a mirror row. `0` means "unknown" and is written as
  *  0, not as a plausible-looking 2024 date that Joyose might treat as real. */
@@ -648,7 +652,13 @@ async function saveJsonTargetLocked(
       closeDb(db);
     }
     const res = await bridge.push('smartp', out);
-    state.applyStatus = { stopped: res.stopped ?? null, started: null, at: Date.now() };
+    state.applyStatus = {
+      stopConfirmed: res.stopConfirmed ?? res.stopped ?? null,
+      wasRunningBefore: res.wasRunning ?? null,
+      restartAttempted: false,
+      startedAfter: null,
+      at: Date.now(),
+    };
   } else {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('teg 目标必须是一个信封对象（{ config_name, version, params, … }）');
@@ -667,14 +677,29 @@ async function saveJsonTargetLocked(
       closeDb(db);
     }
     const res = await bridge.push('teg', out);
-    state.applyStatus = { stopped: res.stopped ?? null, started: null, at: Date.now() };
+    state.applyStatus = {
+      stopConfirmed: res.stopConfirmed ?? res.stopped ?? null,
+      wasRunningBefore: res.wasRunning ?? null,
+      restartAttempted: false,
+      startedAfter: null,
+      at: Date.now(),
+    };
   }
 
   const restarted = await bridge.restart().catch(() => null);
-  if (restarted && typeof restarted.stopped === 'boolean') {
+  if (restarted) {
     state.applyStatus = {
-      stopped: state.applyStatus?.stopped === false ? false : restarted.stopped,
-      started: restarted.started ?? null,
+      // A failed stop stays failed: the restart path cannot retroactively prove
+      // the first stop worked.
+      stopConfirmed:
+        state.applyStatus?.stopConfirmed === false
+          ? false
+          : typeof restarted.stopped === 'boolean'
+            ? restarted.stopped
+            : state.applyStatus?.stopConfirmed ?? null,
+      wasRunningBefore: state.applyStatus?.wasRunningBefore ?? null,
+      restartAttempted: true,
+      startedAfter: restarted.started ?? null,
       at: Date.now(),
     };
   }
@@ -845,72 +870,13 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
       // `state.smartpRaw`: that copy is whatever the last pull saw, so after a
       // second edit in the same session it no longer matches the row on disk
       // and the merge would silently undo the previous commit.
-      const diskParams: Record<string, any> = {};
       if (dbS) {
-        for (const row of listCloudConfig(dbS)) {
-          diskParams[row.config_name] = parseParams(row.params);
-        }
+        const plan = planSmartpWrites(dbS, state.cloudConfig, workBase);
+        applySmartpWrites(dbS, plan.writes);
+        for (const w of plan.writes) writtenRaw[w.name] = w.params;
       }
-      for (const [name, obj] of dbS ? Object.entries(state.cloudConfig) : []) {
-        // Only rows that genuinely exist in SmartP and carry content: a config
-        // that arrived from the teg fallback must never be written into SmartP,
-        // an empty row has nothing to write, and a row whose JSON we could not
-        // parse must keep its original bytes.
-        if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.broken || obj.meta?.fromTeg) {
-          continue;
-        }
-        const raw = diskParams[name];
-        const plan = planSmartpWrite({
-          raw,
-          workBefore: workBase[name],
-          workAfter: obj.params,
-          source: obj.meta?.source,
-        });
-        if (!plan.write) continue;
-        const serialized = stringifyParams(plan.params);
-        if (stringifyParams(raw) === serialized) continue;
-        // Keep SmartP's own version column unless the user locked it: the
-        // reconciled meta.version may come from teg, and copying it here would
-        // silently move SmartP's version forward on every source switch.
-        const version = pickSmartpVersion(obj.meta);
-        if (dbS) updateCloudConfigParams(dbS, name, serialized, version);
-        writtenRaw[name] = plan.params;
-      }
-      for (const [module, rows] of dbT ? Object.entries(state.rulesByModule) : []) {
-        // When rules table is empty (redmi style), skip.
-        if (rows.length === 0) continue;
-        const row = currentRuleRow(rows);
-        if (!row) continue;
-        // Same rule for the mirror: never write a row the DB does not have,
-        // skip empty envelopes so a placeholder cannot erase real content, and
-        // never re-serialise a row we failed to parse.
-        if (row.meta?._real !== true || row.meta?.empty || row.meta?.broken) continue;
-        // Resolve the target *against the DB we are about to write*, not
-        // against our (possibly stale) in-memory copy: Joyose may have
-        // appended a newer revision between pull and push.
-        if (!dbT) continue;
-        const id = latestRuleIdForModule(dbT, module);
-        if (id === null) {
-          // The mirror row was created in memory above; insert it now instead of
-          // silently dropping the write.
-          // Same rule for the inserted row: use the envelope's own version when
-          // it has one, otherwise leave the column unknown.
-          const mirrorVersion =
-            Number(row.meta?.rule_version ?? 0) || Number((row.content as any)?.version ?? 0);
-          const ins = insertRuleRow(
-            dbT,
-            module,
-            JSON.stringify(row.content),
-            mirrorVersion > 0 ? mirrorVersion : undefined,
-          );
-          if (ins.inserted !== 1) {
-            throw new Error(
-              `teg 镜像行写入失败（${module}）：${ins.error ?? '没有插入任何行'}`,
-            );
-          }
-          continue;
-        }
-        updateRuleContentById(dbT, id, JSON.stringify(row.content));
+      if (dbT) {
+        applyTegWrites(dbT, planTegWrites(dbT, state.rulesByModule));
       }
 
       outSmartp = dbS ? exportDb(dbS) : null;
@@ -942,8 +908,11 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
 
     // persist DBs first, so if anything fails we can re-sync
     const stops: boolean[] = [];
-    const recordStop = (r: { stopped?: boolean }) => {
-      if (typeof r?.stopped === 'boolean') stops.push(r.stopped);
+    const wasRunning: boolean[] = [];
+    const recordStop = (r: { stopped?: boolean; stopConfirmed?: boolean; wasRunning?: boolean }) => {
+      const confirmed = typeof r?.stopConfirmed === 'boolean' ? r.stopConfirmed : r?.stopped;
+      if (typeof confirmed === 'boolean') stops.push(confirmed);
+      if (typeof r?.wasRunning === 'boolean') wasRunning.push(r.wasRunning);
     };
     // Uploading a DB costs one ksu.exec round-trip per 48 KB of base64 — about
     // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
@@ -1004,8 +973,11 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     });
     if (restarted) recordStop(restarted);
     state.applyStatus = {
-      stopped: stops.length > 0 ? stops.every(Boolean) : null,
-      started: restarted?.started ?? null,
+      stopConfirmed: stops.length > 0 ? stops.every(Boolean) : null,
+      // Only report "it was running" when at least one write path told us.
+      wasRunningBefore: wasRunning.length > 0 ? wasRunning.some(Boolean) : null,
+      restartAttempted: true,
+      startedAfter: restarted?.started ?? null,
       at: Date.now(),
     };
 

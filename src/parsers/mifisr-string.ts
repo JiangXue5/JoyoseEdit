@@ -175,7 +175,7 @@ function parseSrcFpsList(v: string): number[] {
 }
 
 function fmt(n: number): string {
-  return Number.isInteger(n) ? String(n) : String(n);
+  return String(n);
 }
 
 function fmtAuto(n: number): string {

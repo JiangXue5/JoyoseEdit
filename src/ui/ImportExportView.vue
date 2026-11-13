@@ -115,6 +115,7 @@ import type { ActiveBackend } from '@/db/schema';
 import {
   DOMAIN_GB_KEYS,
   applyImportPackage,
+  pickCloudRowsForPreview,
   validateImportPackage,
   type DomainId,
   type ImportPackage,
@@ -361,38 +362,28 @@ const compatibility = computed<{ severity: 'ok' | 'warn' | 'error'; message: str
 
 // ---- preview diff ---------------------------------------------------------
 
+/** Only the rows named in the package can change. Comparing the full config
+ *  tree (and cloning it twice) for a three-key package made opening the
+ *  preview the slowest step on a 1 MB cloud config, and the clone of
+ *  `rulesByModule` was never read: the import package carries cloud_config
+ *  only. */
 const importDiffSummary = computed(() => {
   const pkg = pendingPackage.value;
   if (!pkg) return [];
-  const before = snapshotFromMaps({
-    cloudConfig: state.cloudConfig,
-    rulesByModule: state.rulesByModule,
-  });
-  const afterState = simulateMerge(pkg);
-  const after = snapshotFromMaps(afterState);
-  return diff(before, after);
+  const touched = Object.keys(pkg.data.cloudConfig);
+  const beforeState = pickCloudRowsForPreview(state.cloudConfig, touched);
+  const afterState = pickCloudRowsForPreview(state.cloudConfig, touched);
+  // Same function the real import uses: the preview cannot diverge from what
+  // lands in the working state.
+  applyImportPackage(pkg, afterState);
+  return diff(
+    snapshotFromMaps({ cloudConfig: beforeState, rulesByModule: {} }),
+    snapshotFromMaps({ cloudConfig: afterState, rulesByModule: {} }),
+  );
 });
 
 function summarizeDiff(r: Parameters<typeof summarizeRecord>[0]): string {
   return summarizeRecord(r);
-}
-
-// Compute what state.cloudConfig / state.rulesByModule would look like if we
-// applied `pkg` now — without actually mutating. Used for the preview diff.
-function simulateMerge(pkg: ImportPackage): {
-  cloudConfig: Record<string, unknown>;
-  rulesByModule: Record<string, unknown[]>;
-} {
-  const cc = deepClone(state.cloudConfig);
-  const rules = deepClone(state.rulesByModule);
-  // Same function the real import uses: the preview cannot diverge from what
-  // lands in the working state.
-  applyImportPackage(pkg, cc);
-  return { cloudConfig: cc, rulesByModule: rules };
-}
-
-function deepClone<T>(v: T): T {
-  return JSON.parse(JSON.stringify(v)) as T;
 }
 
 async function doImport() {

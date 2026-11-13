@@ -60,7 +60,13 @@ _json_string() {
   # stdin -> JSON string literal (quote + escape). Joins lines with \n but does
   # not append one: a single-line message used to come back as "text\n",
   # which the WebUI then showed or compared with a stray newline attached.
-  awk 'BEGIN{printf "\""} {
+  #
+  # C0 controls other than tab/CR/LF are dropped first. They are illegal
+  # unescaped inside a JSON string, and an error message containing one (a
+  # binary path, a truncated argv) used to produce a payload the front end
+  # could not parse at all — the caller then saw a JSON syntax error instead
+  # of the actual failure.
+  tr -d '\000-\010\013\014\016-\037\177' | awk 'BEGIN{printf "\""} {
     if (NR > 1) printf "\\n";
     gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t");
     gsub(/\r/,"\\r"); printf "%s", $0
@@ -172,6 +178,12 @@ resolve_db() {
 safe_name() {
   case "$1" in
     ''|*..*|*/*|*\\*|*\&*|*\|*|*\;*|*\`*|*\$*|*\(*|*\)*|*\<*|*\>*) return 1 ;;
+    # Glob metacharacters: these names end up as `$STAGE_DIR/$name` and inside
+    # `rm -f`, and a `*` there expands to every staged file.
+    *'*'*|*'?'*|*'['*|*']'*) return 1 ;;
+    # Control characters, including newline: they break both the JSON we print
+    # back and the quoting around stage paths.
+    *[[:cntrl:]]*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -429,8 +441,12 @@ _install_db() {
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$target" 2>/dev/null || true
   fi
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopped":true,"verified":"%s","rollback":"%s"}\n' \
-    "$target" "$uid" "$gid" "$chk" "$rb_mode"
+  # `stopped` means "we confirmed the process is gone before swapping"; it is
+  # not the final state. `wasRunning` records whether it was up beforehand, so
+  # the caller can tell "still running" from "was never running". The restart
+  # result comes from cmd_restart, not from here.
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopConfirmed":true,"wasRunning":%s,"verified":"%s","rollback":"%s"}\n' \
+    "$target" "$uid" "$gid" "$was_running" "$chk" "$rb_mode"
 }
 
 
@@ -490,21 +506,33 @@ cmd_digest() {
   printf '}\n'
 }
 
+# Single tail for both write entry points. `cmd_push` (one base64 argv) and
+# `cmd_push_from_stage` (chunked upload) differ only in where the base64 comes
+# from; everything after decoding — SQLite sanity check, size/digest guards,
+# TOCTOU guard, rollback copy, post-write check — must be identical or one
+# entry point silently becomes the weak one.
+_finish_staged_write() {
+  local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "decoded database is empty"; }
+  head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
+  _install_db "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
+}
+
 cmd_push() {
-  local sel="$1" b64="$2" target tmp
+  local sel="$1" b64="$2"
+  local expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
+  local target tmp
   [ -n "$b64" ] || die "push: missing base64 payload"
   target=$(resolve_db "$sel")
   [ -f "$target" ] || die "missing: $target"
   tmp="$target.jedit.$$"
   # decode directly into the sibling tmp, then rename atomically.
   printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
-  # quick sanity: must be a SQLite file
-  head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
-  _install_db "$target" "$tmp"
+  _finish_staged_write "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
 }
 
 cmd_backup() {
-  local label="" restore="restore" arg stamp dir stopped chk was started
+  local label="" restore="restore" arg stamp base dir n stopped chk was started
   for arg in "$@"; do
     case "$arg" in
       --no-restore) restore="no-restore" ;;
@@ -514,11 +542,23 @@ cmd_backup() {
   stamp=$(date +%s)
   if [ -n "$label" ]; then
     safe_name "$label" || die "invalid label"
-    dir="$DATA_ROOT/backup/${stamp}-${label}"
+    base="$DATA_ROOT/backup/${stamp}-${label}"
   else
-    dir="$DATA_ROOT/backup/${stamp}"
+    base="$DATA_ROOT/backup/${stamp}"
   fi
-  mkdir -p "$dir"
+  # Exclusive create. `mkdir -p` silently reused an existing directory, so two
+  # backups in the same second with the same label shared one path — and the
+  # failure paths below `rm -rf` that path, deleting the older copy. A numeric
+  # suffix keeps both, and this process only ever removes a directory it
+  # created itself.
+  dir="$base"
+  n=0
+  while ! mkdir "$dir" 2>/dev/null; do
+    [ -d "$dir" ] || die "cannot create backup directory: $dir"
+    n=$((n + 1))
+    [ "$n" -le 100 ] || die "cannot find a free backup name under $base"
+    dir="$base-$n"
+  done
   chmod 700 "$dir"
   # Remember whether Joyose was up before we quiesce it: a manual backup must
   # not leave the phone with the game service stopped until the next launch.
@@ -931,9 +971,50 @@ cmd_teg_unfreeze() { _teg_rewrite unfreeze; }
 # ---- staging (for payloads that would overflow ARG_MAX) ------------------
 # WebUI uses these to upload big base64 blobs in chunks instead of a single
 # huge argv (shell rejects ~100+ KB argv with "Argument list too long").
+#
+# A failed upload leaves its partial file behind on purpose: the next attempt
+# reuses it via stage-append, and push-from-stage deletes it after a
+# successful write. Without a reaper, though, every aborted export / history
+# save would add one more file forever. `_stage_gc` runs at the start of each
+# upload: anything untouched for an hour cannot belong to an upload in flight.
+STAGE_TTL=3600
+STAGE_KEEP=40
+
+_stage_gc() {
+  local f name now mtime age removed=0
+  now=$(date +%s)
+  [ -d "$STAGE_DIR" ] || return 0
+  for f in "$STAGE_DIR"/*; do
+    [ -f "$f" ] || continue
+    mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    if [ "$age" -gt "$STAGE_TTL" ]; then
+      rm -f "$f" 2>/dev/null && removed=$((removed + 1))
+    fi
+  done
+  # Belt and braces: a burst of failures inside the TTL can still pile up.
+  # `ls -t` is oldest-last; the tail beyond STAGE_KEEP is dropped.
+  local total
+  total=$(ls -1 "$STAGE_DIR" 2>/dev/null | wc -l | tr -d ' \n')
+  if [ "${total:-0}" -gt "$STAGE_KEEP" ]; then
+    ls -1t "$STAGE_DIR" 2>/dev/null | tail -n +$((STAGE_KEEP + 1)) | while IFS= read -r name; do
+      rm -f "$STAGE_DIR/$name" 2>/dev/null && removed=$((removed + 1))
+    done
+  fi
+  return 0
+}
+
+cmd_stage_gc() {
+  local before after
+  before=$(ls -1 "$STAGE_DIR" 2>/dev/null | wc -l | tr -d ' \n')
+  _stage_gc
+  after=$(ls -1 "$STAGE_DIR" 2>/dev/null | wc -l | tr -d ' \n')
+  printf '{"ok":true,"removed":%s,"kept":%s}\n' "$((before - after))" "$after"
+}
 
 cmd_stage_clear() {
   safe_name "$1" || die "invalid stage name"
+  _stage_gc
   : > "$STAGE_DIR/$1"
   chmod 600 "$STAGE_DIR/$1"
   printf '{"ok":true,"stage":"%s"}\n' "$1"
@@ -958,10 +1039,9 @@ cmd_push_from_stage() {
   [ -f "$stage_file" ] || die "stage file missing: $stage"
   tmp="$target.jedit.$$"
   base64 -d < "$stage_file" > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
-  head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
-  # _install_db keeps its own guarantees (pre-check, rollback copy, post-check).
-  # It exits on failure, so the stage file survives for a retry.
-  _install_db "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
+  # Same guard chain as cmd_push. _install_db exits on failure, so the stage
+  # file survives for a retry.
+  _finish_staged_write "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
   rm -f "$stage_file"
 }
 
@@ -1108,7 +1188,7 @@ case "$cmd" in
   save-dl-from-stage) cmd_save_dl_from_stage "${1:?}" "${2:?}" ;;
   reset-cloud)    cmd_reset_cloud ;;
   pull)           cmd_pull "${1:?}" ;;
-  push)           cmd_push "${1:?}" "${2:?}" ;;
+  push)           cmd_push "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
   backup)         cmd_backup "$@" ;;
   prune-backups)  prune_backups "${1:-10}" ;;
   revert)         cmd_revert "${1:?}" ;;
@@ -1123,6 +1203,7 @@ case "$cmd" in
   teg-freeze)     cmd_teg_freeze ;;
   teg-unfreeze)   cmd_teg_unfreeze ;;
   stage-clear)    cmd_stage_clear "${1:?}" ;;
+  stage-gc)       cmd_stage_gc ;;
   stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
   push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
   lock-status)             cmd_lock_status ;;

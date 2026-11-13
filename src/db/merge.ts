@@ -123,6 +123,16 @@ export function isVersionLocked(v: unknown): boolean {
   return typeof v === 'number' && String(v).startsWith('2099');
 }
 
+/** The cloud-lock badge answers one question — "is the active cloud config's
+ *  version locked?" — and used to be recomputed in two places from the same
+ *  path. Keep the path in one spot so the badge and the header cannot drift.
+ *
+ *  Not to be confused with the teg SDK freeze (`pref_local_max_version`):
+ *  that is a different mechanism with its own status call. */
+export function isCloudLocked(configs: Record<string, any> | null | undefined): boolean {
+  return isVersionLocked(configs?.booster_config?.meta?.version);
+}
+
 /** Re-attach persisted pre-lock versions after a pull.
  *
  *  The database only carries the `2099*` value, so the working copy has no way

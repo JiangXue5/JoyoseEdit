@@ -16,6 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import initSqlJs from 'sql.js';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 import { parseFrc, serializeFrc, blankFrc, validateFrc } from '../src/parsers/frc-string';
 import {
@@ -44,6 +45,7 @@ import {
   setPkgSupportVk,
   splitPkgGroup,
   groupImpact,
+  addPolicyForPkg,
 } from '../src/parsers/fisr-config';
 import { findPkgRoutes, removePkgRoutes, renamePkgRoutes } from '../src/parsers/pkg-routes';
 import {
@@ -114,11 +116,21 @@ import {
   mergeOntoRaw,
   pickSmartpVersion,
   planSmartpWrite,
+  isCloudLocked,
 } from '../src/db/merge';
 import { parseCloudConfigRows } from '../src/db/parse-rows';
+import { listCloudConfig, listRules } from '../src/db/dbio';
+import {
+  planSmartpWrites,
+  applySmartpWrites,
+  planTegWrites,
+  applyTegWrites,
+  currentRuleRow,
+} from '../src/db/commit-writes';
 import {
   IMPORT_SCHEMA,
   applyImportPackage,
+  pickCloudRowsForPreview,
   validateImportPackage,
   type ImportPackage,
 } from '../src/import/package';
@@ -170,6 +182,7 @@ async function main() {
   await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
+  await runPolicyResultTest();
   await runActiveBackendEdgeCases();
   await runEnvelopeTest();
   await runSourcePickTest();
@@ -178,8 +191,10 @@ async function main() {
   await runLiftThermalTest();
   await runThermalUnlockTest();
   await runNovatekComplexTest();
+  await runCommitWritesTest(SQL);
   await runRuleMirrorTest(SQL);
   await runNavGuardTest();
+  await runShellBoundaryTest();
 
   const failed = results.filter((r) => !r.ok);
   console.log(
@@ -1122,6 +1137,56 @@ async function runFrcStringTest() {
   });
 }
 
+async function runPolicyResultTest() {
+  console.log('\n=== policy add outcome ===');
+  await check('policy: duplicate feature reports its own reason', () => {
+    const cfg = emptyFisrConfig();
+    const first = addPolicyForPkg(cfg, 'com.a', { feature: 'FI', strategy: 1 } as any);
+    if (!first.ok) throw new Error('first add refused: ' + JSON.stringify(first));
+    const again = addPolicyForPkg(cfg, 'com.a', { feature: 'FI', strategy: 2 } as any);
+    if (again.ok) throw new Error('duplicate accepted');
+    if (again.reason !== 'duplicate') throw new Error('wrong reason: ' + again.reason);
+    const group = findGroupForPkg(cfg, 'com.a')!;
+    if (group.enhance_policy_config.length !== 1) throw new Error('duplicate mutated the list');
+    return 'duplicate reported without mutating';
+  });
+  await check('policy: empty package name is refused explicitly', () => {
+    const cfg = emptyFisrConfig();
+    const res = addPolicyForPkg(cfg, '   ', { feature: 'FI', strategy: 1 } as any);
+    if (res.ok || res.reason !== 'invalid-pkg') throw new Error('not refused: ' + JSON.stringify(res));
+    if ((cfg.enhance_config as any[]).length !== 0) throw new Error('created a group for an empty name');
+    return 'invalid-pkg';
+  });
+  await check('policy: adding to a shared group reports the split', () => {
+    const cfg = emptyFisrConfig();
+    (cfg.enhance_config as any[]).push({
+      game_list: ['com.a', 'com.b'],
+      enhance_policy_config: [{ feature: 'FI', strategy: 1 }],
+    });
+    const res = addPolicyForPkg(cfg, 'com.a', { feature: 'SR', strategy: 2 } as any);
+    if (!res.ok) throw new Error('refused: ' + JSON.stringify(res));
+    if (!res.splitShared) throw new Error('split not reported');
+    const a = findGroupForPkg(cfg, 'com.a')!;
+    const b = findGroupForPkg(cfg, 'com.b')!;
+    if (a === b) throw new Error('group not split');
+    if (a.enhance_policy_config.length !== 2) throw new Error('new policy not on the split group');
+    if (b.enhance_policy_config.length !== 1) throw new Error('peer group changed');
+    return 'split reported and peer untouched';
+  });
+  await check('lock: isCloudLocked reads the booster_config version only', () => {
+    if (isCloudLocked(null)) throw new Error('null must be unlocked');
+    if (isCloudLocked({})) throw new Error('empty must be unlocked');
+    if (isCloudLocked({ booster_config: { meta: {} } })) throw new Error('missing version must be unlocked');
+    if (!isCloudLocked({ booster_config: { meta: { version: 2099012345 } } })) {
+      throw new Error('2099 version must be locked');
+    }
+    if (isCloudLocked({ common_config: { meta: { version: 2099012345 } } })) {
+      throw new Error('other configs must not drive the cloud badge');
+    }
+    return 'booster_config only';
+  });
+}
+
 async function runMifisrStringTest() {
   console.log('\n=== mifisr validation edge cases ===');
 
@@ -1513,6 +1578,28 @@ async function runEnvelopeTest() {
     if (JSON.stringify(fresh).includes('""')) throw new Error('empty name leaked');
     return 'repaired to module name';
   });
+  await check('envelope: unknown upstream keys survive a refresh', () => {
+    const orig = {
+      config_name: 'booster_config',
+      group_name: 'booster_config',
+      enable: true,
+      version: 1,
+      with_model: false,
+      params: { old: 1 },
+      // Fields we have never modelled. A fixed-key rebuild used to drop these.
+      model: 'Xiaomi 17',
+      anchor_percents: [10, 90],
+      future_flag: { nested: true },
+    };
+    const fresh = refreshEnvelope(orig as any, { fresh: 2 }, 3) as Record<string, any>;
+    const parsed = JSON.parse(JSON.stringify(fresh));
+    if (parsed.model !== 'Xiaomi 17') throw new Error('model dropped');
+    if (JSON.stringify(parsed.anchor_percents) !== '[10,90]') throw new Error('anchor_percents dropped');
+    if (parsed.future_flag?.nested !== true) throw new Error('unknown object dropped');
+    if (parsed.group_name !== 'booster_config' || parsed.version !== 3) throw new Error('known keys wrong');
+    if (parsed.params.fresh !== 2) throw new Error('params not replaced');
+    return 'kept model/anchor_percents/future_flag';
+  });
 }
 
 function collectAllKeys(node: unknown, acc: string[] = []): string[] {
@@ -1867,6 +1954,148 @@ async function runNavGuardTest() {
   });
 }
 
+async function runCommitWritesTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
+  console.log('\n=== write planner ===');
+  const smartpBytes = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Pro Max/SmartP.db'));
+  const tegBytes = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Pro Max/teg_config.db'));
+
+  await check('writes: only touched rows are planned; fallback/broken/empty rows are skipped', () => {
+    const db = new SQL.Database(smartpBytes);
+    try {
+      const rows = listCloudConfig(db);
+      const target = rows[0];
+      const raw = JSON.parse(String(target.params));
+      const edited = JSON.parse(JSON.stringify(raw));
+      edited.__probe = 1;
+      const cloudConfig = {
+        [target.config_name]: { meta: { _real: true, source: 'smartp' }, params: edited },
+        from_teg: { meta: { _real: true, fromTeg: true }, params: { a: 1 } },
+        broken_row: { meta: { _real: true, broken: true }, params: {} },
+        empty_row: { meta: { _real: true, empty: true }, params: {} },
+        mirror_row: { meta: { _real: false }, params: { a: 1 } },
+      };
+      const plan = planSmartpWrites(db, cloudConfig, { [target.config_name]: raw });
+      if (plan.writes.length !== 1) throw new Error('planned ' + plan.writes.length + ' writes');
+      if (plan.writes[0].name !== target.config_name) throw new Error('wrong row planned');
+      for (const [k, reason] of Object.entries({
+        from_teg: 'from-teg',
+        broken_row: 'broken',
+        empty_row: 'empty',
+        mirror_row: 'not-smartp',
+      })) {
+        if (plan.skipped[k] !== reason) throw new Error(`${k}: ${plan.skipped[k]} != ${reason}`);
+      }
+      return '1 write, 4 skip reasons';
+    } finally {
+      db.close();
+    }
+  });
+
+  await check('writes: unchanged row is planned as no write', () => {
+    const db = new SQL.Database(smartpBytes);
+    try {
+      const target = listCloudConfig(db)[0];
+      const raw = JSON.parse(String(target.params));
+      const plan = planSmartpWrites(
+        db,
+        { [target.config_name]: { meta: { _real: true, source: 'smartp' }, params: raw } },
+        { [target.config_name]: raw },
+      );
+      if (plan.writes.length !== 0) throw new Error('planned a write for an unchanged row');
+      if (plan.skipped[target.config_name] !== 'unchanged') throw new Error('reason: ' + plan.skipped[target.config_name]);
+      return 'unchanged';
+    } finally {
+      db.close();
+    }
+  });
+
+  await check('writes: applying the plan changes only the planned row', () => {
+    const db = new SQL.Database(smartpBytes);
+    try {
+      const rows = listCloudConfig(db);
+      const target = rows[0];
+      const other = rows[1];
+      const raw = JSON.parse(String(target.params));
+      const otherRaw = JSON.stringify(JSON.parse(String(other.params)));
+      const edited = { ...JSON.parse(JSON.stringify(raw)), __applied: true };
+      const plan = planSmartpWrites(
+        db,
+        { [target.config_name]: { meta: { _real: true, source: 'smartp' }, params: edited } },
+        { [target.config_name]: raw },
+      );
+      applySmartpWrites(db, plan.writes);
+      const after = Object.fromEntries(listCloudConfig(db).map((r) => [r.config_name, String(r.params)]));
+      if (!after[target.config_name].includes('__applied')) throw new Error('edit not written');
+      if (after[other.config_name] !== otherRaw) throw new Error('sibling row was rewritten');
+      return '1 row changed, sibling byte-identical';
+    } finally {
+      db.close();
+    }
+  });
+
+  await check('writes: teg updates the newest revision and inserts a missing module', () => {
+    const db = new SQL.Database(tegBytes);
+    try {
+      const existing = listRules(db)[0];
+      const module = String(existing.rule_module);
+      const rulesByModule = {
+        [module]: [
+          { content: { v: 1 }, meta: { _real: true, rule_version: 2 } },
+          { content: { v: 3 }, meta: { _real: true, rule_version: 9 } },
+        ],
+        brand_new_module: [{ content: { hello: 1, version: 7 }, meta: { _real: true, rule_version: 42 } }],
+        broken_module: [{ content: {}, meta: { _real: true, broken: true } }],
+      };
+      const plan = planTegWrites(db, rulesByModule);
+      if (plan.updates.length !== 1) throw new Error('updates: ' + plan.updates.length);
+      if (plan.updates[0].content !== JSON.stringify({ v: 3 })) throw new Error('picked the wrong revision');
+      if (plan.inserts.length !== 1) throw new Error('inserts: ' + plan.inserts.length);
+      if (plan.inserts[0].version !== 42) throw new Error('inserted version: ' + plan.inserts[0].version);
+      if (plan.skipped.broken_module !== 'broken') throw new Error('broken module not skipped');
+      applyTegWrites(db, plan);
+      const modules = listRules(db).map((r) => String(r.rule_module));
+      if (!modules.includes('brand_new_module')) throw new Error('insert did not land');
+      return '1 update, 1 insert, broken skipped';
+    } finally {
+      db.close();
+    }
+  });
+
+  await check('writes: a failed mirror insert throws instead of reporting success', () => {
+    // SmartP has no `rules` table, so the insert has nowhere to land. The
+    // planner cannot produce this plan on its own (it would throw earlier),
+    // but applyTegWrites must not swallow a failed insert when it happens.
+    const db = new SQL.Database(smartpBytes);
+    try {
+      try {
+        applyTegWrites(db, {
+          updates: [],
+          inserts: [{ module: 'ghost_module', content: '{"a":1}', version: 1 }],
+          skipped: {},
+        });
+      } catch (err: any) {
+        if (!/teg 镜像行写入失败/.test(String(err?.message))) throw new Error('wrong error: ' + err?.message);
+        return 'threw: ' + String(err.message).slice(0, 48);
+      }
+      throw new Error('insert silently succeeded');
+    } finally {
+      db.close();
+    }
+  });
+
+  await check('writes: currentRuleRow picks the highest rule_version, not the last row', () => {
+    const rows = [
+      { content: 'a', meta: { rule_version: 2 } },
+      { content: 'b', meta: { rule_version: 9 } },
+      { content: 'c', meta: { rule_version: 5 } },
+    ];
+    const picked = currentRuleRow(rows);
+    if (picked?.content !== 'b') throw new Error('picked ' + picked?.content);
+    if (currentRuleRow([]) !== null) throw new Error('empty input must be null');
+    return 'b (9)';
+  });
+}
+
 async function runRuleMirrorTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
   console.log('\n=== teg mirror row insert ===');
   const sample = SAMPLES.find((s) => s.label.includes('Xiaomi 15'));
@@ -2117,6 +2346,62 @@ async function runImportPackageTest() {
     return 'prototype keys rejected';
   });
 
+  await check('import: 预览只比对包内涉及的配置，结果与全量一致', () => {
+    const cloud = {
+      booster_config: {
+        meta: { version: 1 },
+        params: {
+          game_booster: {
+            fisr_config: [{ pkg: 'com.a', enhance_policy_config: [{ feature: 'FI', strategy: 1 }] }],
+          },
+        },
+      },
+      common_config: { meta: {}, params: { game_list: ['com.a'] } },
+      mivk_config: { meta: {}, params: { on: false } },
+    };
+    const pkg = validPackage({
+      domains: ['enhance'],
+      data: {
+        cloudConfig: {
+          booster_config: {
+            params: {
+              game_booster: {
+                fisr_config: [{ pkg: 'com.b', enhance_policy_config: [{ feature: 'SR', strategy: 2 }] }],
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const full = JSON.parse(JSON.stringify(cloud));
+    applyImportPackage(pkg, full);
+    const fullDiff = diff(
+      snapshotFromMaps({ cloudConfig: cloud, rulesByModule: {} }),
+      snapshotFromMaps({ cloudConfig: full, rulesByModule: {} }),
+    );
+
+    const keys = Object.keys(pkg.data.cloudConfig);
+    const before = pickCloudRowsForPreview(cloud, keys);
+    const after = pickCloudRowsForPreview(cloud, keys);
+    applyImportPackage(pkg, after);
+    const subDiff = diff(
+      snapshotFromMaps({ cloudConfig: before, rulesByModule: {} }),
+      snapshotFromMaps({ cloudConfig: after, rulesByModule: {} }),
+    );
+
+    if (subDiff.length !== fullDiff.length) {
+      throw new Error(`子集 diff ${subDiff.length} 条，全量 ${fullDiff.length} 条`);
+    }
+    const fmt = (rs: typeof subDiff) => rs.map((r) => `${r.kind}:${summarizeRecord(r)}`).join('|');
+    if (fmt(subDiff) !== fmt(fullDiff)) throw new Error('子集 diff 与全量不一致');
+    if (before.common_config || before.mivk_config) throw new Error('拷贝了无关配置');
+    if ((cloud.booster_config.params as any).game_booster.fisr_config[0].pkg !== 'com.a') {
+      throw new Error('原始状态被修改');
+    }
+    return `${subDiff.length} 条，与全量一致，仅拷贝 1 个配置`;
+  });
+
   await check('import: 跨域写入被拒绝（只声明 enhance 却带 mivk_settings）', () => {
     const err = expectReject(
       validPackage({
@@ -2247,6 +2532,85 @@ async function runImportPackageTest() {
     cc.booster_config.params.game_booster.fisr_config[0].n = 99;
     if (JSON.stringify(raw) !== before) throw new Error('导入包对象被写入方改动了');
     return 'package stays immutable';
+  });
+}
+
+// ---- shell helper boundary ------------------------------------------------
+// `_json_string` sits between an error message and the JSON the WebView
+// parses, and `safe_name` sits between argv and a path. Both are input
+// boundaries, so they get a real shell, not a reimplementation in TS.
+function shellFunction(name: string): string {
+  const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8');
+  const lines = src.split('\n');
+  const start = lines.findIndex((l) => l.startsWith(`${name}() {`));
+  if (start < 0) throw new Error(`function ${name} not found in helper`);
+  let end = start;
+  while (end < lines.length && lines[end] !== '}') end++;
+  return lines.slice(start, end + 1).join('\n');
+}
+
+function shHasTools(): boolean {
+  try {
+    execFileSync('sh', ['-c', 'tr --version >/dev/null 2>&1 || true; command -v awk >/dev/null'], {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runShellBoundaryTest() {
+  console.log('\n=== shell helper boundaries ===');
+  if (!shHasTools()) {
+    await check('shell: 边界测试跳过（本机没有 sh/awk）', () => 'skipped');
+    return;
+  }
+  const jsonFn = shellFunction('_json_string');
+  const safeFn = shellFunction('safe_name');
+  const json = (input: string) =>
+    execFileSync('sh', ['-c', `${jsonFn}\n_json_string`], { input, encoding: 'utf8' });
+
+  await check('shell: _json_string escapes quotes and backslashes', () => {
+    const out = json('he said "hi" \\ bye');
+    const parsed = JSON.parse(out);
+    if (parsed !== 'he said "hi" \\ bye') throw new Error('round-trip mismatch: ' + out);
+    return out;
+  });
+  await check('shell: _json_string keeps tabs, joins lines with \\n', () => {
+    const parsed = JSON.parse(json('a\tb\nc'));
+    if (parsed !== 'a\tb\nc') throw new Error('got ' + JSON.stringify(parsed));
+    return JSON.stringify(parsed);
+  });
+  await check('shell: _json_string drops C0 controls instead of emitting bad JSON', () => {
+    const raw = 'a\u0001b\u0007c\u001fd';
+    const out = json(raw);
+    const parsed = JSON.parse(out); // throws on invalid JSON
+    if (parsed !== 'abcd') throw new Error('controls not dropped: ' + JSON.stringify(parsed));
+    return 'parsed clean';
+  });
+  await check('shell: _json_string handles empty and very long input', () => {
+    if (JSON.parse(json('')) !== '') throw new Error('empty string broken');
+    const long = 'x'.repeat(10000);
+    if (JSON.parse(json(long)) !== long) throw new Error('long string truncated');
+    return '0 / 10000 chars';
+  });
+  await check('shell: safe_name rejects traversals, globs and control chars', () => {
+    const bad = ['', '..', 'a/b', 'a\\b', 'a;b', 'a&b', 'a|b', 'a`b', 'a$b', 'a(b', 'a)b',
+      'a<b', 'a>b', 'a*b', 'a?b', 'a[b', 'a]b', 'a\nb', 'a\u0001b'];
+    const sh = `${safeFn}\nfor n in "$@"; do if safe_name "$n"; then echo "ACCEPT:$n"; else echo "REJECT:$n"; fi; done`;
+    const out = execFileSync('sh', ['-c', sh, 'sh', ...bad], { encoding: 'utf8' });
+    const accepted = out.split('\n').filter((l) => l.startsWith('ACCEPT:'));
+    if (accepted.length) throw new Error('accepted unsafe names: ' + accepted.join(', '));
+    return `${bad.length} rejected`;
+  });
+  await check('shell: safe_name accepts plain names, dots, dashes and CJK labels', () => {
+    const good = ['push-smartp-m1', 'hist.abc123', '2026-11-13_20-00-00', '备份', 'note 1'];
+    const sh = `${safeFn}\nfor n in "$@"; do if safe_name "$n"; then echo "ACCEPT:$n"; else echo "REJECT:$n"; fi; done`;
+    const out = execFileSync('sh', ['-c', sh, 'sh', ...good], { encoding: 'utf8' });
+    const rejected = out.split('\n').filter((l) => l.startsWith('REJECT:'));
+    if (rejected.length) throw new Error('rejected valid names: ' + rejected.join(', '));
+    return `${good.length} accepted`;
   });
 }
 

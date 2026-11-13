@@ -195,8 +195,15 @@ export interface WriteResult {
   path: string;
   uid?: number;
   gid?: number;
-  /** Whether Joyose was confirmed dead before the file was replaced.
-   * Absent on an older installed helper. */
+  /** Whether the helper confirmed the consumer was gone before the swap.
+   *  Says nothing about the final process state — see `wasRunning` and the
+   *  result of `restart()`. Absent on an older installed helper. */
+  stopConfirmed?: boolean;
+  /** Whether Joyose was up before the helper quiesced it. Absent on an older
+   *  installed helper. */
+  wasRunning?: boolean;
+  /** Legacy field name used by helpers that predate `stopConfirmed`. Read it
+   *  as a fallback, never as the final process state. */
   stopped?: boolean;
 }
 

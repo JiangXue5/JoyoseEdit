@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+
+jobs:
+  webui:
+    name: WebUI (typecheck / tests / build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (sample DBs + parsers + shell boundaries)
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Sample PII scan
+        run: npm run scan:samples
+
+  helper:
+    name: Root helper (ShellCheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: sh -n module/bin/joyose-edit.sh
+      - name: ShellCheck
+        # The helper runs under Android's /system/bin/sh (mksh), where `local`
+        # is a builtin. SC3043 is the only rule that flags it, so it is the
+        # only one excluded — every other warning fails the build.
+        run: shellcheck -S warning -e SC3043 module/bin/joyose-edit.sh

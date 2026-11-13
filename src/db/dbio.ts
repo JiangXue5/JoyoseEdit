@@ -75,20 +75,6 @@ export function listCloudConfig(db: Database): CloudConfigRow[] {
   return out;
 }
 
-export function getCloudConfig(db: Database, name: string): CloudConfigRow | null {
-  const stmt = db.prepare(
-    `SELECT _id, config_name, group_name, enable, version, with_model,
-            model, params, anchor, anchor_percents, anchor_values,
-            value_type, final_value
-       FROM cloud_config WHERE config_name = :name`,
-  );
-  stmt.bind({ ':name': name });
-  let row: CloudConfigRow | null = null;
-  if (stmt.step()) row = stmt.getAsObject() as unknown as CloudConfigRow;
-  stmt.free();
-  return row;
-}
-
 /** Update the `params` (and optionally `version`) of an existing row. */
 export function updateCloudConfigParams(
   db: Database,
@@ -187,33 +173,6 @@ export function insertRuleRow(
   } catch (err: any) {
     return { inserted: 0, error: err?.message ?? String(err) };
   }
-}
-
-/** Update `rule_content` and `rule_version` of every row that matches `module`. */
-export function updateRulesContent(
-  db: Database,
-  module: string,
-  content: string,
-  version?: number,
-): number {
-  if (typeof version === 'number') {
-    db.run(
-      `UPDATE rules SET rule_content = :c, rule_version = :v WHERE rule_module = :m`,
-      { ':c': content, ':v': version, ':m': module },
-    );
-  } else {
-    db.run(`UPDATE rules SET rule_content = :c WHERE rule_module = :m`, {
-      ':c': content,
-      ':m': module,
-    });
-  }
-  const res = db.exec(`SELECT changes() as n`);
-  return Number(res[0]?.values?.[0]?.[0] ?? 0);
-}
-
-export function countRulesForModule(db: Database, module: string): number {
-  const res = db.exec(`SELECT COUNT(*) FROM rules WHERE rule_module = '${module.replace(/'/g, "''")}'`);
-  return Number(res[0]?.values?.[0]?.[0] ?? 0);
 }
 
 /** Base64 <-> Uint8Array helpers; the root bridge emits base64. */

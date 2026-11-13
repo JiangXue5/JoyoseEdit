@@ -191,33 +191,44 @@ export function groupImpact(cfg: FisrConfig, pkg: string): GroupImpact | null {
   return { peers, shared: peers.length > 0, policies: group.enhance_policy_config.length };
 }
 
+/** Why an add was refused. `duplicate` means the feature is already on the
+ *  group; `invalid-pkg` means the caller passed an empty name. */
+export type AddPolicyRefusal = 'duplicate' | 'invalid-pkg';
+
+export type AddPolicyOutcome =
+  | { ok: true; /** A shared group was split to keep the edit local. */ splitShared: boolean }
+  | { ok: false; reason: AddPolicyRefusal };
+
 /**
  * Append a single policy to the group for `pkg`. If the group doesn't exist,
- * create one. If a policy with the same `feature` already exists on the group,
- * this is a no-op and returns false. Returns true when the policy was added.
+ * create one. Returns a structured outcome rather than a bare boolean: the UI
+ * has to tell "added" from "already there" and from "nothing to add to", and
+ * a boolean collapses all three into `false`.
  */
 export function addPolicyForPkg(
   cfg: FisrConfig,
   pkg: string,
   policy: FisrPolicy,
-): boolean {
+): AddPolicyOutcome {
+  if (typeof pkg !== 'string' || pkg.trim() === '') return { ok: false, reason: 'invalid-pkg' };
   if (!Array.isArray(cfg.enhance_config)) cfg.enhance_config = [];
   const existing = findGroupForPkg(cfg, pkg);
   if (existing) {
     // A shared group's policy list is common to every listed game; adding to
     // it would enable the feature for all of them.
-    const target = existing.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : existing;
+    const splitShared = existing.game_list.length > 1;
+    const target = splitShared ? splitPkgGroup(cfg, pkg)! : existing;
     if (target.enhance_policy_config.some((p) => p.feature === policy.feature)) {
-      return false;
+      return { ok: false, reason: 'duplicate' };
     }
     target.enhance_policy_config.push(clone(policy));
-  } else {
-    cfg.enhance_config.push({
-      game_list: [pkg],
-      enhance_policy_config: [clone(policy)],
-    });
+    return { ok: true, splitShared };
   }
-  return true;
+  cfg.enhance_config.push({
+    game_list: [pkg],
+    enhance_policy_config: [clone(policy)],
+  });
+  return { ok: true, splitShared: false };
 }
 
 /**

@@ -12,7 +12,8 @@
     "typecheck": "vue-tsc --noEmit",
     "test": "tsx tests/run.mts",
     "package": "node scripts/package-module.mjs",
-    "package:prop": "node scripts/package-module.mjs"
+    "package:prop": "node scripts/package-module.mjs",
+    "scan:samples": "node scripts/scan-samples.mjs"
   },
   "dependencies": {
     "@codemirror/lang-json": "^6.0.2",

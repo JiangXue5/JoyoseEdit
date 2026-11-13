@@ -103,7 +103,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
 import { state, initialize, pullAll, pushAll } from '@/state/session';
-import { isVersionLocked } from '@/db/merge';
+import { isCloudLocked } from '@/db/merge';
 import { scanFpsLock } from '@/parsers/fpslock';
 import { toast } from '@/state/toast';
 import OverviewView from '@/ui/OverviewView.vue';
@@ -113,6 +113,7 @@ import AppIcon from '@/ui/AppIcon.vue';
 import { dialog } from '@/state/dialog';
 import { theme, cycleTheme } from '@/state/theme';
 import { activeView as view, drawerOpen, navigate, type ViewId } from '@/state/nav';
+import { GROUP_LABELS, GROUP_ORDER, VIEWS, VIEW_LIST, pagesFor } from '@/ui/views';
 
 // Async chunks can fail inside the WebView (stale cache → 404 on a hashed
 // chunk, or MIME rejection). Rather than parking the UI on "加载中…" forever,
@@ -139,47 +140,12 @@ function asyncView(loader: () => Promise<unknown>) {
   });
 }
 
-const viewLoaders: Record<ViewId, () => Promise<unknown>> = {
-  overview: () => Promise.resolve(OverviewView),
-  lock: () => import('@/ui/LockView.vue'),
-  unlockfps: () => import('@/ui/UnlockFpsView.vue'),
-  thermal: () => import('@/ui/ThermalUnlockView.vue'),
-  gamelist: () => import('@/ui/GameListView.vue'),
-  frc: () => import('@/ui/FrcView.vue'),
-  mifisr: () => import('@/ui/MifisrView.vue'),
-  novatek: () => import('@/ui/NovatekView.vue'),
-  mivk: () => import('@/ui/MivkView.vue'),
-  json: () => import('@/ui/JsonEditorView.vue'),
-  history: () => import('@/ui/HistoryView.vue'),
-  importexport: () => import('@/ui/ImportExportView.vue'),
-};
-
-const LockView = asyncView(viewLoaders.lock);
-const UnlockFpsView = asyncView(viewLoaders.unlockfps);
-const ThermalUnlockView = asyncView(viewLoaders.thermal);
-const GameListView = asyncView(viewLoaders.gamelist);
-const FrcView = asyncView(viewLoaders.frc);
-const MifisrView = asyncView(viewLoaders.mifisr);
-const NovatekView = asyncView(viewLoaders.novatek);
-const MivkView = asyncView(viewLoaders.mivk);
-const JsonEditorView = asyncView(viewLoaders.json);
-const HistoryView = asyncView(viewLoaders.history);
-const ImportExportView = asyncView(viewLoaders.importexport);
-
-const VIEW_META: Record<ViewId, { title: string; desc: string }> = {
-  overview: { title: '概览', desc: '设备上的 Joyose 数据库状态、可用增强通路与备份入口。' },
-  lock: { title: '云控锁定', desc: '冻结 teg 云控版本，避免云端下发覆盖本地修改。' },
-  unlockfps: { title: '去除锁帧', desc: '清除或推迟 Joyose 的帧率限制，两种力度可选。' },
-  thermal: { title: '温度解锁', desc: '抬高插帧 / 超分的温控降档阈值。' },
-  gamelist: { title: '游戏列表', desc: 'Joyose 依据这两个名单决定是否为某个应用应用游戏策略。' },
-  frc: { title: '高通 GPU', desc: '骁龙 8 Elite 机型的 AFME / FRC / FSR 通路（未实机验证）。' },
-  mifisr: { title: 'MIFISR 画质增强', desc: '小米 17 系列的插帧 + 超分配置，逐游戏维护。' },
-  novatek: { title: 'Novatek 独显', desc: '红米独显机型的 NT# 策略与温控参数。' },
-  mivk: { title: '渲染模块', desc: 'MIVK / MIGL 渲染 hook 的模块开关与等级。' },
-  json: { title: '参数树编辑', desc: '直接编辑云控参数树，适合排查与专家级调整。' },
-  history: { title: '编辑历史', desc: '每次提交产生一条增量记录，可随时回到任意节点。' },
-  importexport: { title: '导入 / 导出', desc: '把配置打包成 JSON，用于备份或跨设备迁移。' },
-};
+/** Built from the registry, so a new page needs no edit here. Overview is
+ *  already in the main chunk (it is the first screen); wrapping it in an
+ *  async component would add a loading flash to every cold start. */
+const viewComponents = Object.fromEntries(
+  VIEW_LIST.map((v) => [v.id, v.id === 'overview' ? OverviewView : asyncView(v.load)]),
+) as Record<ViewId, Component>;
 
 const version = __APP_VERSION__;
 
@@ -236,60 +202,54 @@ interface NavItem {
   badgeTone?: string;
 }
 
+/** Badges are the only per-page data that is not static: they follow the
+ *  pulled config and change while the user works. Kept out of the registry
+ *  so the table stays a plain constant. */
+function navBadge(id: ViewId): { text: string; tone?: string } | undefined {
+  switch (id) {
+    case 'overview':
+      return state.stat ? { text: `${pathsActive.value}/4` } : undefined;
+    case 'lock':
+      return isLocked.value ? { text: '已冻结', tone: 'warn' } : undefined;
+    case 'gamelist':
+      return gameListCount.value ? { text: String(gameListCount.value) } : undefined;
+    case 'mifisr':
+      return { text: pathCount('mifisr') };
+    case 'frc':
+      return { text: pathCount('qualcomm') };
+    case 'novatek':
+      return { text: pathCount('novatek') };
+    case 'mivk':
+      return { text: `${pathCount('mivk')}·${pathCount('migl')}` };
+    case 'unlockfps':
+      return fpsLockBadge.value ? { text: fpsLockBadge.value, tone: 'warn' } : undefined;
+    default:
+      return undefined;
+  }
+}
+
 const navGroups = computed<{ label: string; items: NavItem[] }[]>(() => {
-  const main: NavItem[] = [
-    { id: 'overview', label: '概览', icon: 'overview', badge: state.stat ? `${pathsActive.value}/4` : undefined },
-    { id: 'lock', label: '云控锁定', icon: 'lock', badge: isLocked.value ? '已冻结' : undefined, badgeTone: 'warn' },
-    { id: 'gamelist', label: '游戏列表', icon: 'list', badge: gameListCount.value ? String(gameListCount.value) : undefined },
-  ];
-
-  const enhance: NavItem[] = [];
-  if (state.activeBackend === 'mifisr') {
-    enhance.push({ id: 'mifisr', label: 'MIFISR', icon: 'spark', badge: pathCount('mifisr') });
-  } else if (state.activeBackend === 'qualcomm') {
-    enhance.push({ id: 'frc', label: '高通 GPU', icon: 'cpu', badge: pathCount('qualcomm') });
-  } else if (state.activeBackend === 'novatek') {
-    enhance.push({ id: 'novatek', label: 'Novatek 独显', icon: 'monitor', badge: pathCount('novatek') });
-  }
-  enhance.push({ id: 'mivk', label: '渲染模块', icon: 'layers', badge: `${pathCount('mivk')}·${pathCount('migl')}` });
-
-  const tuning: NavItem[] = [
-    { id: 'unlockfps', label: '去除锁帧', icon: 'gauge', badge: fpsLockBadge.value || undefined, badgeTone: 'warn' },
-    { id: 'thermal', label: '温度解锁', icon: 'thermo' },
-  ];
-
-  const other: NavItem[] = [
-    { id: 'json', label: '参数树', icon: 'braces' },
-    { id: 'history', label: '编辑历史', icon: 'clock' },
-    { id: 'importexport', label: '导入 / 导出', icon: 'swap' },
-  ];
-
-  return [
-    { label: 'Dashboard', items: main },
-    { label: '画质增强', items: enhance },
-    { label: '帧率与温控', items: tuning },
-    { label: '工具', items: other },
-  ];
+  const pages = pagesFor(state.activeBackend);
+  return GROUP_ORDER.map((group) => ({
+    label: GROUP_LABELS[group],
+    items: pages
+      .filter((v) => v.group === group)
+      .map((v) => {
+        const badge = navBadge(v.id);
+        return {
+          id: v.id,
+          label: v.label,
+          icon: v.icon,
+          badge: badge?.text,
+          badgeTone: badge?.tone,
+        };
+      }),
+  })).filter((g) => g.items.length > 0);
 });
 
-const meta = computed(() => VIEW_META[view.value]);
+const meta = computed(() => VIEWS[view.value]);
 
-const currentView = computed<Component>(() => {
-  switch (view.value) {
-    case 'overview': return OverviewView;
-    case 'lock': return LockView;
-    case 'unlockfps': return UnlockFpsView;
-    case 'thermal': return ThermalUnlockView;
-    case 'gamelist': return GameListView;
-    case 'frc': return FrcView;
-    case 'mifisr': return MifisrView;
-    case 'novatek': return NovatekView;
-    case 'mivk': return MivkView;
-    case 'json': return JsonEditorView;
-    case 'history': return HistoryView;
-    case 'importexport': return ImportExportView;
-  }
-});
+const currentView = computed<Component>(() => viewComponents[view.value]);
 
 // Bounce back to overview if the selected backend-specific editor no longer
 // matches the device (e.g. re-pulled from a different phone).
@@ -319,15 +279,15 @@ onMounted(async () => {
   // paint immediately instead of waiting on a 20–80 KB parse.
   const idle = (window as any).requestIdleCallback ?? ((cb: any) => setTimeout(cb, 800));
   idle(() => {
-    for (const [id, load] of Object.entries(viewLoaders)) {
-      if (id === view.value) continue;
-      load().catch(() => null);
+    for (const v of VIEW_LIST) {
+      if (v.id === view.value) continue;
+      v.load().catch(() => null);
     }
   });
 });
 
 const pathsActive = computed(() => state.paths.filter((p) => p.active).length);
-const isLocked = computed(() => isVersionLocked(state.cloudConfig.booster_config?.meta.version));
+const isLocked = computed(() => isCloudLocked(state.cloudConfig));
 
 const fpsLockBadge = computed(() => {
   const booster = state.cloudConfig.booster_config?.params;
@@ -406,20 +366,26 @@ async function handlePush() {
     const name = res.file ?? '';
     const rebased = state.rebasedAt !== null;
     const applied = state.applyStatus;
-    if (applied?.stopped === false) {
+    if (applied?.stopConfirmed === false) {
       toast.warn(
         '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
         name,
       );
     } else if (rebased) {
       toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
-    } else if (applied?.started === true) {
+    } else if (applied?.startedAfter === true) {
       // Restarting Joyose right after the write means it has already read the
       // new rows; without this the first game launch raced the cold start and
       // the edit only showed up on the second one.
       toast.success('已提交，Joyose 已重新加载配置', `${name} · 直接进游戏即可，不需要再开一遍`);
-    } else if (applied?.started === false) {
+    } else if (applied?.restartAttempted && applied.startedAfter === false) {
       toast.info('已提交', `${name} · Joyose 已停止，下次启动游戏时会读取新配置`);
+    } else if (applied?.restartAttempted) {
+      // We asked it to start but could not confirm it is up.
+      toast.warn(
+        '已提交，但没能确认 Joyose 已重新启动',
+        `${name} · 进游戏前若配置没生效，请手动重启 Joyose`,
+      );
     } else {
       toast.success('已提交并写入历史', name);
     }

@@ -228,3 +228,29 @@ export function applyImportPackage(
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T;
 }
+
+/**
+ * Deep copy of just the named `cloud_config` rows, keeping their
+ * `{ meta, params }` shape so `applyImportPackage` sees the same input it gets
+ * on a real import.
+ *
+ * The import preview used to clone the whole config tree (twice) for a package
+ * that touches one or two rows, and cloned `rulesByModule` that it never read.
+ * Only the rows named in the package can change, so only those are copied.
+ */
+export function pickCloudRowsForPreview(
+  source: Record<string, any> | null | undefined,
+  names: string[],
+): Record<string, any> {
+  const out: Record<string, any> = {};
+  if (!source) return out;
+  for (const name of names) {
+    const row = source[name];
+    if (!row) continue;
+    out[name] = {
+      meta: row.meta ? clone(row.meta) : {},
+      params: row.params !== undefined ? clone(row.params) : {},
+    };
+  }
+  return out;
+}

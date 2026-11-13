@@ -997,15 +997,24 @@ async function addFisrFeature(feature: 'FI' | 'SR' | 'FISR') {
   if (!(await confirmSplit(pkg, `添加 ${feature} 策略`))) return;
   const policy = policyForFeature(feature);
   const added = addPolicyForPkg(gb.fisr_config as FisrConfig, pkg, policy);
-  if (!added) {
-    toast.warn(`${feature} 已存在`, `${pkg} 的 fisr_config 里已有 ${feature} policy，未重复添加`);
+  if (!added.ok) {
+    if (added.reason === 'duplicate') {
+      toast.warn(`${feature} 已存在`, `${pkg} 的 fisr_config 里已有 ${feature} policy，未重复添加`);
+    } else {
+      toast.warn('没有可添加的目标', `${feature} 未添加：当前游戏没有有效的包名`);
+    }
     return;
   }
   // MIFISR doesn't read dp_fi_config (that's DMI's concern), so the default
   // preset flow doesn't touch it.
   if (alsoUpdateMqs.value) addToMqs(pkg);
   markDirty();
-  toast.success(`已添加 ${feature}`, `strategy=${policy.strategy}`);
+  toast.success(
+    `已添加 ${feature}`,
+    added.splitShared
+      ? `strategy=${policy.strategy} · 原策略组与其他游戏共用，已拆分`
+      : `strategy=${policy.strategy}`,
+  );
 }
 
 async function removeFisrFeature(feature: string) {

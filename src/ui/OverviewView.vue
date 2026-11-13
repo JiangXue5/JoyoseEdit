@@ -241,7 +241,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { state, pullAll, refreshStat, recordBackupCheckpoint, backupNow, resetCloudData, revertLatestBackup } from '@/state/session';
-import { isVersionLocked } from '@/db/merge';
+import { isCloudLocked, isVersionLocked } from '@/db/merge';
 import {
   getBoosterSourcePref,
   setBoosterSourcePref,
@@ -461,7 +461,7 @@ async function onWriteTargetChange() {
   }
   toast.info('写入目标已更新', WRITE_TARGET_LABELS[writeTarget.value]);
 }
-const isLocked = computed(() => isVersionLocked(state.cloudConfig.booster_config?.meta.version));
+const isLocked = computed(() => isCloudLocked(state.cloudConfig));
 
 const backendIcon = computed(() => {
   switch (state.activeBackend) {
