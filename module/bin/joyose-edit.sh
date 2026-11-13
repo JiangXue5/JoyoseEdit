@@ -441,12 +441,16 @@ _install_db() {
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$target" 2>/dev/null || true
   fi
+  # Digest of the bytes that actually landed. The WebUI stores it in the
+  # history record so a later rollback can tell "this database is still the one
+  # my delta was computed against" from "somebody replaced it since".
+  dst_sha=$(_sha256_file "$target")
   # `stopped` means "we confirmed the process is gone before swapping"; it is
   # not the final state. `wasRunning` records whether it was up beforehand, so
   # the caller can tell "still running" from "was never running". The restart
   # result comes from cmd_restart, not from here.
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopConfirmed":true,"wasRunning":%s,"verified":"%s","rollback":"%s"}\n' \
-    "$target" "$uid" "$gid" "$was_running" "$chk" "$rb_mode"
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopConfirmed":true,"wasRunning":%s,"verified":"%s","rollback":"%s","sha256":"%s"}\n' \
+    "$target" "$uid" "$gid" "$was_running" "$chk" "$rb_mode" "$dst_sha"
 }
 
 

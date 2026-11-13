@@ -49,11 +49,13 @@ import {
   buildHistoryFilename,
   parseHistoryFilename,
   type ConfigSnapshot,
+  type DbDigests,
   type HistoryFileMeta,
   type HistoryRecord,
   type HistorySource,
 } from '@/history/store';
-import { diff, applyDelta, applyDeltaReport, formatPath, invertDelta } from '@/history/diff';
+import { diff, applyDelta } from '@/history/diff';
+import { planRestore } from '@/history/restore-plan';
 import { refreshEnvelope } from '@/history/envelope';
 import {
   pickBoosterParams,
@@ -738,7 +740,8 @@ async function ensureBackup(label?: string): Promise<void> {
   }
 }
 
-/** Re-read the DB digests and store them as the conflict-detection baseline. */export async function refreshBaseline(): Promise<void> {
+/** Re-read the DB digests and store them as the conflict-detection baseline. */
+export async function refreshBaseline(): Promise<void> {
   try {
     const d = await bridge.digest();
     state.baselineSmartp = d.smartp;
@@ -796,8 +799,13 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     const writeSmartp = writeTarget === 'both' || writeTarget === 'smartp';
     const writeTeg = writeTarget === 'both' || writeTarget === 'teg';
 
+    // Digests as the databases stand right now. Used twice: to detect that
+    // somebody else changed them since the pull (conflict), and as the
+    // `beforeDigest` stamped into the history record so a later rollback can
+    // prove it is replaying onto the base it was computed from.
+    const beforeDigest = await bridge.digest().catch(() => null);
+
     if (!opts.force) {
-      const fresh = await bridge.digest().catch(() => null);
       const check = (label: string, baseline: string | null, current: string | null) => {
         if (!baseline || !current || baseline === current) return;
         throw new ConflictError(
@@ -806,9 +814,9 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
       };
       // Only the database we are about to write can conflict with us; a teg
       // update must not block a SmartP-only commit.
-      if (fresh) {
-        if (writeSmartp) check('SmartP.db', state.baselineSmartp, fresh.smartp);
-        if (writeTeg) check('teg_config.db', state.baselineTeg, fresh.teg);
+      if (beforeDigest) {
+        if (writeSmartp) check('SmartP.db', state.baselineSmartp, beforeDigest.smartp);
+        if (writeTeg) check('teg_config.db', state.baselineTeg, beforeDigest.teg);
       }
     }
 
@@ -947,12 +955,20 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
       const existing = await bridge.historyList();
       const seq = nextSeq(existing);
       const ts = Math.floor(Date.now() / 1000);
+      // Where the databases ended up. Read after the swap so the record
+      // describes reality, not our intention: "we asked for these bytes" and
+      // "the file now holds them" are different claims.
+      const afterDigest = await bridge.digest().catch(() => null);
       const rec = buildRecord({
         seq,
         timestamp: ts,
         source: opts.source ?? 'webui',
         note: opts.note ?? '',
         delta,
+        dbKind: wroteSmartp && wroteTeg ? 'both' : wroteSmartp ? 'smartp' : 'teg',
+        beforeDigest: beforeDigest ?? undefined,
+        afterDigest: afterDigest ?? undefined,
+        canRevert: delta.length > 0,
       });
       fname = buildHistoryFilename(ts, seq);
       await bridge.historySave(fname, JSON.stringify(rec));
@@ -1148,6 +1164,12 @@ export async function backupNow(label?: string) {
 export async function revertToBackup(name: string) {
   return withWriteLock('回滚', async () => {
     const r = await bridge.revert(name);
+    // A file-level revert replaces the databases behind the delta chain's
+    // back. Re-read them first: keeping the pre-revert snapshot would make the
+    // next commit diff against bytes that no longer exist. Then record the
+    // floor, so a record from before this point is refused instead of being
+    // replayed onto a base it never saw.
+    await pullAll();
     await markHistoryFloor();
     return r;
   });
@@ -1156,6 +1178,7 @@ export async function revertToBackup(name: string) {
 export async function revertLatestBackup() {
   return withWriteLock('回滚', async () => {
     const r = await bridge.revertLatest();
+    await pullAll();
     await markHistoryFloor();
     return r;
   });
@@ -1182,48 +1205,62 @@ export async function unfreezeTeg() {
   return withWriteLock('解冻云控', () => bridge.tegUnfreeze());
 }
 
+/** Digest of the databases as the newest recorded commit left them.
+ *
+ *  Only the first few records are scanned: a backup checkpoint carries no
+ *  digest, and reading all ten costs ten shell calls for no extra safety. */
+async function newestKnownDigest(): Promise<DbDigests | null> {
+  const meta = await listHistory();
+  for (const m of meta.slice(0, 3)) {
+    try {
+      const rec = await readHistory(m.name);
+      if (rec.afterDigest) return rec.afterDigest;
+    } catch {
+      // An unreadable record is not a reason to block the rollback.
+    }
+  }
+  return null;
+}
+
 /** Walk the commit chain from the working tree (`pristineSnapshot`) back to
- * the post-state of `targetSeq`, applying inverse deltas, then rehydrate
- * the resulting snapshot into the in-memory state. Semantics mirror
+ * the post-state of `targetSeq`, then rehydrate the result. Semantics mirror
  * `git checkout <commit>`: you land on the state at the end of that commit.
- * To see the pre-state of commit N, restore to commit N-1 instead. */
+ * To see the pre-state of commit N, restore to commit N-1 instead.
+ *
+ *  IO lives here; every decision (floor, marker record, digests, replay) is in
+ *  `planRestore`, a pure function, so each refusal path has a test. */
 export async function restoreToRecord(targetSeq: number): Promise<void> {
   if (!state.pristineSnapshot) {
     throw new Error('working tree 未初始化，先在概览点刷新');
   }
-  // A file-level revert replaced the DBs underneath the old delta chain. Those
-  // records describe a base that no longer exists; replaying them would apply
-  // changes to the wrong starting point and still report success.
   const floor = getHistoryFloor();
-  if (floor > 0 && targetSeq <= floor) {
-    throw new Error(
-      `这条记录（seq=${targetSeq}）早于最近一次文件级回滚（seq=${floor}），`
-        + '它对应的数据库基准已经不存在，不能直接回滚。请用备份回滚，或只回滚回滚之后的新记录。',
-    );
-  }
   const meta = await listHistory();
-  const newer = meta.filter((m) => m.seq > targetSeq);
-  if (!meta.some((m) => m.seq === targetSeq)) {
+  const targetMeta = meta.find((m) => m.seq === targetSeq);
+  if (!targetMeta) {
     throw new Error(`未找到 seq=${targetSeq} 的历史记录`);
   }
-
-  let snap: ConfigSnapshot = JSON.parse(JSON.stringify(state.pristineSnapshot));
-  const missing: string[] = [];
-  for (const m of newer) {
-    const rec = await readHistory(m.name);
-    const rep = applyDeltaReport(snap, invertDelta(rec.delta));
-    snap = rep.value;
-    for (const p of rep.missing) missing.push(formatPath(p));
+  const targetRecord = await readHistory(targetMeta.name);
+  const newerRecords: HistoryRecord[] = [];
+  for (const m of meta) {
+    if (m.seq > targetSeq) newerRecords.push(await readHistory(m.name));
   }
-  if (missing.length) {
-    // Do not write a partially replayed state: the caller may then commit it.
-    const sample = missing.slice(0, 3).join('、');
-    throw new Error(
-      `历史记录与当前数据库不匹配（${missing.length} 处路径不存在：${sample}`
-        + `${missing.length > 3 ? ' …' : ''}）。已停止回滚，请先刷新后再试。`,
-    );
-  }
-  rehydrateFromSnapshot(snap);
+  // Only ask the device what "correct" is when a record can answer. On a
+  // history written before v1.2.0 there is no digest, and the call would be
+  // spent on a check that cannot run.
+  const anchorDigest = await newestKnownDigest();
+  const nowDigest = anchorDigest ? await bridge.digest().catch(() => null) : null;
+  const plan = planRestore({
+    targetSeq,
+    floor,
+    meta,
+    newerRecords,
+    targetRecord,
+    anchorDigest,
+    nowDigest,
+    current: state.pristineSnapshot,
+  });
+  if (!plan.ok) throw new Error(plan.message);
+  rehydrateFromSnapshot(plan.snapshot);
   state.dirty = true;
 }
 
@@ -1288,6 +1325,9 @@ export async function recordBackupCheckpoint(backupName: string): Promise<void> 
     source: 'backup',
     note: backupName,
     delta: [],
+    // A marker with no delta has nothing to replay: offering it as a rollback
+    // target would silently do nothing and still look like a restore.
+    canRevert: false,
   });
   await bridge.historySave(buildHistoryFilename(ts, seq), JSON.stringify(rec));
   await bridge.historyClear(HISTORY_KEEP).catch(() => null);

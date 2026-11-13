@@ -21,9 +21,34 @@ export interface ConfigSnapshot {
   };
 }
 
+/** Which database(s) a record's delta was applied to. */
+export type DbKind = 'smartp' | 'teg' | 'both';
+
+/** Content digests of the two databases at one moment. `null` means the file
+ *  was absent, or the device has no sha256sum and we could not compute one —
+ *  never "unchanged". */
+export interface DbDigests {
+  smartp: string | null;
+  teg: string | null;
+}
+
 /** Git-style incremental commit. `delta` is the forward patch from parent
  * state to this state; state is reconstructed by walking the chain (see
- * session.ts::restoreToRecord). Files stay in the KB range. */
+ * session.ts::restoreToRecord). Files stay in the KB range.
+ *
+ *  v2 format (delta only) is still what `version` means. The fields below were
+ *  added afterwards without changing the delta shape, so old readers keep
+ *  working and new readers can tell a record's base from its own fields:
+ *
+ *  * `dbKind`      which DB the delta landed in (a commit can touch both);
+ *  * `beforeDigest` the DBs as they were when this record's base was read;
+ *  * `afterDigest`  the DBs immediately after the write landed;
+ *  * `canRevert`   whether this record may be replayed at all (a backup
+ *                  checkpoint has no delta, so replaying it means nothing).
+ *
+ *  Digests are what let rollback refuse to run on a database somebody else
+ *  changed in the meantime — replaying a delta onto a base it was not
+ *  computed from produces a wrong result and still "succeeds". */
 export interface HistoryRecord {
   version: 2;
   seq: number;
@@ -31,6 +56,11 @@ export interface HistoryRecord {
   source: HistorySource;
   note: string;
   delta: DiffRecord[];
+  /** Absent on records written before v1.2.0. */
+  dbKind?: DbKind;
+  beforeDigest?: DbDigests;
+  afterDigest?: DbDigests;
+  canRevert?: boolean;
 }
 
 export interface HistoryFileMeta {
@@ -71,10 +101,17 @@ export interface BuildRecordArgs {
   /** Forward delta (parent-state -> this-state). Typically produced by
    *  `diff(before, after)` where before / after are `ConfigSnapshot`s. */
   delta: DiffRecord[];
+  /** Optional bookkeeping about the databases this delta was applied to. */
+  dbKind?: DbKind;
+  beforeDigest?: DbDigests;
+  afterDigest?: DbDigests;
+  /** Defaults to `delta.length > 0`: a checkpoint with no delta cannot be
+   *  replayed, so it must not be offered as a rollback target. */
+  canRevert?: boolean;
 }
 
 export function buildRecord(args: BuildRecordArgs): HistoryRecord {
-  return {
+  const rec: HistoryRecord = {
     version: 2,
     seq: args.seq,
     timestamp: args.timestamp ?? Math.floor(Date.now() / 1000),
@@ -82,6 +119,11 @@ export function buildRecord(args: BuildRecordArgs): HistoryRecord {
     note: args.note ?? '',
     delta: args.delta,
   };
+  if (args.dbKind) rec.dbKind = args.dbKind;
+  if (args.beforeDigest) rec.beforeDigest = args.beforeDigest;
+  if (args.afterDigest) rec.afterDigest = args.afterDigest;
+  rec.canRevert = args.canRevert ?? args.delta.length > 0;
+  return rec;
 }
 
 /** Project `state.cloudConfig` / `state.rulesByModule` (which wrap values

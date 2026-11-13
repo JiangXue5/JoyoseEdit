@@ -205,6 +205,16 @@ export interface WriteResult {
   /** Legacy field name used by helpers that predate `stopConfirmed`. Read it
    *  as a fallback, never as the final process state. */
   stopped?: boolean;
+  /** SHA-256 of the file after the swap. Empty when the ROM ships no
+   *  sha256sum — that means "not verified", never "matches". */
+  sha256?: string;
+  /** How the post-write integrity check ran: `sqlite3` is a full
+   *  `PRAGMA quick_check`, `geometry` is the header + page-count fallback used
+   *  when the ROM has no sqlite3 binary. */
+  verified?: 'sqlite3' | 'geometry';
+  /** How the pre-swap rollback copy was verified. `size` means the ROM has no
+   *  digest tool, so only the length was compared. */
+  rollback?: 'sha256' | 'size';
 }
 
 /** SHA-256 as lowercase hex, or null when the WebView has no crypto.subtle

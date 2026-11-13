@@ -31,12 +31,16 @@
           <strong>seq {{ record.seq }}</strong>
           <span class="pill">{{ record.source }}</span>
           <span class="pill">{{ formatTime(record.timestamp) }}</span>
-          <button v-if="record.source !== 'backup'" class="primary" @click="restore"
+          <button v-if="record.source !== 'backup' && record.canRevert !== false" class="primary" @click="restore"
             style="margin-left: auto" :disabled="detailLoading || restoreDisabled"
             :title="restoreDisabled
               ? '这条记录早于最近一次文件级回滚，基准已失效，不能再按增量回放'
               : '把内存状态回溯到此次提交完成后的状态；还需点顶栏「提交到设备」才真正生效。想看此提交之前的状态，请选前一条记录恢复'">
             {{ restoreDisabled ? '基准已失效' : '恢复到此提交' }}
+          </button>
+          <button v-else-if="record.canRevert === false" class="ghost" disabled style="margin-left: auto"
+            title="这条记录不改变任何配置（例如备份锚点），没有可回放的内容">
+            无变更
           </button>
           <button v-else class="danger" @click="revertFromBackup" style="margin-left: auto"
             title="直接把此时间点的 DB 字节拷贝回 Joyose（文件级恢复，立即生效）">
@@ -44,6 +48,12 @@
           </button>
         </div>
         <div v-if="record.note" class="muted tiny">note: {{ record.note }}</div>
+        <div v-if="record.dbKind || record.afterDigest" class="muted tiny">
+          <span v-if="record.dbKind">写入目标：{{ dbKindLabel }}</span>
+          <span v-if="record.afterDigest?.smartp">　SmartP {{ record.afterDigest.smartp.slice(0, 8) }}</span>
+          <span v-if="record.afterDigest?.teg">　teg {{ record.afterDigest.teg.slice(0, 8) }}</span>
+          <span v-if="!record.afterDigest">　（旧记录，无写入后摘要）</span>
+        </div>
         <div class="panel" style="margin: 0; background: var(--bg-elevated)">
           <h2 style="font-size: 14px">变更 <small>{{ diffEntries.length }} 条</small></h2>
           <div v-if="diffEntries.length === 0" class="muted tiny">（无字段变化）</div>
@@ -89,6 +99,14 @@ const loading = ref(false);
 const detailLoading = ref(false);
 
 const diffEntries = computed(() => record.value?.delta ?? []);
+const dbKindLabel = computed(() => {
+  switch (record.value?.dbKind) {
+    case 'smartp': return '仅 SmartP.db';
+    case 'teg': return '仅 teg_config.db';
+    case 'both': return '两个库';
+    default: return '';
+  }
+});
 /** Newest seq that predates a file-level revert; 0 when none happened. */
 const floor = ref(0);
 const restoreDisabled = computed(

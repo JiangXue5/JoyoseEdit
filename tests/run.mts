@@ -109,6 +109,8 @@ import {
   nextSeq,
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
+import { planRestore, digestDrift } from '../src/history/restore-plan';
+import type { ConfigSnapshot, DbDigests, HistoryFileMeta, HistoryRecord } from '../src/history/store';
 import {
   applyLockedOriginals,
   commitOutcome,
@@ -179,6 +181,7 @@ async function main() {
 
   await runHistoryStoreTest();
   await runDiffTest();
+  await runRestorePlanTest();
   await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
@@ -2611,6 +2614,241 @@ async function runShellBoundaryTest() {
     const rejected = out.split('\n').filter((l) => l.startsWith('REJECT:'));
     if (rejected.length) throw new Error('rejected valid names: ' + rejected.join(', '));
     return `${good.length} accepted`;
+  });
+}
+
+// ---- restore planning (C3 / C4) -----------------------------------------
+//
+// The rollback scenarios from the plan, exercised on the pure decision
+// function: replay itself, the file-level floor, digest drift, per-database
+// scope, marker records, and a chain that no longer matches the live snapshot.
+
+function snapOf(cc: Record<string, any>, rules: Record<string, any[]> = {}): ConfigSnapshot {
+  return { smartp: { cloud_config: cc }, teg: { rules } };
+}
+
+function metaOf(recs: HistoryRecord[]): HistoryFileMeta[] {
+  return recs
+    .slice()
+    .sort((a, b) => b.seq - a.seq)
+    .map((r) => ({ name: `${r.timestamp}-${r.seq}.json`, timestamp: r.timestamp, seq: r.seq }));
+}
+
+async function runRestorePlanTest() {
+  console.log('\n=== restore plan ===');
+
+  const s0 = snapOf({ booster_config: { fps: 60 } });
+  const s1 = snapOf({ booster_config: { fps: 90 } });
+  const s2 = snapOf({ booster_config: { fps: 120 } });
+  const r1 = buildRecord({ seq: 1, timestamp: 1, delta: diff(s0, s1) });
+  const r2 = buildRecord({ seq: 2, timestamp: 2, delta: diff(s1, s2) });
+  const fps = (s: ConfigSnapshot) => (s.smartp.cloud_config.booster_config as any).fps;
+  const same = (a: string | null, b: string | null) => ({ smartp: a, teg: b });
+
+  await check('restore: 连续提交后回到中间那条', () => {
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2]),
+      newerRecords: [r2],
+      targetRecord: r1,
+      anchorDigest: same('aa', null),
+      nowDigest: same('aa', null),
+      current: s2,
+    });
+    if (!out.ok) throw new Error('refused: ' + out.message);
+    if (fps(out.snapshot) !== 90) throw new Error('expected 90, got ' + fps(out.snapshot));
+    return 'seq 2 undone, fps=90';
+  });
+
+  await check('restore: 三条记录一次退回第一条', () => {
+    const s3 = snapOf({ booster_config: { fps: 144 } });
+    const r3 = buildRecord({ seq: 3, timestamp: 3, delta: diff(s2, s3) });
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2, r3]),
+      newerRecords: [r3, r2],
+      targetRecord: r1,
+      anchorDigest: same('aa', null),
+      nowDigest: same('aa', null),
+      current: s3,
+    });
+    if (!out.ok) throw new Error('refused: ' + out.message);
+    if (fps(out.snapshot) !== 90) throw new Error('expected 90, got ' + fps(out.snapshot));
+    return 'two deltas undone, fps=90';
+  });
+
+  await check('restore: 撤销 teg 提交时保留前一条的 SmartP 改动', () => {
+    // seq 1 edits SmartP, seq 2 edits teg. Rolling back to seq 1 must undo the
+    // teg edit and KEEP the SmartP edit from seq 1 — not rewind both.
+    const c0 = snapOf({ x: 1 }, { booster_config: [{ v: 1 }] });
+    const c1 = snapOf({ x: 2 }, { booster_config: [{ v: 1 }] });
+    const c2 = snapOf({ x: 2 }, { booster_config: [{ v: 2 }] });
+    const rc1 = buildRecord({ seq: 1, timestamp: 1, delta: diff(c0, c1) });
+    const rc2 = buildRecord({ seq: 2, timestamp: 2, delta: diff(c1, c2) });
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([rc1, rc2]),
+      newerRecords: [rc2],
+      targetRecord: rc1,
+      anchorDigest: null,
+      nowDigest: null,
+      current: c2,
+    });
+    if (!out.ok) throw new Error('refused: ' + out.message);
+    if ((out.snapshot.smartp.cloud_config as any).x !== 2) throw new Error('SmartP edit was lost');
+    if ((out.snapshot.teg.rules as any).booster_config[0].v !== 1) throw new Error('teg not undone');
+    return 'SmartP kept, teg reverted';
+  });
+
+  await check('restore: 撤销 SmartP 提交时保留前一条的 teg 改动', () => {
+    const d0 = snapOf({ y: 1 }, { booster_config: [{ v: 9 }] });
+    const d1 = snapOf({ y: 1 }, { booster_config: [{ v: 8 }] });
+    const d2 = snapOf({ y: 2 }, { booster_config: [{ v: 8 }] });
+    const rd1 = buildRecord({ seq: 1, timestamp: 1, delta: diff(d0, d1) });
+    const rd2 = buildRecord({ seq: 2, timestamp: 2, delta: diff(d1, d2) });
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([rd1, rd2]),
+      newerRecords: [rd2],
+      targetRecord: rd1,
+      anchorDigest: null,
+      nowDigest: null,
+      current: d2,
+    });
+    if (!out.ok) throw new Error('refused: ' + out.message);
+    if ((out.snapshot.teg.rules as any).booster_config[0].v !== 8) throw new Error('teg edit was lost');
+    if ((out.snapshot.smartp.cloud_config as any).y !== 1) throw new Error('SmartP not undone');
+    return 'teg kept, SmartP reverted';
+  });
+
+  await check('restore: 文件级回滚之后的旧记录被拒绝', () => {
+    const out = planRestore({
+      targetSeq: 3,
+      floor: 5,
+      meta: metaOf([r1, r2]),
+      newerRecords: [r2],
+      targetRecord: r1,
+      anchorDigest: null,
+      nowDigest: null,
+      current: s2,
+    });
+    if (out.ok) throw new Error('accepted a record below the floor');
+    if (out.code !== 'floor') throw new Error('wrong code: ' + out.code);
+    return 'floor=5 refuses seq=3';
+  });
+
+  await check('restore: 云端在提交后改过库 → 拒绝', () => {
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2]),
+      newerRecords: [r2],
+      targetRecord: r1,
+      anchorDigest: same('aa', 'bb'),
+      nowDigest: same('zz', 'bb'),
+      current: s2,
+    });
+    if (out.ok) throw new Error('replayed onto a moved base');
+    if (out.code !== 'drift') throw new Error('wrong code: ' + out.code);
+    if (!out.message.includes('SmartP.db')) throw new Error('did not name the drifted file');
+    return 'SmartP.db drift refused';
+  });
+
+  await check('restore: 只有 teg 漂移时只报 teg', () => {
+    const drift = digestDrift(same('aa', 'bb'), same('aa', 'cc'));
+    if (drift.join() !== 'teg_config.db') throw new Error('wrong drift set: ' + drift.join());
+    return 'teg only';
+  });
+
+  await check('restore: 备份锚点不是回滚目标', () => {
+    const marker = buildRecord({ seq: 9, timestamp: 9, source: 'backup', note: 'b1', delta: [] });
+    if (marker.canRevert !== false) throw new Error('marker is marked revertible');
+    const out = planRestore({
+      targetSeq: 9,
+      floor: 0,
+      meta: metaOf([marker]),
+      newerRecords: [],
+      targetRecord: marker,
+      anchorDigest: null,
+      nowDigest: null,
+      current: s0,
+    });
+    if (out.ok) throw new Error('accepted an empty marker');
+    if (out.code !== 'no-delta') throw new Error('wrong code: ' + out.code);
+    return 'marker refused';
+  });
+
+  await check('restore: 路径在当前快照里不存在时整体拒绝', () => {
+    // seq 2's delta points into `gone`, a row that was removed afterwards
+    // (cloud clear / manual reset). Rolling back to seq 1 must replay that
+    // delta, find no parent to land on, and stop instead of writing a partial
+    // state.
+    const target = buildRecord({ seq: 1, timestamp: 1, delta: diff(s0, s1) });
+    const bad = buildRecord({
+      seq: 2,
+      timestamp: 2,
+      delta: [{ path: ['smartp', 'cloud_config', 'gone', 'deep'], kind: 'added', after: 1 }],
+    });
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([target, bad]),
+      newerRecords: [bad],
+      targetRecord: target,
+      anchorDigest: null,
+      nowDigest: null,
+      current: snapOf({}),
+    });
+    if (out.ok) throw new Error('replayed into a missing parent');
+    if (out.code !== 'replay') throw new Error('wrong code: ' + out.code);
+    return 'missing path refused';
+  });
+
+  await check('history: 记录带 dbKind / 前后摘要 / canRevert', () => {
+    const rec = buildRecord({
+      seq: 7,
+      timestamp: 7,
+      delta: diff(s0, s1),
+      dbKind: 'both',
+      beforeDigest: same('11', '22'),
+      afterDigest: same('33', '44'),
+    });
+    const back = JSON.parse(JSON.stringify(rec)) as HistoryRecord;
+    if (back.dbKind !== 'both') throw new Error('dbKind lost');
+    if (back.beforeDigest?.smartp !== '11' || back.afterDigest?.teg !== '44') throw new Error('digest lost');
+    if (back.canRevert !== true) throw new Error('revertible record marked otherwise');
+    return 'both / 11→33 / 22→44';
+  });
+
+  await check('history: 旧记录没有新字段仍可回滚', () => {
+    // A record written before v1.2.0: no dbKind, no digests, no canRevert.
+    // Rolling back TO it must not be blocked by the missing fields.
+    const legacy: HistoryRecord = {
+      version: 2,
+      seq: 4,
+      timestamp: 4,
+      source: 'webui',
+      note: '',
+      delta: diff(s0, s1),
+    };
+    const newer = buildRecord({ seq: 5, timestamp: 5, delta: diff(s1, s2) });
+    const out = planRestore({
+      targetSeq: 4,
+      floor: 0,
+      meta: metaOf([legacy, newer]),
+      newerRecords: [newer],
+      targetRecord: legacy,
+      anchorDigest: null,
+      nowDigest: null,
+      current: s2,
+    });
+    if (!out.ok) throw new Error('legacy record refused: ' + out.message);
+    if (fps(out.snapshot) !== 90) throw new Error('expected 90, got ' + fps(out.snapshot));
+    return 'v2 record replayed onto by a newer record';
   });
 }
 
