@@ -235,6 +235,13 @@ cmd_push() {
   chown "$uid:$gid" "$tmp" 2>/dev/null || true
   chmod 660 "$tmp"
   stopped=$(_stop_pkg)
+  # A live consumer still holds the old inode and can roll a journal back over
+  # the file we are about to move in. "Could not prove it stopped" is not good
+  # enough — refuse the swap instead of gambling with the user's database.
+  if [ "$stopped" != "true" ]; then
+    rm -f "$tmp"
+    die "Joyose is still running; refusing to replace $target"
+  fi
   _drop_sidecars "$target"
   mv -f "$tmp" "$target"
   _drop_sidecars "$target"
@@ -491,6 +498,12 @@ cmd_push_from_stage() {
   # Stop the consumer before the swap, and clear sidecars that still describe
   # the file we are replacing. See the note above _stop_pkg.
   stopped=$(_stop_pkg)
+  # Same rule as cmd_push: never replace while the process is still alive.
+  # Keep the stage file on purpose so a retry does not have to upload 1 MB again.
+  if [ "$stopped" != "true" ]; then
+    rm -f "$tmp"
+    die "Joyose is still running; refusing to replace $target"
+  fi
   _drop_sidecars "$target"
   mv -f "$tmp" "$target"
   _drop_sidecars "$target"
