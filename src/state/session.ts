@@ -552,8 +552,8 @@ export async function saveJsonTarget(
   }
 
   // A direct write skips the commit bar, so take the restore point here — the
-  // user has no "discard" path for a JSON edit.
-  await bridge.backup('json-edit').catch(() => null);
+  // user has no "discard" path for a JSON edit. Refuse to write without it.
+  await ensureBackup('json-edit');
 
   if (which === 'smartp') {
     if (target === 'sp_booster') {
@@ -635,6 +635,22 @@ export interface PushOptions {
   force?: boolean;
 }
 
+/** Take the pre-write restore point and treat its failure as fatal.
+ *
+ *  Both write paths used to swallow this error: the user saw a normal commit
+ *  while the operation had no restore point at all. The commit chain is the
+ *  only way back, so a missing backup means the write must not start. */
+async function ensureBackup(label?: string): Promise<void> {
+  try {
+    const res = await bridge.backup(label);
+    if (!res?.ok || !res.dir) {
+      throw new Error('备份命令没有返回备份目录');
+    }
+  } catch (err: any) {
+    throw new Error(`自动备份失败，已中止写入：${err?.message ?? String(err)}`);
+  }
+}
+
 /** Re-read the DB digests and store them as the conflict-detection baseline. */export async function refreshBaseline(): Promise<void> {
   try {
     const d = await bridge.digest();
@@ -698,8 +714,9 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       }
     }
 
-    // auto-backup
-    await bridge.backup().catch(() => null);
+    // auto-backup — abort when it does not land. A commit whose restore point
+    // silently failed is exactly the commit the user cannot walk back later.
+    await ensureBackup();
 
     // re-pull current bytes, mutate, write back
     const [smartpBytes, tegBytes] = await Promise.all([
