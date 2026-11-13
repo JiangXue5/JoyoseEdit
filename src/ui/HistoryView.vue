@@ -80,7 +80,6 @@ import {
   readHistory,
   restoreToRecord,
   markDirty,
-  pullAll,
   revertToBackup,
 } from '@/state/session';
 import * as bridge from '@/root/bridge';
@@ -175,11 +174,10 @@ async function revertFromBackup() {
     const reverted = await revertToBackup(backupName);
     // The rollback itself succeeded; a failed refresh only means the page is
     // still showing pre-rollback values. Say that instead of "回滚失败".
-    const pulled = await pullAll();
-    if (reverted.wasRunning && reverted.restarted === false) {
+    if (reverted.result.joyoseWasRunning === true && reverted.result.joyoseRestarted === false) {
       toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', backupName);
-    } else if (!pulled.ok) {
-      toast.warn('已回滚，但界面刷新失败', `${pulled.error} · 请手动刷新`); 
+    } else if (reverted.refreshError) {
+      toast.warn('已回滚，但界面刷新失败', `${reverted.refreshError} · 请手动刷新`);
     } else {
       toast.success('已回滚到备份', backupName);
     }

@@ -110,6 +110,7 @@ import {
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
 import { planRestore, digestDrift } from '../src/history/restore-plan';
+import { makeResult, commitCode, defaultMessage } from '../src/state/result';
 import type { ConfigSnapshot, DbDigests, HistoryFileMeta, HistoryRecord } from '../src/history/store';
 import {
   applyLockedOriginals,
@@ -182,6 +183,7 @@ async function main() {
   await runHistoryStoreTest();
   await runDiffTest();
   await runRestorePlanTest();
+  await runOperationResultTest();
   await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
@@ -2849,6 +2851,83 @@ async function runRestorePlanTest() {
     if (!out.ok) throw new Error('legacy record refused: ' + out.message);
     if (fps(out.snapshot) !== 90) throw new Error('expected 90, got ' + fps(out.snapshot));
     return 'v2 record replayed onto by a newer record';
+  });
+}
+
+// ---- unified operation result (F3) --------------------------------------
+//
+// Every mutating action now returns one shape. The interesting part is the
+// ordering of the commit codes: two things can go wrong at once, and the
+// user must be told the one they can act on.
+
+async function runOperationResultTest() {
+  console.log('\n=== operation result ===');
+
+  const base = {
+    stopConfirmed: true,
+    restartAttempted: true,
+    startedAfter: true,
+    rebased: false,
+  };
+
+  await check('result: 提交成功走 written', () => {
+    if (commitCode(base) !== 'written') throw new Error('not written: ' + commitCode(base));
+    return 'written';
+  });
+
+  await check('result: 合并过云端更新时先说 rebased', () => {
+    if (commitCode({ ...base, rebased: true }) !== 'written-rebased') throw new Error('rebased lost');
+    return 'written-rebased';
+  });
+
+  await check('result: Joyose 没停住时优先报 stop-failed', () => {
+    const code = commitCode({ ...base, stopConfirmed: false });
+    if (code !== 'written-stop-failed') throw new Error('got ' + code);
+    // Rebased is a lesser fact: it must not mask a Joyose still holding the
+    // old config.
+    const both = commitCode({ ...base, stopConfirmed: false, rebased: true });
+    if (both !== 'written-stop-failed') throw new Error('rebased masked stop failure: ' + both);
+    return 'stop-failed wins over rebased';
+  });
+
+  await check('result: 重启失败/历史失败优先于其它一切', () => {
+    if (commitCode({ ...base, restartError: 'x' }) !== 'written-restart-failed') throw new Error('restart');
+    if (commitCode({ ...base, historyError: 'y' }) !== 'written-no-history') throw new Error('history');
+    const both = commitCode({ ...base, historyError: 'y', restartError: 'x' });
+    if (both !== 'written-no-history') throw new Error('history must outrank restart: ' + both);
+    return 'no-history > restart-failed > stop-failed';
+  });
+
+  await check('result: 重启未确认与已停住分开表示', () => {
+    if (commitCode({ ...base, startedAfter: false }) !== 'written-stopped') throw new Error('stopped');
+    if (commitCode({ ...base, startedAfter: null }) !== 'written-reload-unconfirmed') throw new Error('unconfirmed');
+    // No restart attempted: do not claim it is stopped either.
+    if (commitCode({ ...base, restartAttempted: false, startedAfter: null }) !== 'written') throw new Error('no-restart');
+    return 'stopped / unconfirmed / plain';
+  });
+
+  await check('result: 默认字段不撒谎', () => {
+    const r = makeResult({ code: 'backed-up' });
+    if (!r.ok) throw new Error('backup not ok');
+    if (r.databaseChanged) throw new Error('backup claimed a DB change');
+    if (r.joyoseStopped !== null) throw new Error('backup invented a process state');
+    if (r.joyoseRestarted !== null) throw new Error('backup invented a restart');
+    if (!r.message) throw new Error('empty message');
+    return 'nulls, not false';
+  });
+
+  await check('result: 只有 failed 不是 ok', () => {
+    const codes = [
+      'written', 'written-rebased', 'written-reload-unconfirmed', 'written-stop-failed',
+      'written-restart-failed', 'written-stopped', 'written-no-history', 'no-change',
+      'out-of-scope', 'backed-up', 'reverted', 'reset', 'frozen', 'unfrozen',
+    ] as const;
+    for (const c of codes) {
+      if (!makeResult({ code: c }).ok) throw new Error(c + ' should be ok');
+      if (!defaultMessage(c)) throw new Error(c + ' has no message');
+    }
+    if (makeResult({ code: 'failed' }).ok) throw new Error('failed should not be ok');
+    return '14 codes ok, failed is not';
   });
 }
 

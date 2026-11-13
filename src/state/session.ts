@@ -56,6 +56,7 @@ import {
 } from '@/history/store';
 import { diff, applyDelta } from '@/history/diff';
 import { planRestore } from '@/history/restore-plan';
+import { makeResult, commitCode, type OperationResult } from '@/state/result';
 import { refreshEnvelope } from '@/history/envelope';
 import {
   pickBoosterParams,
@@ -787,6 +788,9 @@ export interface CommitResult {
   historyError?: string;
   /** The DB write succeeded but the restart call failed. */
   restartError?: string;
+  /** The same outcome in the shape every mutating operation returns. Views
+   *  branch on `result.code`; the fields above stay for the details. */
+  result: OperationResult;
 }
 
 /** Commit the in-memory edits: build history record, write both DBs, save
@@ -852,6 +856,7 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
         reason: 'no-change',
         wroteSmartp: false,
         wroteTeg: false,
+        result: makeResult({ code: 'no-change', databaseChanged: false }),
       };
     }
 
@@ -905,7 +910,14 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // allowed to write (e.g. the user edited a teg-only config while the write
     // target is SmartP-only). Say so instead of reporting a successful write.
     if (commitOutcome(delta.length, wroteSmartp, wroteTeg) === 'out-of-scope') {
-      return { file: null, changed: false, reason: 'out-of-scope', wroteSmartp, wroteTeg };
+      return {
+        file: null,
+        changed: false,
+        reason: 'out-of-scope',
+        wroteSmartp,
+        wroteTeg,
+        result: makeResult({ code: 'out-of-scope', databaseChanged: false }),
+      };
     }
 
     // auto-backup — abort when it does not land. A commit whose restore point
@@ -1001,6 +1013,7 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     state.dirty = false;
     await refreshStat();
     await refreshBaseline();
+    const stopConfirmed = stops.length > 0 ? stops.every(Boolean) : null;
     return {
       file: fname,
       changed: true,
@@ -1009,6 +1022,22 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
       wroteTeg,
       historyError,
       restartError,
+      result: makeResult({
+        code: commitCode({
+          historyError,
+          restartError,
+          stopConfirmed,
+          restartAttempted: true,
+          startedAfter: restarted?.started ?? null,
+          rebased: state.rebasedAt !== null,
+        }),
+        databaseChanged: wroteSmartp || wroteTeg,
+        // A commit always takes its restore point before writing.
+        backupCreated: true,
+        joyoseStopped: stopConfirmed,
+        joyoseWasRunning: wasRunning.length > 0 ? wasRunning.some(Boolean) : null,
+        joyoseRestarted: restarted?.started ?? null,
+      }),
     };
   } catch (err) {
     // ConflictError bubbles to pushAll, which rebases and retries; anything
@@ -1156,12 +1185,37 @@ export async function pushAll(opts: PushOptions = {}): Promise<CommitResult> {
 
 /* Locked wrappers for the operations the views used to call bridge directly.
  * Keeping them here means a page cannot bypass the lock by importing the
- * bridge, and every mutating entry point has exactly one implementation. */
-export async function backupNow(label?: string) {
-  return withWriteLock('备份', () => bridge.backup(label));
+ * bridge, and every mutating entry point has exactly one implementation.
+ *
+ * Each returns the bridge's own fields plus `result`, so a view can branch on
+ * one code instead of re-deriving the outcome from a different set of
+ * booleans per action. */
+export type WithResult<T> = T & {
+  result: OperationResult;
+  /** Set when the state after the operation could not be re-read. The
+   *  operation itself succeeded — this only means the page may be stale. */
+  refreshError?: string;
+};
+
+export async function backupNow(label?: string): Promise<WithResult<bridge.BackupResult>> {
+  return withWriteLock('备份', async () => {
+    const r = await bridge.backup(label);
+    return {
+      ...r,
+      result: makeResult({
+        code: 'backed-up',
+        // A backup does not move the databases; it copies them.
+        databaseChanged: false,
+        backupCreated: true,
+        joyoseStopped: r.stopped ?? null,
+        joyoseWasRunning: r.wasRunning ?? null,
+        joyoseRestarted: r.restarted ?? null,
+      }),
+    };
+  });
 }
 
-export async function revertToBackup(name: string) {
+export async function revertToBackup(name: string): Promise<WithResult<bridge.RevertResult>> {
   return withWriteLock('回滚', async () => {
     const r = await bridge.revert(name);
     // A file-level revert replaces the databases behind the delta chain's
@@ -1169,22 +1223,42 @@ export async function revertToBackup(name: string) {
     // next commit diff against bytes that no longer exist. Then record the
     // floor, so a record from before this point is refused instead of being
     // replayed onto a base it never saw.
-    await pullAll();
+    const pulled = await pullAll();
     await markHistoryFloor();
-    return r;
+    return {
+      ...r,
+      refreshError: pulled.ok ? undefined : (pulled.error ?? '刷新失败'),
+      result: makeResult({
+        code: 'reverted',
+        databaseChanged: true,
+        joyoseStopped: r.stopped ?? null,
+        joyoseWasRunning: r.wasRunning ?? null,
+        joyoseRestarted: r.restarted ?? null,
+      }),
+    };
   });
 }
 
-export async function revertLatestBackup() {
+export async function revertLatestBackup(): Promise<WithResult<bridge.RevertResult>> {
   return withWriteLock('回滚', async () => {
     const r = await bridge.revertLatest();
-    await pullAll();
+    const pulled = await pullAll();
     await markHistoryFloor();
-    return r;
+    return {
+      ...r,
+      refreshError: pulled.ok ? undefined : (pulled.error ?? '刷新失败'),
+      result: makeResult({
+        code: 'reverted',
+        databaseChanged: true,
+        joyoseStopped: r.stopped ?? null,
+        joyoseWasRunning: r.wasRunning ?? null,
+        joyoseRestarted: r.restarted ?? null,
+      }),
+    };
   });
 }
 
-export async function resetCloudData(): Promise<bridge.ResetCloudResult> {
+export async function resetCloudData(): Promise<WithResult<bridge.ResetCloudResult>> {
   return withWriteLock('重置云控', async () => {
     const r = await bridge.resetCloud();
     // Only a failed `pm clear` means nothing happened. The broadcasts are
@@ -1193,16 +1267,44 @@ export async function resetCloudData(): Promise<bridge.ResetCloudResult> {
     if (!r.cleared) {
       throw new Error(`云控数据没有被清除：${r.failed.join('、') || '未知原因'}`);
     }
-    return r;
+    return {
+      ...r,
+      result: makeResult({ code: 'reset', databaseChanged: true }),
+    };
   });
 }
 
-export async function freezeTeg() {
-  return withWriteLock('冻结云控', () => bridge.tegFreeze());
+export async function freezeTeg(): Promise<WithResult<bridge.TegRewriteResult>> {
+  return withWriteLock('冻结云控', async () => {
+    const r = await bridge.tegFreeze();
+    return {
+      ...r,
+      result: makeResult({
+        code: 'frozen',
+        // This writes SharedPreferences, not either database.
+        databaseChanged: false,
+        joyoseStopped: r.stopped ?? null,
+        joyoseWasRunning: r.wasRunning ?? null,
+        joyoseRestarted: r.restarted ?? null,
+      }),
+    };
+  });
 }
 
-export async function unfreezeTeg() {
-  return withWriteLock('解冻云控', () => bridge.tegUnfreeze());
+export async function unfreezeTeg(): Promise<WithResult<bridge.TegRewriteResult>> {
+  return withWriteLock('解冻云控', async () => {
+    const r = await bridge.tegUnfreeze();
+    return {
+      ...r,
+      result: makeResult({
+        code: 'unfrozen',
+        databaseChanged: false,
+        joyoseStopped: r.stopped ?? null,
+        joyoseWasRunning: r.wasRunning ?? null,
+        joyoseRestarted: r.restarted ?? null,
+      }),
+    };
+  });
 }
 
 /** Digest of the databases as the newest recorded commit left them.

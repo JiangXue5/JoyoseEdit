@@ -338,56 +338,59 @@ async function handlePush() {
   if (note === null) return;
   try {
     const res = await pushAll({ note });
-    if (res.reason === 'no-change') {
-      toast.info('没有改动', '工作区与设备上的配置一致，未写入数据库、未写历史、未重启 Joyose');
-      return;
-    }
-    if (res.reason === 'out-of-scope') {
-      toast.warn(
-        '改动没有被写入',
-        '被修改的配置不在当前「写入目标」范围内，请到概览页调整后重新提交',
-      );
-      return;
-    }
-    if (res.historyError) {
-      toast.warn(
-        '已写入设备，但历史记录没有保存',
-        `${res.historyError} · 配置已经生效，只是这次提交不在历史里`,
-      );
-      return;
-    }
-    if (res.restartError) {
-      toast.warn(
-        '已写入设备，但 Joyose 重启失败',
-        `${res.restartError} · 请手动重启 Joyose 或手机后再进游戏`,
-      );
-      return;
-    }
+    // One code, one branch. The booleans behind it (stop confirmed, restart
+    // observed) are still reported separately for the lines that need them,
+    // but the decision of *which* message to show no longer depends on the
+    // order in which those booleans happen to be checked here.
     const name = res.file ?? '';
-    const rebased = state.rebasedAt !== null;
-    const applied = state.applyStatus;
-    if (applied?.stopConfirmed === false) {
-      toast.warn(
-        '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
-        name,
-      );
-    } else if (rebased) {
-      toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
-    } else if (applied?.startedAfter === true) {
-      // Restarting Joyose right after the write means it has already read the
-      // new rows; without this the first game launch raced the cold start and
-      // the edit only showed up on the second one.
-      toast.success('已提交，Joyose 已重新加载配置', `${name} · 直接进游戏即可，不需要再开一遍`);
-    } else if (applied?.restartAttempted && applied.startedAfter === false) {
-      toast.info('已提交', `${name} · Joyose 已停止，下次启动游戏时会读取新配置`);
-    } else if (applied?.restartAttempted) {
-      // We asked it to start but could not confirm it is up.
-      toast.warn(
-        '已提交，但没能确认 Joyose 已重新启动',
-        `${name} · 进游戏前若配置没生效，请手动重启 Joyose`,
-      );
-    } else {
-      toast.success('已提交并写入历史', name);
+    switch (res.result.code) {
+      case 'no-change':
+        toast.info('没有改动', '工作区与设备上的配置一致，未写入数据库、未写历史、未重启 Joyose');
+        return;
+      case 'out-of-scope':
+        toast.warn(
+          '改动没有被写入',
+          '被修改的配置不在当前「写入目标」范围内，请到概览页调整后重新提交',
+        );
+        return;
+      case 'written-no-history':
+        toast.warn(
+          '已写入设备，但历史记录没有保存',
+          `${res.historyError} · 配置已经生效，只是这次提交不在历史里`,
+        );
+        return;
+      case 'written-restart-failed':
+        toast.warn(
+          '已写入设备，但 Joyose 重启失败',
+          `${res.restartError} · 请手动重启 Joyose 或手机后再进游戏`,
+        );
+        return;
+      case 'written-stop-failed':
+        toast.warn(
+          '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
+          name,
+        );
+        return;
+      case 'written-rebased':
+        toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
+        return;
+      case 'written':
+        // Restarting Joyose right after the write means it has already read the
+        // new rows; without this the first game launch raced the cold start and
+        // the edit only showed up on the second one.
+        toast.success('已提交，Joyose 已重新加载配置', `${name} · 直接进游戏即可，不需要再开一遍`);
+        return;
+      case 'written-stopped':
+        toast.info('已提交', `${name} · Joyose 已停止，下次启动游戏时会读取新配置`);
+        return;
+      case 'written-reload-unconfirmed':
+        toast.warn(
+          '已提交，但没能确认 Joyose 已重新启动',
+          `${name} · 进游戏前若配置没生效，请手动重启 Joyose`,
+        );
+        return;
+      default:
+        toast.success('已提交并写入历史', name);
     }
   } catch (err) {
     toast.fromError(err, '提交失败');

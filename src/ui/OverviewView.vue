@@ -583,7 +583,7 @@ async function handleBackup() {
     const r = await backupNow();
     await recordBackupCheckpoint(r.name).catch(() => null);
     await refreshStat();
-    if (r.wasRunning && r.restarted === false) {
+    if (r.result.joyoseWasRunning === true && r.result.joyoseRestarted === false) {
       toast.warn('已备份，但 Joyose 未能重新启动', `${r.name} · 进游戏前请手动打开一次 Joyose`);
     } else {
       toast.success('已备份', r.name);
@@ -602,11 +602,10 @@ async function handleRevertLatest() {
   if (!ok) return;
   try {
     const r = await revertLatestBackup();
-    const pulled = await pullAll();
-    if (r.wasRunning && r.restarted === false) {
+    if (r.result.joyoseWasRunning === true && r.result.joyoseRestarted === false) {
       toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', r.from);
-    } else if (!pulled.ok) {
-      toast.warn('已回滚，但界面刷新失败', `${pulled.error} · 请手动刷新`);
+    } else if (r.refreshError) {
+      toast.warn('已回滚，但界面刷新失败', `${r.refreshError} · 请手动刷新`);
     } else {
       toast.success('已回滚到备份', r.from);
     }
