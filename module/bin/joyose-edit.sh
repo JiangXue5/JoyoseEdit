@@ -80,6 +80,10 @@ _json_string() {
 # subcommand takes this lock; the second one waits or fails with the owner.
 LOCK_DIR="$DATA_ROOT/lock"
 LOCK_TTL=180
+# How many 200 ms ticks a second writer waits before giving up (~20 s). Only a
+# value from the environment changes it; tests use a small one so a contended
+# lock fails in under a second instead of stalling the suite.
+LOCK_WAIT_TICKS=${LOCK_WAIT_TICKS:-100}
 # Filled by _acquire_lock, checked by _release_lock. Guards against removing a
 # lock that a *different* process created with our pid number after we died.
 MY_LOCK_TOKEN=''
@@ -137,7 +141,7 @@ _acquire_lock() {
       continue
     fi
     i=$((i + 1))
-    if [ "$i" -ge 100 ]; then
+    if [ "$i" -ge "$LOCK_WAIT_TICKS" ]; then
       die "device is busy: another write is still running (pid $(awk '{print $1}' "$LOCK_DIR/owner" 2>/dev/null) · $(awk '{print $5}' "$LOCK_DIR/owner" 2>/dev/null))"
     fi
     sleep 0.2 2>/dev/null || sleep 1
@@ -341,7 +345,7 @@ _verify_db() {
 # fails. Nothing here may delete the only good copy.
 _install_db() {
   local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
-  local uid gid stopped chk size sha rollback cur was_running=false rb_mode='size' src_sha dst_sha
+  local uid gid stopped chk size sha rollback cur now_sha was_running=false rb_mode='size' src_sha dst_sha
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
 
@@ -422,7 +426,15 @@ _install_db() {
   # 4. atomic swap
   _drop_sidecars "$target"
   if ! mv -f "$tmp" "$target" 2>/dev/null; then
-    mv -f "$rollback" "$target" 2>/dev/null || true
+    # Did the live file actually move? If its bytes are still the ones we
+    # copied, the swap never happened and the rollback copy is just clutter —
+    # leaving it behind would accumulate one per failed write.
+    now_sha=$(_sha256_file "$target")
+    if [ -n "$src_sha" ] && [ "$now_sha" = "$src_sha" ]; then
+      rm -f "$tmp" "$rollback"
+    else
+      mv -f "$rollback" "$target" 2>/dev/null || true
+    fi
     _abort_after_stop "$was_running" "cannot replace $target; original kept"
   fi
   _drop_sidecars "$target"

@@ -10,13 +10,14 @@
 //      confirm the edits stuck.
 //   5. Exercise history store + diff against a filesystem driver.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import initSqlJs from 'sql.js';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import { parseFrc, serializeFrc, blankFrc, validateFrc } from '../src/parsers/frc-string';
 import {
@@ -184,6 +185,7 @@ async function main() {
   await runDiffTest();
   await runRestorePlanTest();
   await runOperationResultTest();
+  await runHelperFailureTest();
   await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
@@ -2928,6 +2930,295 @@ async function runOperationResultTest() {
     }
     if (makeResult({ code: 'failed' }).ok) throw new Error('failed should not be ok');
     return '14 codes ok, failed is not';
+  });
+}
+
+// ---- helper failure injection (G2) --------------------------------------
+//
+// The helper's failure paths — stop refused, backup failed, candidate corrupt,
+// swap failed, disk full — used to be reachable only on a phone with a broken
+// ROM. They run here against the real script: the dispatch block is cut off,
+// the paths point at a temp dir, and fake pidof/am/cp/mv stand in for Android's.
+// Every case asserts the live database is byte-identical afterwards, because
+// "it printed an error" is not the property we care about.
+
+interface HelperHarness {
+  dir: string;
+  dbDir: string;
+  dataDir: string;
+  fake: string;
+  bin: string;
+}
+
+function touchState(h: HelperHarness, name: string) {
+  writeFileSync(path.join(h.fake, name), '');
+}
+
+function shaOf(file: string): string {
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+function writeFakeTools(bin: string, fake: string) {
+  const tools: Record<string, string> = {
+    // exit 0 while $FAKE/alive exists — "the process is running".
+    pidof: `#!/bin/sh\n[ -f "$FAKE/alive" ] && { echo 4242; exit 0; }\nexit 1\n`,
+    am: `#!/bin/sh
+echo "am $*" >> "$FAKE/am.log"
+case "$1" in
+  force-stop)
+    [ -f "$FAKE/stop-fails" ] && exit 0
+    rm -f "$FAKE/alive"; exit 0 ;;
+  start)
+    [ -f "$FAKE/start-fails" ] && exit 1
+    : > "$FAKE/alive"; exit 0 ;;
+esac
+exit 0
+`,
+    cp: `#!/bin/sh
+if [ -f "$FAKE/cp-fails" ]; then printf 'cp: write error: No space left on device\\n' >&2; exit 1; fi
+exec /usr/bin/cp "$@"
+`,
+    mv: `#!/bin/sh
+if [ -f "$FAKE/mv-fails" ]; then
+  for last; do :; done
+  case "$last" in
+    *SmartP.db|*teg_config.db) printf 'mv: cannot replace %s\\n' "$last" >&2; exit 1 ;;
+  esac
+fi
+exec /usr/bin/mv "$@"
+`,
+  };
+  for (const [name, body] of Object.entries(tools)) {
+    const f = path.join(bin, name);
+    writeFileSync(f, body);
+    chmodSync(f, 0o755);
+  }
+  writeFileSync(path.join(bin, '.fake-dir'), fake);
+}
+
+function newHarness(opts: { sqlite3?: 'corrupt' } = {}): HelperHarness {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'joyose-helper-'));
+  const dbDir = path.join(dir, 'db');
+  const dataDir = path.join(dir, 'data');
+  const fake = path.join(dir, 'state');
+  const bin = path.join(dir, 'bin');
+  for (const d of [dbDir, dataDir, fake, bin]) mkdirSync(d, { recursive: true });
+  // Two different, both valid sample databases: "same bytes" and "different
+  // bytes" have to be distinguishable for the assertions below.
+  writeFileSync(path.join(dbDir, 'SmartP.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 15/SmartP.db')));
+  writeFileSync(path.join(dbDir, 'new.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')));
+  writeFakeTools(bin, fake);
+  if (opts.sqlite3 === 'corrupt') {
+    // A ROM that has sqlite3, and a file whose PRAGMA quick_check fails even
+    // though the 16-byte header is intact.
+    const f = path.join(bin, 'sqlite3');
+    writeFileSync(f, '#!/bin/sh\nprintf "corruption\\n"\n');
+    chmodSync(f, 0o755);
+  }
+  return { dir, dbDir, dataDir, fake, bin };
+}
+
+function harnessScript(h: HelperHarness, driver: string): string {
+  const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8');
+  const cut = src.indexOf('# ---- dispatch');
+  if (cut < 0) throw new Error('# ---- dispatch not found in helper');
+  const body = src
+    .slice(0, cut)
+    .replace(/^DATA_ROOT=.*$/m, `DATA_ROOT=${h.dataDir}`)
+    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`);
+  return [
+    '#!/bin/sh',
+    body,
+    `DB=${h.dbDir}`,
+    `export PATH="${h.bin}:$PATH"`,
+    `export FAKE="${h.fake}"`,
+    'set +e',
+    driver,
+  ].join('\n');
+}
+
+function runHarness(h: HelperHarness, driver: string, env: Record<string, string> = {}) {
+  const file = path.join(h.dir, `run-${Math.random().toString(36).slice(2)}.sh`);
+  writeFileSync(file, harnessScript(h, driver));
+  const r = spawnSync('sh', [file], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: { ...process.env, ...env, FAKE: h.fake },
+  });
+  return { code: r.status ?? -1, out: r.stdout ?? '', err: r.stderr ?? '' };
+}
+
+function cleanupHarness(h: HelperHarness) {
+  try {
+    rmSync(h.dir, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+function jettison(h: HelperHarness): string[] {
+  return readdirSync(h.dbDir).filter((f) => f.includes('.jedit.'));
+}
+
+async function runHelperFailureTest() {
+  console.log('\n=== helper failure injection ===');
+  if (!shHasTools()) {
+    await check('helper: 故障注入跳过（本机没有 sh）', () => 'skipped');
+    return;
+  }
+
+  // Push `new.db` over `SmartP.db`, report the helper's exit code.
+  const push = `B64=$(base64 -w0 "$DB/new.db")
+( cmd_push smartp "$B64" "$(stat -c %s "$DB/new.db")" "" )
+echo "EXIT=$?"`;
+
+  await check('helper: Joyose 停不下来时拒绝替换数据库', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    touchState(h, 'alive');
+    touchState(h, 'stop-fails');
+    const r = runHarness(h, push);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    const left = jettison(h);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('push did not fail: ' + r.out);
+    if (!same) throw new Error('database changed despite a failed stop');
+    if (!/still running/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    if (left.length) throw new Error('left temp files: ' + left.join(','));
+    return 'refused, db untouched';
+  });
+
+  await check('helper: 备份失败时数据库不变且目录不残留', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    touchState(h, 'alive');
+    touchState(h, 'cp-fails');
+    const r = runHarness(h, `( cmd_backup test )\necho "EXIT=$?"`);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    const backups = readdirSync(path.join(h.dataDir, 'backup'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('backup did not fail');
+    if (!same) throw new Error('database changed');
+    if (backups.length) throw new Error('partial backup left behind: ' + backups.join(','));
+    if (!/disk full/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'no partial dir, db untouched';
+  });
+
+  await check('helper: 截断的候选库被拒（头正确不足以为证）', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    const r = runHarness(h, `head -c 4096 "$DB/new.db" > "$DB/trunc.db"
+B64=$(base64 -w0 "$DB/trunc.db")
+( cmd_push smartp "$B64" "$(stat -c %s "$DB/trunc.db")" "" )
+echo "EXIT=$?"`);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('truncated db accepted');
+    if (!same) throw new Error('database replaced by a truncated file');
+    if (!/integrity/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'rejected before the swap';
+  });
+
+  await check('helper: quick_check 报损坏时拒绝写入', () => {
+    const h = newHarness({ sqlite3: 'corrupt' });
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    const r = runHarness(h, push);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('corrupt db accepted');
+    if (!same) throw new Error('database replaced');
+    return 'sqlite3 says corruption -> refused';
+  });
+
+  await check('helper: 没有 sqlite3 时好库仍然可写（geometry 校验）', () => {
+    const h = newHarness();
+    const expected = shaOf(path.join(h.dbDir, 'new.db'));
+    const r = runHarness(h, push);
+    const after = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write refused: ' + r.err.slice(0, 200));
+    if (!r.out.includes('"verified":"geometry"')) throw new Error('did not report the fallback');
+    if (after !== expected) throw new Error('bytes on disk are not the ones we sent');
+    return 'geometry fallback, exact bytes';
+  });
+  await check('helper: 替换失败时原库保持且不留副本', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    touchState(h, 'mv-fails');
+    const r = runHarness(h, push);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    const left = jettison(h);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('swap "succeeded"');
+    if (!same) throw new Error('database changed');
+    if (left.length) throw new Error('redundant rollback copy left: ' + left.join(','));
+    if (!/cannot replace/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'original kept, no leftovers';
+  });
+
+  await check('helper: 磁盘满（回滚副本创建失败）时中止并恢复进程', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    touchState(h, 'alive');
+    touchState(h, 'cp-fails');
+    const r = runHarness(h, push);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    const log = readFileSync(path.join(h.fake, 'am.log'), 'utf8');
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('write continued without a restore point');
+    if (!same) throw new Error('database changed');
+    if (!/rollback copy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    if (!/start /.test(log)) throw new Error('Joyose was not restarted after the abort');
+    return 'aborted, process restored';
+  });
+
+  await check('helper: 临时文件写入失败（坏 base64）不碰数据库', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    const r = runHarness(h, `( cmd_push smartp "!!!not-base64!!!" "" )\necho "EXIT=$?"`);
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('bad payload accepted');
+    if (!same) throw new Error('database changed');
+    return 'decode failure, db untouched';
+  });
+
+  await check('helper: 重启失败单独报告，不冒充写入失败', () => {
+    const h = newHarness();
+    touchState(h, 'alive');
+    touchState(h, 'start-fails');
+    const r = runHarness(h, `${push}
+( cmd_restart )
+echo "RESTART=$?"`);
+    const after = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    const expected = shaOf(path.join(h.dbDir, 'new.db'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write itself failed: ' + r.err.slice(0, 200));
+    if (after !== expected) throw new Error('bytes were not written');
+    if (!/"started":false/.test(r.out)) throw new Error('restart failure not reported: ' + r.out.slice(-200));
+    return 'write ok, started=false';
+  });
+
+  await check('helper: 并发写入被设备锁挡住', () => {
+    const h = newHarness();
+    const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
+    // The harness calls cmd_push directly, so the lock has to be asked for
+    // explicitly — the dispatch block that normally does it is cut off.
+    const r = runHarness(
+      h,
+      `mkdir -p "$LOCK_DIR"
+printf '%s %s %s %s %s\\n' "$$" "$(date +%s)" "$(_proc_start "$$")" "held" "push" > "$LOCK_DIR/owner"
+( _acquire_lock push && echo "GOT_LOCK" )
+echo "EXIT=$?"`,
+      { LOCK_WAIT_TICKS: '3' },
+    );
+    const same = shaOf(path.join(h.dbDir, 'SmartP.db')) === before;
+    cleanupHarness(h);
+    if (r.out.includes('GOT_LOCK')) throw new Error('second writer entered the critical section');
+    if (!r.out.includes('EXIT=1')) throw new Error('acquire did not fail: ' + r.out);
+    if (!same) throw new Error('database changed under a held lock');
+    if (!/device is busy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'refused in ~0.6 s';
   });
 }
 
