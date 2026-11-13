@@ -110,7 +110,17 @@
               <dt>历史版本</dt>
               <dd class="faint">{{ ruleHistory(row.name) }}</dd>
             </div>
+            <div class="cfg-source">
+              <dt>写入目标</dt>
+              <dd>
+                <span class="cfg-tag write">{{ writeTargetShort }}</span>
+                <span class="tiny faint">{{ writeTargetNote(row.name) }}</span>
+              </dd>
+            </div>
           </dl>
+          <div v-if="sourceConflict(row.name)" class="cfg-conflict">
+            {{ sourceConflict(row.name) }}
+          </div>
         </div>
         <div v-if="Object.keys(state.cloudConfig).length === 0" class="hint" style="padding: 8px 0">
           两个数据库里都没有 cloud_config 行。先在 Joyose 里联网下发一次云控，或到「参数树」写入。
@@ -331,6 +341,57 @@ function isActiveSource(source: unknown, side: 'smartp' | 'teg'): boolean {
 function currentLabel(cfg: any): string {
   if (cfg.meta?.empty) return '（空）';
   return fmtVersion(cfg.meta?.version);
+}
+
+/** What this row will be written to when the user commits. Shown per config
+ *  because "读取来源" and "写入目标" are two different settings, and a silent
+ *  mismatch is exactly how an edit ends up nowhere. */
+const writeTargetShort = computed(() => {
+  switch (writeTarget.value) {
+    case 'smartp':
+      return '仅 SmartP';
+    case 'teg':
+      return '仅 teg';
+    default:
+      return '两份都写';
+  }
+});
+
+function writeTargetNote(name: string): string {
+  if (writeTarget.value === 'both') return '提交后同时更新';
+  if (writeTarget.value === 'smartp') return smartpHas(name) ? '提交后更新' : 'SmartP 里没有这一行';
+  return tegHas(name) ? '提交后更新' : 'teg 里没有这一行';
+}
+
+/** The read source and the write target disagree.
+ *
+ *  The commit path only writes a row that actually exists in the target DB and
+ *  never copies a teg-sourced working copy into SmartP wholesale, so some
+ *  combinations drop the user's edit. Say so here instead of letting the user
+ *  find out after a "提交成功" toast. */
+function sourceConflict(name: string): string {
+  const meta = state.cloudConfig[name]?.meta as any;
+  if (!meta || meta.empty) return '';
+  const fromTeg = meta.fromTeg === true || meta.source === 'teg';
+  const fromSmartp = meta.source === 'smartp';
+
+  if (fromTeg && writeTarget.value === 'smartp') {
+    return '读取自 teg，写入目标只有 SmartP：这份配置提交后不会落盘（teg 内容不会整份写进 SmartP）。'
+      + '请把写入目标改成「两份都写」或「仅 teg」，或先在 Joyose 里让 SmartP 下发这一行。';
+  }
+  if (fromTeg && writeTarget.value === 'both') {
+    return '读取自 teg：提交时只会写 teg 镜像，SmartP 里这一行保持原样（避免把 teg 独有字段带过去）。';
+  }
+  if (fromSmartp && writeTarget.value === 'teg') {
+    return '读取自 SmartP，写入目标只有 teg：SmartP 里的这份不会被更新，Joyose 实际读到的可能仍是旧内容。';
+  }
+  if (writeTarget.value === 'smartp' && !smartpHas(name)) {
+    return '写入目标是 SmartP，但 SmartP 里没有这一行，提交会被跳过。';
+  }
+  if (writeTarget.value === 'teg' && !tegHas(name)) {
+    return '写入目标是 teg，但 teg 里没有这一行，提交会被跳过。';
+  }
+  return '';
 }
 
 /** 云控 JSON 的键序由后端拼装顺序决定，不能拿它当展示顺序。
