@@ -19,6 +19,7 @@ import {
   updateCloudConfigParams,
   updateRuleContentById,
 } from '@/db/dbio';
+import { mergeOntoRaw, pickSmartpVersion } from '@/db/merge';
 import {
   detectActiveBackend,
   detectPaths,
@@ -582,13 +583,12 @@ async function saveJsonTargetLocked(
       if (count === 0) {
         throw new Error(`SmartP 中没有 ${name} 行，无法写入`);
       }
-      const existing = state.cloudConfig[name]?.meta?.version;
-      updateCloudConfigParams(
-        db,
-        name,
-        stringifyParams(parsed),
-        typeof existing === 'number' ? existing : undefined,
-      );
+      // Never use meta.version unconditionally: when the working copy was
+      // chosen from the teg source, it is teg's envelope version, not SmartP's
+      // column. pickSmartpVersion() only trusts a locked version or SmartP's
+      // own column.
+      const version = pickSmartpVersion(state.cloudConfig[name]?.meta);
+      updateCloudConfigParams(db, name, stringifyParams(parsed), version);
       out = exportDb(db);
     } finally {
       closeDb(db);
@@ -740,27 +740,36 @@ async function pushCore(opts: PushOptions = {}): Promise<string> {
       // meant that a cloud push landing between our pull and our commit was
       // silently rolled back on every unrelated config, because we wrote the
       // whole in-memory snapshot back.
-      const baseline = state.pristineSnapshot?.smartp?.cloud_config ?? {};
+      const workBase = state.pristineSnapshot?.smartp?.cloud_config ?? {};
       for (const [name, obj] of dbS ? Object.entries(state.cloudConfig) : []) {
         // Only rows that genuinely exist in SmartP and carry content: a config
         // that arrived from the teg fallback must never be written into SmartP,
         // and an empty row has nothing to write.
         if (obj.meta?._real !== true || obj.meta?.empty || obj.meta?.fromTeg) continue;
-        const serialized = stringifyParams(obj.params);
-        if (baseline[name] !== undefined && JSON.stringify(baseline[name]) === serialized) {
-          continue;
+        // SmartP's own bytes, not the working copy: `cloudConfig[name].params`
+        // may be the teg version chosen by the data-source setting. Merging the
+        // user's edits onto this raw base keeps every untouched SmartP field
+        // (including ones teg has never heard of) exactly as it was.
+        const raw = state.smartpRaw[name];
+        if (raw === undefined) continue;
+        const before = workBase[name];
+        let targetParams: any;
+        if (before === undefined) {
+          // No working baseline to diff against. Only a SmartP-sourced working
+          // copy can be written wholesale; a teg-sourced one would overwrite
+          // the SmartP row with content that never came from it.
+          if (obj.meta?.source !== 'smartp') continue;
+          targetParams = obj.params;
+        } else {
+          const merged = mergeOntoRaw({ raw, before, after: obj.params });
+          targetParams = merged.value;
         }
+        const serialized = stringifyParams(targetParams);
+        if (JSON.stringify(raw) === serialized) continue;
         // Keep SmartP's own version column unless the user locked it: the
         // reconciled meta.version may come from teg, and copying it here would
         // silently move SmartP's version forward on every source switch.
-        const locked = typeof obj.meta?.originalVersion !== 'undefined';
-        const version = locked
-          ? typeof obj.meta?.version === 'number'
-            ? obj.meta.version
-            : undefined
-          : typeof obj.meta?.smartpVersion === 'number' && obj.meta.smartpVersion > 0
-            ? obj.meta.smartpVersion
-            : undefined;
+        const version = pickSmartpVersion(obj.meta);
         if (dbS) updateCloudConfigParams(dbS, name, serialized, version);
       }
       for (const [module, rows] of dbT ? Object.entries(state.rulesByModule) : []) {

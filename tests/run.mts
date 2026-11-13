@@ -103,6 +103,7 @@ import {
   nextSeq,
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, invertDelta } from '../src/history/diff';
+import { mergeOntoRaw, pickSmartpVersion } from '../src/db/merge';
 import { buildRuleEnvelope, refreshEnvelope } from '../src/history/envelope';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -820,6 +821,45 @@ async function runDiffTest() {
     cur = JSON.parse(JSON.stringify(s3));
     for (let i = deltas.length - 1; i >= 0; i--) cur = applyDelta(cur, invertDelta(deltas[i]));
     if (JSON.stringify(cur) !== JSON.stringify(s0)) throw new Error('reverse chain failed');
+  });
+
+  await check('merge: edits land on SmartP raw, teg-only fields stay out', () => {
+    // Working copy came from teg: it has a field SmartP never had and a
+    // different value for one that both have. The user only touched `a`.
+    const raw = { a: 1, b: { x: 1, y: 2 } };
+    const before = { a: 9, b: { x: 1, y: 2 }, tegOnly: true };
+    const after = { a: 5, b: { x: 1, y: 2 }, tegOnly: true };
+    const { value, changed } = mergeOntoRaw({ raw, before, after });
+    const v = value as any;
+    if (!changed) throw new Error('edit not detected');
+    if (v.a !== 5) throw new Error('edit lost: ' + JSON.stringify(v));
+    if (v.b.y !== 2) throw new Error('untouched SmartP field lost: ' + JSON.stringify(v));
+    if ('tegOnly' in v) throw new Error('teg-only field leaked into SmartP: ' + JSON.stringify(v));
+    if (raw.a !== 1) throw new Error('raw input mutated');
+    return 'a=5, b kept, tegOnly dropped';
+  });
+
+  await check('version: a teg-sourced meta never writes its version into SmartP', () => {
+    const tegSourced = pickSmartpVersion({ fromTeg: true, version: 2026010101 });
+    if (tegSourced !== undefined) {
+      throw new Error('teg version leaked into SmartP column: ' + tegSourced);
+    }
+    const own = pickSmartpVersion({ version: 2026010101, smartpVersion: 2025010101 });
+    if (own !== 2025010101) throw new Error('SmartP column not preferred: ' + own);
+    const locked = pickSmartpVersion({ originalVersion: 2025010101, version: 2099010101 });
+    if (locked !== 2099010101) throw new Error('locked version not honoured: ' + locked);
+    if (pickSmartpVersion({ smartpVersion: 0 }) !== undefined) {
+      throw new Error('zero must mean unknown, not a version');
+    }
+    return 'teg dropped / own kept / lock wins';
+  });
+
+  await check('merge: no edits returns the raw value unchanged', () => {
+    const raw = { a: 1, list: [1, 2, 3] };
+    const { value, changed } = mergeOntoRaw({ raw, before: { a: 7 }, after: { a: 7 } });
+    if (changed) throw new Error('reported a change with identical copies');
+    if (value !== raw) throw new Error('raw value was cloned or replaced');
+    return 'unchanged';
   });
 
   await check('diff: array trailing remove is correctly inverted', () => {
