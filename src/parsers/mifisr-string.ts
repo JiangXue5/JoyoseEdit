@@ -81,6 +81,10 @@ export function validateMifisr(p: MifisrParams): MifisrValidationIssue[] {
 
   if (!p.pkg || p.pkg.includes('_')) {
     issues.push({ field: 'pkg', message: 'package name must be non-empty and contain no underscore' });
+  } else if (p.pkg.startsWith('com.example.')) {
+    // The "add game" button inserts this placeholder. Writing it to the device
+    // creates a MIFISR route that no installed app can ever match.
+    issues.push({ field: 'pkg', message: 'placeholder package name — replace it with the real one' });
   }
 
   for (const k of ['minFps', 'targetFps'] as const) {

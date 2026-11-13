@@ -561,8 +561,15 @@ async function handleResetCloud() {
   });
   if (!sure) return;
   try {
-    await resetCloudData();
-    toast.warn('已重置云控', 'Joyose 数据已清空，等待其重新下载；必要时重启设备');
+    const reset = await resetCloudData();
+    if (reset.failed.length) {
+      toast.warn(
+        '已清空云控，但部分步骤失败',
+        `${reset.failed.join('、')} · 数据已删除，Joyose 下次启动会重新下发，必要时重启设备`,
+      );
+    } else {
+      toast.warn('已重置云控', 'Joyose 数据已清空，等待其重新下载；必要时重启设备');
+    }
     await refreshStat();
     const r = await pullAll();
     if (!r.ok) toast.warn('已重置，但界面刷新失败', `${r.error} · 请手动刷新`);

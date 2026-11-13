@@ -1105,8 +1105,17 @@ export async function revertLatestBackup() {
   return withWriteLock('回滚', () => bridge.revertLatest());
 }
 
-export async function resetCloudData(): Promise<void> {
-  await withWriteLock('重置云控', () => bridge.resetCloud());
+export async function resetCloudData(): Promise<bridge.ResetCloudResult> {
+  return withWriteLock('重置云控', async () => {
+    const r = await bridge.resetCloud();
+    // Only a failed `pm clear` means nothing happened. The broadcasts are
+    // wake-ups that Joyose repeats by itself, so a partial result is reported
+    // (see the view) instead of being thrown as a total failure.
+    if (!r.cleared) {
+      throw new Error(`云控数据没有被清除：${r.failed.join('、') || '未知原因'}`);
+    }
+    return r;
+  });
 }
 
 export async function freezeTeg() {

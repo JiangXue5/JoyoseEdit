@@ -45,7 +45,7 @@ import {
   splitPkgGroup,
   groupImpact,
 } from '../src/parsers/fisr-config';
-import { findPkgRoutes, removePkgRoutes } from '../src/parsers/pkg-routes';
+import { findPkgRoutes, removePkgRoutes, renamePkgRoutes } from '../src/parsers/pkg-routes';
 import {
   parseSupportModule,
   serializeSupportModule,
@@ -1241,6 +1241,67 @@ async function runMifisrStringTest() {
       throw new Error('neighbour damaged: ' + nb);
     }
     return '4 cleaned / 2 kept / neighbour intact';
+  });
+
+  await check('rename: every route moves with the package', () => {
+    const gb: any = {
+      fisr_config: {
+        enhance_config: [
+          { game_list: ['com.old', 'com.peer'], enhance_policy_config: [{ feature: 'FI', strategy: 'AFME' }] },
+        ],
+      },
+      mqs_enhance_list: ['com.old:60#default', 'com.peer:60#default'],
+      customize_game_params: { dp_fi_config: ['com.old_dmi'] },
+      support_highfps_app: ['com.old:120'],
+      novatek_gex_fps_limit: ['com.old:144'],
+      frc_game_params: ['com.old_45_90_30_60_47_46_43_41_0x0_1_1'],
+    };
+    const res = renamePkgRoutes(gb, 'com.old', 'com.new');
+    if (!res.ok) throw new Error('rename refused: ' + res.error);
+    if (res.migrated.length !== 6) throw new Error('migrated ' + res.migrated.length + ' routes');
+    const gl = gb.fisr_config.enhance_config[0].game_list.join(',');
+    if (gl !== 'com.new,com.peer') throw new Error('game_list wrong: ' + gl);
+    const all = [
+      ...gb.mqs_enhance_list,
+      ...gb.customize_game_params.dp_fi_config,
+      ...gb.support_highfps_app,
+      ...gb.novatek_gex_fps_limit,
+      ...gb.frc_game_params,
+    ].join('|');
+    if (/com\.old/.test(all)) throw new Error('old name left behind: ' + all);
+    if (!gb.mqs_enhance_list.includes('com.new:60#default')) throw new Error('mqs not renamed');
+    if (!gb.frc_game_params[0].startsWith('com.new_')) throw new Error('frc not renamed');
+    if (!gb.mqs_enhance_list.includes('com.peer:60#default')) throw new Error('neighbour damaged');
+    return '6 routes migrated / neighbour intact';
+  });
+
+  await check('rename: refuses a package another game already owns', () => {
+    const gb: any = {
+      fisr_config: {
+        enhance_config: [
+          { game_list: ['com.a'], enhance_policy_config: [] },
+          { game_list: ['com.taken'], enhance_policy_config: [] },
+        ],
+      },
+      mqs_enhance_list: ['com.a:60#default'],
+    };
+    const res = renamePkgRoutes(gb, 'com.a', 'com.taken');
+    if (res.ok) throw new Error('merged two games');
+    if (res.reason !== 'conflict') throw new Error('wrong reason: ' + res.reason);
+    if (gb.fisr_config.enhance_config[0].game_list[0] !== 'com.a') throw new Error('mutated on refusal');
+    return 'refused';
+  });
+
+  await check('rename: rejects placeholder and malformed names', () => {
+    const gb: any = { fisr_config: { enhance_config: [{ game_list: ['com.a'], enhance_policy_config: [] }] } };
+    for (const bad of ['com.example.newgame', 'nodots', 'com..x', '']) {
+      const res = renamePkgRoutes(gb, 'com.a', bad);
+      if (res.ok) throw new Error('accepted ' + JSON.stringify(bad));
+      if (res.reason !== 'invalid') throw new Error('wrong reason for ' + bad + ': ' + res.reason);
+    }
+    const same = renamePkgRoutes(gb, 'com.a', 'com.a');
+    if (!same.ok || same.migrated.length) throw new Error('same-name rename should be a no-op');
+    return '4 rejected / no-op ok';
   });
 
   await check('routes: second delete is a no-op and reports nothing removed', () => {

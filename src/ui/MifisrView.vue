@@ -96,7 +96,12 @@
 
           <div class="field">
             <label class="label">包名 pkg</label>
-            <input v-model="currentParsed.pkg" class="mono" @input="queueRewrite" />
+            <input
+              v-model="currentParsed.pkg"
+              class="mono"
+              @input="queueRewrite"
+              @change="commitRename"
+            />
           </div>
 
           <div class="grid-2" style="margin-top: var(--space-3)">
@@ -299,7 +304,7 @@ import {
   type FisrConfig,
   type FisrPolicy,
 } from '@/parsers/fisr-config';
-import { findPkgRoutes, removePkgRoutes } from '@/parsers/pkg-routes';
+import { findPkgRoutes, removePkgRoutes, renamePkgRoutes } from '@/parsers/pkg-routes';
 import { findByCmdline, getEntries, modulesOf } from '@/parsers/mivk-migl';
 import { lookupKnownGame } from '@/presets/mifisr/known-games';
 import { toast } from '@/state/toast';
@@ -326,6 +331,9 @@ const alsoUpdateMqs = ref(true);
 const selected = ref(0);
 const currentParsed = ref<MifisrParams | null>(null);
 const srcFpsText = ref('');
+/** The package name this entry had before the user started editing it. Every
+ *  other route is keyed by that name, so a rename has to move them together. */
+const renameBase = ref('');
 
 const mifisrSwitchOn = computed(
   () => state.cloudConfig.booster_config?.params?.game_booster?.fisr_mqs_v2 === true,
@@ -555,8 +563,13 @@ const problems = computed<Issue[]>(() => {
 // or when the user switches selection. Deliberately not a deep watch:
 // rewrite() mutates list[selected] in place on every keystroke, and
 // re-parsing transient NaN states would wipe the form under the cursor.
+// The cache must follow the current entry's *string*, not just the list length
+// and the selected index: another page (or a preset import) can rewrite the
+// entry in place, and rewriting it back would then persist the stale parse.
+// The self-check keeps our own `rewrite()` from re-parsing what we just wrote,
+// which would replace the object the inputs are bound to mid-keystroke.
 watch(
-  [() => entries.value.length, selected],
+  [() => entries.value.length, selected, () => entries.value[selected.value]],
   () => {
     const e = entries.value;
     if (e.length === 0) {
@@ -565,10 +578,19 @@ watch(
       return;
     }
     if (selected.value >= e.length) selected.value = 0;
+    const raw = e[selected.value];
+    if (currentParsed.value) {
+      try {
+        if (serializeMifisr(currentParsed.value) === raw) return;
+      } catch {
+        // unserialisable mid-edit value — fall through and re-parse the source
+      }
+    }
     try {
-      const parsed = parseMifisr(e[selected.value]);
+      const parsed = parseMifisr(raw);
       currentParsed.value = parsed;
       srcFpsText.value = parsed.srcFps.join(',');
+      renameBase.value = parsed.pkg;
     } catch {
       currentParsed.value = null;
       srcFpsText.value = '';
@@ -809,6 +831,50 @@ function setSwitchDefaultStatus(p: FisrPolicy, value: string): void {
 // to serialise + re-detect paths on every keystroke, which is the main source
 // of input lag on device.
 let rewriteQueued = false;
+
+/** `@change` fires on blur, i.e. right before the submit button's click — so a
+ *  rename is migrated even when the user never leaves the field deliberately. */
+function commitRename(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const to = input.value.trim();
+  const from = renameBase.value;
+  if (!from || !to || from === to) {
+    renameBase.value = to;
+    return;
+  }
+  // Two entries pointing at the same package would fight over one strategy
+  // group. renamePkgRoutes only sees the group lists, so check the entry list
+  // itself here.
+  const dup = entries.value.some((raw, i) => {
+    if (i === selected.value) return false;
+    try {
+      return parseMifisr(raw).pkg === to;
+    } catch {
+      return false;
+    }
+  });
+  if (dup) {
+    toast.error('包名没有改成', `${to} 已经在这一页的另一条条目里`);
+    if (currentParsed.value) currentParsed.value.pkg = from;
+    input.value = from;
+    rewrite();
+    return;
+  }
+  const res = renamePkgRoutes(ensureGameBooster(), from, to);
+  if (!res.ok) {
+    toast.error('包名没有改成', res.error);
+    if (currentParsed.value) currentParsed.value.pkg = from;
+    input.value = from;
+    rewrite();
+    return;
+  }
+  rewrite();
+  renameBase.value = to;
+  if (res.migrated.length) {
+    toast.info('已重命名包名', `同时迁移：${res.migrated.map((r) => r.label).join('、')}`);
+  }
+  markDirty();
+}
 
 function queueRewrite() {
   if (rewriteQueued) return;

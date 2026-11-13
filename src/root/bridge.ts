@@ -142,8 +142,28 @@ export async function writePrefs(json: string): Promise<void> {
 /** Wipe Joyose's app data and wake its cloud services so the config is
  *  re-downloaded. Destructive: every local Joyose setting goes with it, so the
  *  caller must confirm first. */
-export async function resetCloud(): Promise<void> {
-  await runKsu(`sh ${HELPER} reset-cloud`);
+export interface ResetCloudResult {
+  ok: boolean;
+  /** True only when `pm clear` itself succeeded — the data is really gone. */
+  cleared: boolean;
+  /** Steps that returned non-zero, by helper-side name. */
+  failed: string[];
+}
+
+export async function resetCloud(): Promise<ResetCloudResult> {
+  const out = (await runKsu(`sh ${HELPER} reset-cloud`)).trim();
+  try {
+    const parsed = JSON.parse(out) as ResetCloudResult;
+    return {
+      ok: parsed.ok === true,
+      cleared: parsed.cleared === true,
+      failed: Array.isArray(parsed.failed) ? parsed.failed : [],
+    };
+  } catch {
+    // An older helper printed a bare `ok`; treat that as success with no detail.
+    if (out === 'ok') return { ok: true, cleared: true, failed: [] };
+    throw new RootBridgeError(`reset-cloud 输出无法解析：${out.slice(0, 120)}`, 0, '');
+  }
 }
 
 export interface DigestResult {

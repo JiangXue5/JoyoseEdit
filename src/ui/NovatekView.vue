@@ -109,6 +109,7 @@ import {
   type NovatekSet,
   type NovatekBlock,
 } from '@/parsers/novatek-string';
+import { findPkgRoutes, removePkgRoutes } from '@/parsers/pkg-routes';
 import PageHeader from './PageHeader.vue';
 import { rafThrottle } from '@/utils/raf';
 import NovatekSegmentCard from './NovatekSegmentCard.vue';
@@ -192,12 +193,13 @@ const anyNovatek = computed(() => state.paths.find((p) => p.id === 'novatek')?.a
 
 const currentParsed = ref<NovatekParams | null>(null);
 
-// Only re-parse on list-identity changes (length / listKey) or selection move.
-// In-place mutations from rewrite() must not trigger re-parse, otherwise a
-// transient invalid edit (e.g. user clears a field) would wipe currentParsed
-// and destroy the form under the user's cursor.
+// Re-parse when the current entry's string changes, not only when the list
+// length or the selection does: another page can rewrite the entry in place,
+// and a stale parse would then be written back over it. The serialise
+// self-check keeps our own rewrite() from destroying the form mid-keystroke
+// (a cleared numeric field must not wipe currentParsed).
 watch(
-  [() => entries.value.length, selected, listKey],
+  [() => entries.value.length, selected, listKey, () => entries.value[selected.value]],
   () => {
     const e = entries.value;
     if (e.length === 0) {
@@ -205,8 +207,16 @@ watch(
       return;
     }
     if (selected.value >= e.length) selected.value = 0;
+    const raw = e[selected.value];
+    if (currentParsed.value) {
+      try {
+        if (serializeNovatek(currentParsed.value) === raw) return;
+      } catch {
+        // transient invalid value — fall through and re-parse the source
+      }
+    }
     try {
-      currentParsed.value = parseNovatek(e[selected.value]);
+      currentParsed.value = parseNovatek(raw);
     } catch {
       currentParsed.value = null;
     }
@@ -295,8 +305,33 @@ function quickUnlockThermal() {
   rewrite();
 }
 
-function removeCurrent() {
+/** Removing a Novatek entry must not leave its enhancement routes behind:
+ *  `fisr_config` / mqs / dp_fi / support_highfps_app entries keyed by the same
+ *  package keep overriding a game that no longer has a display profile.
+ *  gex / FRC are standalone settings, so they are reported instead of dropped. */
+async function removeCurrent() {
+  if (!currentParsed.value) return;
+  const pkg = currentParsed.value.pkg;
+  const gb = ensureGameBooster();
+  const routes = findPkgRoutes(gb, pkg);
+  if (routes.length) {
+    const ok = await dialog.confirm(`删除 ${pkg} 并清理关联路由？`, {
+      detail: routes.map((r) => `${r.label} ×${r.count}`).join('、'),
+      okText: '删除并清理',
+      destructive: true,
+    });
+    if (!ok) return;
+  }
+  const cleaned = removePkgRoutes(gb, pkg);
   entries.value = entries.value.filter((_, i) => i !== selected.value);
   selected.value = Math.max(0, selected.value - 1);
+  if (cleaned.kept.length) {
+    toast.warn(
+      '这些关联设置已保留',
+      `${cleaned.kept.map((r) => `${r.label}×${r.count}`).join('、')} 不是增强路由，需要的话请单独删除`,
+    );
+  } else {
+    toast.success('已删除', cleaned.removed.length ? `同时清理：${cleaned.removed.map((r) => `${r.label}×${r.count}`).join('、')}` : '没有其他关联路由');
+  }
 }
 </script>

@@ -773,16 +773,41 @@ cmd_save_dl_from_stage() {
 # everything, then wake the cloud service / receivers so it happens promptly
 # instead of on the next 13-minute tick. Destructive by design — the WebUI
 # gates this behind an explicit confirmation.
+# Every step used to be `|| true` and the command printed `ok` unconditionally,
+# so a failed `pm clear` looked exactly like a successful reset: the UI said
+# "cleared", the data was still there, and the user retried into the same state.
+#
+# `pm clear` is the only step whose failure means "nothing happened" — the rest
+# are best-effort re-enable / wake-ups that Joyose repeats on its own next
+# launch. So: report every failure, mark the reset failed only when the data was
+# not actually cleared.
 cmd_reset_cloud() {
-  pm clear "$PKG" >/dev/null 2>&1 || true
-  am force-stop "$PKG" >/dev/null 2>&1 || true
-  pm enable "$PKG/com.xiaomi.joyose.smartop.SmartOpService" >/dev/null 2>&1 || true
-  pm enable "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || true
-  am broadcast -a android.intent.action.BOOT_COMPLETED -p "$PKG" >/dev/null 2>&1 || true
-  am broadcast "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || true
-  am broadcast "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || true
-  am broadcast -a android.intent.action.BOOT_COMPLETED -n "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || true
-  printf 'ok'
+  local failed='' cleared=false
+  # NB: every call is written as `cmd || _mark_fail name`, never as a bare
+  # function call that returns 1 — `set -e` would abort the whole helper on the
+  # first failure and the caller would see no JSON at all.
+  _mark_fail() {
+    failed="${failed:+$failed,}\"$1\""
+  }
+
+  if pm clear "$PKG" >/dev/null 2>&1; then
+    cleared=true
+  else
+    _mark_fail pm_clear
+  fi
+  am force-stop "$PKG" >/dev/null 2>&1 || _mark_fail force_stop
+  pm enable "$PKG/com.xiaomi.joyose.smartop.SmartOpService" >/dev/null 2>&1 || _mark_fail enable_op
+  pm enable "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || _mark_fail enable_cloud
+  am broadcast -a android.intent.action.BOOT_COMPLETED -p "$PKG" >/dev/null 2>&1 || _mark_fail boot_broadcast
+  am broadcast "$PKG/com.xiaomi.joyose.cloud.CloudServerReceiver" >/dev/null 2>&1 || _mark_fail cloud_broadcast
+  am broadcast "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || _mark_fail joyose_broadcast
+  am broadcast -a android.intent.action.BOOT_COMPLETED -n "$PKG/com.xiaomi.joyose.JoyoseBroadCastReceiver" >/dev/null 2>&1 || _mark_fail boot_receiver
+
+  if [ "$cleared" = true ]; then
+    printf '{"ok":true,"cleared":true,"failed":[%s]}\n' "$failed"
+  else
+    printf '{"ok":false,"cleared":false,"failed":[%s]}\n' "$failed"
+  fi
 }
 
 cmd_install_ts() {

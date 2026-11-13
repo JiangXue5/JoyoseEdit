@@ -98,3 +98,122 @@ export function removePkgRoutes(gb: Record<string, any>, pkg: string): CleanResu
   }
   return result;
 }
+
+/** Android package name, plus the placeholder rule: `com.example.*` is what
+ *  the "add game" button inserts, and writing it to the device would create a
+ *  route that can never match an installed app. */
+const PKG_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/;
+export function isValidPkgName(pkg: string): boolean {
+  return PKG_RE.test(pkg) && !pkg.startsWith('com.example.');
+}
+
+export interface RenameResult {
+  ok: boolean;
+  reason?: 'invalid' | 'conflict';
+  error?: string;
+  /** Routes that were rewritten from the old package to the new one. */
+  migrated: RouteHit[];
+}
+
+/** Rename a package everywhere it is referenced.
+ *
+ *  Editing the package name in the MIFISR list used to rewrite only the entry
+ *  string: `fisr_config`'s `game_list`, `mqs_enhance_list`, `dp_fi_config` and
+ *  `support_highfps_app` kept the old name, so the game lost its strategy or
+ *  the old name kept a route alive for an app that no longer exists. This is
+ *  the atomic version: all six routes move together, or nothing does. */
+export function renamePkgRoutes(
+  gb: Record<string, any>,
+  from: string,
+  to: string,
+): RenameResult {
+  if (!gb || !from || !to) {
+    return { ok: false, reason: 'invalid', error: '包名不能为空', migrated: [] };
+  }
+  if (from === to) return { ok: true, migrated: [] };
+  if (!isValidPkgName(to)) {
+    return {
+      ok: false,
+      reason: 'invalid',
+      error: `"${to}" 不是合法的包名${to.startsWith('com.example.') ? '（com.example.* 是占位值）' : ''}`,
+      migrated: [],
+    };
+  }
+
+  // Refuse if another game already owns this package: merging two games into
+  // one would silently hand the target's routes to the newly renamed entry.
+  const conflicts: string[] = [];
+  const cfg = gb.fisr_config;
+  if (isFisrConfig(cfg)) {
+    if (cfg.enhance_config.some((g) => g.game_list.includes(to) && !g.game_list.includes(from))) {
+      conflicts.push('策略路由（fisr_config）');
+    }
+  }
+  if (asArray(gb.mqs_enhance_list).some((e) => typeof e === 'string' && e.startsWith(`${to}:`))) {
+    conflicts.push('MQS 增强名单');
+  }
+  if (
+    asArray(gb.customize_game_params?.dp_fi_config).some(
+      (e) => typeof e === 'string' && e.startsWith(`${to}_`),
+    )
+  ) {
+    conflicts.push('DMI 路由（dp_fi_config）');
+  }
+  if (asArray(gb.support_highfps_app).some((e) => typeof e === 'string' && e.startsWith(`${to}:`))) {
+    conflicts.push('高帧放行（support_highfps_app）');
+  }
+  if (conflicts.length) {
+    return {
+      ok: false,
+      reason: 'conflict',
+      error: `${to} 已被另一款游戏占用：${conflicts.join('、')}`,
+      migrated: [],
+    };
+  }
+
+  const before = findPkgRoutes(gb, from);
+  const migrated: RouteHit[] = [];
+
+  if (isFisrConfig(cfg)) {
+    for (const group of cfg.enhance_config) {
+      if (group.game_list.includes(from)) {
+        group.game_list = group.game_list.map((p) => (p === from ? to : p));
+      }
+    }
+  }
+  const renameList = (list: unknown, sep: string): unknown => {
+    if (!Array.isArray(list)) return list;
+    return list.map((e) =>
+      typeof e === 'string' && e.startsWith(`${from}${sep}`)
+        ? `${to}${sep}${e.slice(from.length + sep.length)}`
+        : e,
+    );
+  };
+  if (Array.isArray(gb.mqs_enhance_list)) {
+    gb.mqs_enhance_list = renameList(gb.mqs_enhance_list, ':');
+  }
+  if (Array.isArray(gb.customize_game_params?.dp_fi_config)) {
+    gb.customize_game_params.dp_fi_config = renameList(
+      gb.customize_game_params.dp_fi_config,
+      '_',
+    );
+  }
+  if (Array.isArray(gb.support_highfps_app)) {
+    gb.support_highfps_app = renameList(gb.support_highfps_app, ':');
+  }
+  if (Array.isArray(gb.novatek_gex_fps_limit)) {
+    gb.novatek_gex_fps_limit = renameList(gb.novatek_gex_fps_limit, ':');
+  }
+  if (Array.isArray(gb.frc_game_params)) {
+    gb.frc_game_params = renameList(gb.frc_game_params, '_');
+  }
+
+  for (const hit of before) {
+    // fisr_config is always touched (the group's game_list); the rest only if
+    // an entry actually existed for the old name.
+    if (hit.key === 'fisr_config' || findPkgRoutes(gb, to).some((h) => h.key === hit.key)) {
+      migrated.push(hit);
+    }
+  }
+  return { ok: true, migrated };
+}
