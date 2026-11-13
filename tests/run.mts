@@ -112,6 +112,8 @@ import {
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
 import { planRestore, digestDrift } from '../src/history/restore-plan';
 import { makeResult, commitCode, defaultMessage } from '../src/state/result';
+import { CAPABILITIES, VERIFICATION_LABEL } from '../src/compat/matrix';
+import { VIEW_IDS } from '../src/state/nav';
 import type { ConfigSnapshot, DbDigests, HistoryFileMeta, HistoryRecord } from '../src/history/store';
 import {
   applyLockedOriginals,
@@ -186,6 +188,7 @@ async function main() {
   await runRestorePlanTest();
   await runOperationResultTest();
   await runHelperFailureTest();
+  await runCompatMatrixTest();
   await runImportPackageTest();
   await runFrcStringTest();
   await runMifisrStringTest();
@@ -3219,6 +3222,60 @@ echo "EXIT=$?"`,
     if (!same) throw new Error('database changed under a held lock');
     if (!/device is busy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
     return 'refused in ~0.6 s';
+  });
+
+  await check('helper: system-info 在缺 getprop/dumpsys 时仍输出可解析 JSON', () => {
+    const h = newHarness();
+    const r = runHarness(h, `( cmd_system_info )\necho "EXIT=$?"`);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('cmd_system_info crashed: ' + r.err.slice(0, 200));
+    const line = r.out.split('\n').find((l) => l.startsWith('{"ok":true'));
+    if (!line) throw new Error('no JSON line: ' + r.out);
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    for (const k of ['android', 'hyperos', 'joyose', 'module']) {
+      if (typeof parsed[k] !== 'string') throw new Error(`${k} is not a string`);
+    }
+    return 'four string fields, no crash';
+  });
+}
+
+// ---- compatibility matrix (G3) ------------------------------------------
+//
+// The matrix is the one place that answers "has this been proven on a phone?".
+// These checks keep it honest: every row needs evidence, and the set of
+// device-verified rows must match README (only MIFISR today). Upgrading a row
+// is fine — upgrading it without the README change, or without the hardware,
+// is not.
+
+async function runCompatMatrixTest() {
+  console.log('\n=== compatibility matrix ===');
+
+  await check('compat: 页面 ID 无重复', () => {
+    const seen = new Set<string>();
+    for (const id of VIEW_IDS) {
+      if (seen.has(id)) throw new Error('duplicate view id: ' + id);
+      seen.add(id);
+    }
+    if (!seen.has('diagnosis')) throw new Error('diagnosis page not registered');
+    return `${seen.size} pages`;
+  });
+
+  await check('compat: 每一行都有证据和合法级别', () => {
+    const levels = new Set(Object.keys(VERIFICATION_LABEL));
+    for (const c of CAPABILITIES) {
+      if (!c.id || !c.label) throw new Error('row without id/label');
+      if (!c.evidence.trim()) throw new Error(`${c.id} has no evidence`);
+      if (!levels.has(c.verification)) throw new Error(`${c.id} has unknown level ${c.verification}`);
+    }
+    return `${CAPABILITIES.length} rows, ${levels.size} levels`;
+  });
+
+  await check('compat: 实机验证项与 README 一致（只有 MIFISR）', () => {
+    const device = CAPABILITIES.filter((c) => c.verification === 'device').map((c) => c.id);
+    if (device.length !== 1 || device[0] !== 'mifisr') {
+      throw new Error('device-verified set drifted from README: ' + device.join(','));
+    }
+    return 'only mifisr claims device verification';
   });
 }
 

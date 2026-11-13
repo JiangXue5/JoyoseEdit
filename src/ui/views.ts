@@ -156,6 +156,15 @@ export const VIEWS: Record<ViewId, ViewDef> = {
     desc: '把配置打包成 JSON，用于备份或跨设备迁移。',
     load: () => import('@/ui/ImportExportView.vue'),
   },
+  diagnosis: {
+    id: 'diagnosis',
+    label: '兼容性诊断',
+    icon: 'info',
+    group: 'tools',
+    title: '兼容性诊断',
+    desc: '这台设备读到了什么，每条能力被验证到哪一步。',
+    load: () => import('@/ui/DiagnosisView.vue'),
+  },
 };
 
 export const VIEW_LIST: ViewDef[] = Object.values(VIEWS);

@@ -412,6 +412,25 @@ export async function visionStatus(): Promise<VisionStatus> {
   return JSON.parse(await runKsu(`sh ${HELPER} vision-status`));
 }
 
+export interface SystemInfo {
+  ok: true;
+  /** `ro.build.version.release`; empty when the ROM does not expose it. */
+  android: string;
+  /** `ro.mi.os.version.name`, falling back to `ro.miui.ui.version.name`. */
+  hyperos: string;
+  /** Installed Joyose versionName; empty when dumpsys is unavailable. */
+  joyose: string;
+  /** `version=` from the module's own module.prop. */
+  module: string;
+}
+
+/** Version facts for the diagnosis page. Absent values come back as empty
+ *  strings, never as an error: a report that says "unknown" for one field is
+ *  more useful than one that fails entirely. */
+export async function systemInfo(): Promise<SystemInfo> {
+  return JSON.parse(await runKsu(`sh ${HELPER} system-info`));
+}
+
 /* ---- teg SDK cloud-fetch freeze ------------------------------------------
  * Joyose's runtime config is driven by the MIUI teg cloud-config SDK
  * (com.xiaomi.teg.config). teg tracks its own `pref_local_max_version` in

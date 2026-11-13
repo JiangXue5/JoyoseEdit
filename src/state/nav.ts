@@ -8,30 +8,30 @@
 
 import { ref, watch } from 'vue';
 
-export type ViewId =
-  | 'overview'
-  | 'lock'
-  | 'unlockfps'
-  | 'thermal'
-  | 'gamelist'
-  | 'frc'
-  | 'mifisr'
-  | 'novatek'
-  | 'mivk'
-  | 'json'
-  | 'history'
-  | 'importexport';
+export const VIEW_IDS = [
+  'overview',
+  'lock',
+  'unlockfps',
+  'thermal',
+  'gamelist',
+  'frc',
+  'mifisr',
+  'novatek',
+  'mivk',
+  'json',
+  'history',
+  'importexport',
+  'diagnosis',
+] as const;
+
+export type ViewId = (typeof VIEW_IDS)[number];
 
 const STORAGE_KEY = 'joyose-edit:view';
 
 function restore(): ViewId {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v === 'overview' || v === 'lock' || v === 'unlockfps' || v === 'thermal'
-      || v === 'gamelist' || v === 'frc' || v === 'mifisr' || v === 'novatek'
-      || v === 'mivk' || v === 'json' || v === 'history' || v === 'importexport') {
-      return v;
-    }
+    if (v && (VIEW_IDS as readonly string[]).includes(v)) return v as ViewId;
   } catch {
     /* localStorage blocked */
   }

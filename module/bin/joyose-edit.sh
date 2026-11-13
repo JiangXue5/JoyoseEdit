@@ -855,6 +855,24 @@ cmd_vision_status() {
   printf '{"ok":true,"frc_support":"%s","sr_support":"%s"}\n' "$frc" "$sr"
 }
 
+# Version facts for the diagnosis page. Every field is optional on purpose:
+# an odd ROM without getprop/dumpsys should still produce a usable report that
+# says "unknown", not a failed command that hides the rest.
+cmd_system_info() {
+  local android hyperos joyose_ver module_ver
+  android=$(getprop ro.build.version.release 2>/dev/null || true)
+  hyperos=$(getprop ro.mi.os.version.name 2>/dev/null || true)
+  [ -n "$hyperos" ] || hyperos=$(getprop ro.miui.ui.version.name 2>/dev/null || true)
+  joyose_ver=$(dumpsys package "$PKG" 2>/dev/null \
+    | sed -n 's/.*versionName=\([^ ]*\).*/\1/p' | head -n 1 || true)
+  module_ver=$(sed -n 's/^version=//p' "$(dirname "$0")/../module.prop" 2>/dev/null | head -n 1 || true)
+  printf '{"ok":true,"android":%s,"hyperos":%s,"joyose":%s,"module":%s}\n' \
+    "$(printf '%s' "$android" | _json_string)" \
+    "$(printf '%s' "$hyperos" | _json_string)" \
+    "$(printf '%s' "$joyose_ver" | _json_string)" \
+    "$(printf '%s' "$module_ver" | _json_string)"
+}
+
 # ---- teg SDK max-version freeze ------------------------------------------
 # Joyose uses the MIUI teg cloud-config SDK (com.xiaomi.teg.config) for its
 # runtime config. teg tracks its own `pref_local_max_version` in a
@@ -1215,6 +1233,7 @@ case "$cmd" in
   history-clear)  cmd_history_clear "${1:?}" ;;
   cat-wasm)       cmd_cat_wasm ;;
   vision-status)  cmd_vision_status ;;
+  system-info)    cmd_system_info ;;
   teg-status)     cmd_teg_status ;;
   teg-freeze)     cmd_teg_freeze ;;
   teg-unfreeze)   cmd_teg_unfreeze ;;
