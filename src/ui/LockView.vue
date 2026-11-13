@@ -230,8 +230,12 @@ async function refresh() {
 async function doFreeze() {
   busy.value = true;
   try {
-    await freezeTeg();
-    toast.success('云控已冻结', 'Joyose 已重启，后续云端下发不会覆盖本地改动');
+    const r = await freezeTeg();
+    if (r.wasRunning && r.restarted === false) {
+      toast.warn('云控已冻结，但 Joyose 未能重新启动', '进游戏前请手动打开一次 Joyose');
+    } else {
+      toast.success('云控已冻结', `原值 ${r.original || '—'} 已保存，解冻时会恢复`);
+    }
     await refresh();
   } catch (err) {
     toast.error('冻结失败', (err as Error).message);
@@ -243,8 +247,12 @@ async function doFreeze() {
 async function doUnfreeze() {
   busy.value = true;
   try {
-    await unfreezeTeg();
-    toast.warn('云控已解冻', '下一次云控拉取可能覆盖本地改动');
+    const r = await unfreezeTeg();
+    if (r.wasRunning && r.restarted === false) {
+      toast.warn('云控已解冻，但 Joyose 未能重新启动', `pref_local_max_version 已恢复为 ${r.pref_local_max_version}`);
+    } else {
+      toast.warn('云控已解冻', `pref_local_max_version 已恢复为 ${r.pref_local_max_version}，下一次云控拉取可能覆盖本地改动`);
+    }
     await refresh();
   } finally {
     busy.value = false;

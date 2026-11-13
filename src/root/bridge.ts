@@ -367,21 +367,38 @@ export interface TegStatus {
   pref_local_max_version?: string;
   /** True iff `pref_local_max_version == Long.MAX_VALUE`. */
   frozen?: boolean;
+  /** Value saved before freezing; unfreeze restores this (empty when none). */
+  original?: string;
 }
 
 export async function tegStatus(): Promise<TegStatus> {
   return JSON.parse(await runKsu(`sh ${HELPER} teg-status`));
 }
 
+export interface TegRewriteResult {
+  ok: true;
+  path: string;
+  pref_local_max_version: string;
+  mode: 'freeze' | 'unfreeze';
+  /** Pre-freeze value that unfreeze restores. */
+  original?: string;
+  wasRunning?: boolean;
+  stopped?: boolean;
+  restarted?: boolean;
+  frozen?: boolean;
+}
+
 /** Pin `pref_local_max_version` to `Long.MAX_VALUE`, stopping teg SDK
- * from ever accepting a cloud update. Force-stops Joyose first so the
- * in-process SharedPreferences cache is dropped. */
-export async function tegFreeze(): Promise<{ ok: true; path: string; pref_local_max_version: string }> {
+ * from ever accepting a cloud update. Stops Joyose first (the SP cache lives
+ * in the process), verifies the write by reading the file back, and restarts
+ * it when it was running. */
+export async function tegFreeze(): Promise<TegRewriteResult> {
   return JSON.parse(await runKsu(`sh ${HELPER} teg-freeze`));
 }
 
-/** Reset `pref_local_max_version` to 0, re-enabling teg cloud updates. */
-export async function tegUnfreeze(): Promise<{ ok: true; path: string; pref_local_max_version: string }> {
+/** Put back the value that was saved before freezing (0 only when no saved
+ * value exists), re-enabling teg cloud updates. */
+export async function tegUnfreeze(): Promise<TegRewriteResult> {
   return JSON.parse(await runKsu(`sh ${HELPER} teg-unfreeze`));
 }
 

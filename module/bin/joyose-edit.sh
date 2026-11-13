@@ -590,6 +590,10 @@ cmd_vision_status() {
 # (including unrelated modules) are frozen.
 TEG_SP=/data/user/0/com.xiaomi.joyose/shared_prefs/teg_config_pref.xml
 TEG_MAX_VALUE=9223372036854775807
+# Freezing used to be one-way: unfreeze wrote a hard-coded 0, which is not the
+# state the device was in before. Keep the pre-freeze value here so unfreeze
+# can put it back.
+TEG_ORIGINAL_FILE="$DATA_ROOT/teg_original_version"
 
 _teg_current_max() {
   [ -f "$TEG_SP" ] || { echo 0; return; }
@@ -597,49 +601,105 @@ _teg_current_max() {
     | sed -E 's|.*value="([^"]*)".*|\1|' | head -n1
 }
 
+_teg_saved_original() {
+  [ -f "$TEG_ORIGINAL_FILE" ] || return 0
+  tr -d ' \r\n' < "$TEG_ORIGINAL_FILE"
+}
+
 cmd_teg_status() {
   if [ ! -f "$TEG_SP" ]; then
     printf '{"ok":true,"exists":false,"path":"%s"}\n' "$TEG_SP"
     return
   fi
-  local cur frozen
+  local cur frozen saved
   cur=$(_teg_current_max)
   [ -n "$cur" ] || cur=0
   if [ "$cur" = "$TEG_MAX_VALUE" ]; then frozen=true; else frozen=false; fi
-  printf '{"ok":true,"exists":true,"path":"%s","pref_local_max_version":"%s","frozen":%s}\n' \
-    "$TEG_SP" "$cur" "$frozen"
+  saved=$(_teg_saved_original)
+  printf '{"ok":true,"exists":true,"path":"%s","pref_local_max_version":"%s","frozen":%s,"original":"%s"}\n' \
+    "$TEG_SP" "$cur" "$frozen" "$saved"
 }
 
-_teg_rewrite() {
+# Write one value into the SharedPreferences XML and read it back. Returns
+# non-zero when the file did not end up holding the requested value.
+_teg_write_value() {
   local new_value="$1" tmp uid gid
-  [ -f "$TEG_SP" ] || die "teg SDK SP file does not exist yet: $TEG_SP. Let Joyose initialise teg SDK first (e.g. push once)."
-
-  # Must stop Joyose first — SharedPreferences has a per-process cache that
-  # won't pick up raw file edits until the process is recreated.
-  am force-stop "$PKG" 2>/dev/null || true
-
   uid=$(stat -c '%u' "$TEG_SP")
   gid=$(stat -c '%g' "$TEG_SP")
   tmp="$TEG_SP.jedit.$$"
   if grep -q 'pref_local_max_version' "$TEG_SP" 2>/dev/null; then
     sed -E 's|(<long name="pref_local_max_version" value=")[^"]*(")|\1'"$new_value"'\2|' \
-      "$TEG_SP" > "$tmp" || { rm -f "$tmp"; die "sed replace failed"; }
+      "$TEG_SP" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   else
     awk -v ins="    <long name=\"pref_local_max_version\" value=\"$new_value\" />" '
       /<\/map>/ { print ins } { print }
-    ' "$TEG_SP" > "$tmp" || { rm -f "$tmp"; die "awk insert failed"; }
+    ' "$TEG_SP" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   fi
   chown "$uid:$gid" "$tmp" 2>/dev/null || true
   chmod 660 "$tmp"
-  mv -f "$tmp" "$TEG_SP"
+  mv -f "$tmp" "$TEG_SP" || { rm -f "$tmp"; return 1; }
   if command -v restorecon >/dev/null 2>&1; then
     restorecon "$TEG_SP" 2>/dev/null || true
   fi
-  printf '{"ok":true,"path":"%s","pref_local_max_version":"%s"}\n' "$TEG_SP" "$new_value"
+  [ "$(_teg_current_max)" = "$new_value" ]
 }
 
-cmd_teg_freeze()   { _teg_rewrite "$TEG_MAX_VALUE"; }
-cmd_teg_unfreeze() { _teg_rewrite 0; }
+_teg_rewrite() {
+  local mode="$1" cur saved new_value was stopped started wrote
+  [ -f "$TEG_SP" ] || die "teg SDK SP file does not exist yet: $TEG_SP. Let Joyose initialise teg SDK first (e.g. push once)."
+
+  cur=$(_teg_current_max)
+  [ -n "$cur" ] || cur=0
+  saved=$(_teg_saved_original)
+
+  if [ "$mode" = "freeze" ]; then
+    # Keep the first value we ever saw. Freezing while already frozen must not
+    # overwrite it with MAX_VALUE, or unfreeze would "restore" the freeze.
+    if [ -z "$saved" ] && [ "$cur" != "$TEG_MAX_VALUE" ]; then
+      printf '%s\n' "$cur" > "$TEG_ORIGINAL_FILE" 2>/dev/null || die "cannot save original pref value"
+      chmod 600 "$TEG_ORIGINAL_FILE" 2>/dev/null || true
+      saved=$cur
+    fi
+    new_value="$TEG_MAX_VALUE"
+  else
+    if [ -n "$saved" ]; then
+      new_value="$saved"
+    else
+      new_value=0
+    fi
+  fi
+
+  was=false
+  if _pid_alive; then was=true; fi
+  # SharedPreferences keeps a per-process cache, so the file edit only takes
+  # effect when the process is recreated — and must not race a live writer.
+  stopped=$(_stop_pkg)
+  if [ "$stopped" != "true" ]; then
+    die "Joyose is still running; refusing to edit teg_config_pref.xml"
+  fi
+
+  if ! _teg_write_value "$new_value"; then
+    # Try to put back what was there before we touched it.
+    _teg_write_value "$cur" >/dev/null 2>&1 || true
+    die "pref_local_max_version write verification failed (wanted $new_value)"
+  fi
+  wrote=$(_teg_current_max)
+
+  started=false
+  if [ "$was" = "true" ]; then
+    started=$(_start_pkg)
+  fi
+
+  if [ "$mode" = "unfreeze" ]; then
+    rm -f "$TEG_ORIGINAL_FILE" 2>/dev/null || true
+  fi
+  if [ "$wrote" = "$TEG_MAX_VALUE" ]; then frozen=true; else frozen=false; fi
+  printf '{"ok":true,"path":"%s","pref_local_max_version":"%s","mode":"%s","original":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"frozen":%s}\n' \
+    "$TEG_SP" "$wrote" "$mode" "$saved" "$was" "$started" "$frozen"
+}
+
+cmd_teg_freeze()   { _teg_rewrite freeze; }
+cmd_teg_unfreeze() { _teg_rewrite unfreeze; }
 
 # ---- staging (for payloads that would overflow ARG_MAX) ------------------
 # WebUI uses these to upload big base64 blobs in chunks instead of a single
