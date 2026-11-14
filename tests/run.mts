@@ -4592,6 +4592,30 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     return 'one snapshot per change, complete and marked';
   });
 
+  await check('开机备份：指纹文件不带前导空格，旧格式仍认得出', () => {
+    // `_db_pair_fingerprint` glued each part on with a leading space, so the
+    // stamp file was ` sha256:…; sha256:…;`. Comparing worked, but anything
+    // reading that file by line got a value with a stray space in front.
+    const h = newHarness();
+    seedPair(h);
+    const stampPath = path.join(h.dataDir, '.bootstrap-version');
+    const backupRoot = path.join(h.dataDir, 'backup');
+    const first = runDispatch(h, ['bootstrap-backup']);
+    const raw = readFileSync(stampPath, 'utf8');
+    // Same stamp, written the way the old code wrote it.
+    writeFileSync(stampPath, ' ' + raw);
+    const again = runDispatch(h, ['bootstrap-backup']);
+    const count = readdirSync(backupRoot).length;
+    cleanupHarness(h);
+    if (first.code !== 0) throw new Error('bootstrap failed: ' + first.err.slice(0, 300));
+    if (raw.startsWith(' ')) throw new Error('the stamp still starts with a space: ' + JSON.stringify(raw.slice(0, 24)));
+    if (!/^(sha256|stat):/.test(raw)) throw new Error('the stamp does not start with a digest: ' + raw.slice(0, 40));
+    if (again.code !== 0) throw new Error('second bootstrap failed: ' + again.err.slice(0, 300));
+    if (!/unchanged/.test(again.out)) throw new Error('an already-installed stamp read as a change: ' + again.out.slice(0, 200));
+    if (count !== 1) throw new Error('the upgrade took an extra snapshot: ' + count);
+    return 'trimmed, and the old stamp still matches';
+  });
+
   await check('开机备份：另一个写入持锁时不会插进去', () => {
     const h = newHarness();
     const held = path.join(h.fake, 'held');

@@ -856,10 +856,14 @@ _db_pair_fingerprint() {
     if [ -n "$sha" ]; then
       out="$out sha256:$sha;"
     else
-      out="$out stat:$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
+        out="$out stat:$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
     fi
   done
-  printf '%s' "$out"
+  # Components are glued with a leading space each, so the whole string used to
+  # start with one — and that string is written verbatim into the stamp file.
+  # Anything reading that file line by line got a value with a stray space in
+  # front of the first digest.
+  printf '%s' "${out# }"
 }
 
 # Boot-time baseline snapshot, called by service.sh once the owner's CE storage
@@ -877,6 +881,10 @@ cmd_bootstrap_backup() {
   fi
   fp=$(_db_pair_fingerprint)
   last=$(cat "$BOOTSTRAP_STAMP" 2>/dev/null || true)
+  # Stamps written before the leading space was taken out still compare equal.
+  # Without this every installed device would owe one more snapshot on the
+  # first boot after the upgrade — a backup nobody changed anything for.
+  last=${last# }
   if [ -n "$fp" ] && [ "$fp" = "$last" ]; then
     printf '{"ok":true,"skipped":"unchanged"}\n'
     return 0
