@@ -4966,13 +4966,17 @@ async function runWalTest() {
   }
 
   await check('wal: 没有 sqlite3 时 pull 拒绝，而不是交出缺行的库', () => {
-    const h = newHarness();
+    // `sqlite3: 'absent'` is not decoration: without it this test asks whether
+    // the *machine* has sqlite3, and a CI runner has one at /usr/bin/sqlite3.
+    // Then the helper merges, the fixture stops being short without its log,
+    // and the test fails while the code is right.
+    const h = newHarness({ sqlite3: 'absent' });
     const db = path.join(h.dbDir, 'SmartP.db');
     seedPendingWal(db);
     const before = shaOf(db);
-    const r = runDispatch(h, ['pull', 'smartp']);
     // The fixture has to be short without its log, or the test proves nothing.
     const mainHasRow = readFileSync(db).includes(WAL_MARKER);
+    const r = runDispatch(h, ['pull', 'smartp']);
     const after = shaOf(db);
     cleanupHarness(h);
     if (mainHasRow) throw new Error('fixture is wrong: the main file already holds the row');
@@ -5001,7 +5005,7 @@ async function runWalTest() {
   });
 
   await check('wal: 备份拒绝留下半份快照，并把 Joyose 放回去', () => {
-    const h = newHarness();
+    const h = newHarness({ sqlite3: 'absent' });
     seedPendingWal(path.join(h.dbDir, 'SmartP.db'));
     writeFileSync(path.join(h.fake, 'alive'), '');
     const r = runDispatch(h, ['backup', 'wal']);
@@ -5035,7 +5039,7 @@ async function runWalTest() {
   });
 
   await check('wal: 没有 sqlite3 时写入不动库，Joyose 放回去', () => {
-    const h = newHarness();
+    const h = newHarness({ sqlite3: 'absent' });
     const db = path.join(h.dbDir, 'SmartP.db');
     seedPendingWal(db);
     writeFileSync(path.join(h.fake, 'alive'), '');
