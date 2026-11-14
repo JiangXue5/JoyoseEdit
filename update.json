@@ -1,6 +1,6 @@
 {
-  "version": "v1.1.6",
-  "versionCode": 11600,
-  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.6/joyose-edit-v1.1.6.zip",
-  "changelog": "v1.1.6 — 写入/提交后主动把 Joyose 拉起来，让它在进游戏前就读完新配置；之前只停不启，第一局游戏常常赶在它冷启动完成之前拿配置，必须开两遍才生效。若机型没有可启动入口，会退回旧行为并在提示里说明。"
+  "version": "v1.1.7-beta.1",
+  "versionCode": 11700,
+  "zipUrl": "https://github.com/JiangXue5/JoyoseEdit/releases/download/v1.1.7-beta.1/joyose-edit-v1.1.7-beta.1.zip",
+  "changelog": "v1.1.7-beta.1（测试版）— 写库前先处理未合并的 WAL：有 sqlite3 就合并，合并不了明确拒绝，不再静默复制出缺行的库；pull 改为合并副本，不再在锁外改活库；提交成功后不再擅自拉起你原本关掉的 Joyose，也不再把它误报成「未能停止」；设置文件遇到非法载荷不再被清空；开机备份指纹改按内容识别，原地改写也能发现；诊断页显示数据库日志模式。"
 }
