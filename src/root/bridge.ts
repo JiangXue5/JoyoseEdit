@@ -154,6 +154,13 @@ export interface StatEntry {
   size?: number;
   uid?: number;
   gid?: number;
+  /** `rollback` | `wal` | `unknown`, read from header bytes 18/19. Absent on a
+   *  helper that predates it. */
+  journal?: string;
+  /** Non-empty `-wal`: the file on disk is not the whole database right now.
+   *  Every read and write refuses in that state rather than move half of it. */
+  wal_pending?: boolean;
+  wal_bytes?: number;
 }
 
 export async function stat(): Promise<StatResult> {

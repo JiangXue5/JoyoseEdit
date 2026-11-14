@@ -60,6 +60,7 @@
             <th>文件</th>
             <th>状态</th>
             <th>大小</th>
+            <th>日志模式</th>
             <th>SHA-256</th>
           </tr>
         </thead>
@@ -68,10 +69,19 @@
             <td class="mono">{{ row.label }}</td>
             <td>{{ row.exists ? '存在' : '缺失' }}</td>
             <td class="mono">{{ row.size }}</td>
+            <td class="mono tiny">{{ row.journal }}{{ row.walPending ? ' · 有未合并 WAL' : '' }}</td>
             <td class="mono tiny">{{ row.sha }}</td>
           </tr>
         </tbody>
       </table>
+      <div v-if="walPending.length" class="banner warn" style="margin-top: var(--space-3)">
+        <strong>数据库存在未合并的 WAL</strong>
+        <span>
+          {{ walPending.map((r) => r.label).join('、') }} 的新近提交还在 <code>-wal</code> 里，
+          主库并不是完整的数据库。helper 会先用 sqlite3 合并；本机没有 sqlite3 时，
+          读取、提交、备份、回滚都会拒绝执行并说明原因，而不是搬走半份数据。
+        </span>
+      </div>
       <div class="kpi-grid" style="margin-top: var(--space-3)">
         <div class="kpi">
           <span class="kpi-label">云控配置</span>
@@ -225,10 +235,18 @@ const dbRows = computed(() => {
       exists: !!e?.exists,
       size: e?.exists ? `${(e.size ?? 0).toLocaleString()} B` : '—',
       sha: d?.[key] ? d[key]!.slice(0, 12) : (d ? '读不到' : '—'),
+      // Byte 18/19 of the header. `rollback` is what every sample device has;
+      // `wal` means the main file can be missing its newest commits and the
+      // helper will refuse to move it until the log is merged.
+      journal: e?.journal ?? '—',
+      walPending: !!e?.wal_pending,
     };
   };
   return [one('smartp', 'SmartP.db'), one('teg', 'teg_config.db')];
 });
+
+/** Any database whose `-wal` still holds committed transactions. */
+const walPending = computed(() => dbRows.value.filter((r) => r.walPending));
 
 function verifyClass(v: Verification): string {
   return `verify-${v}`;
@@ -277,7 +295,7 @@ function buildReport(): string {
   lines.push(`Joyose：${sys.value?.joyose || '未知'}`);
   lines.push(`通路：${backendLabel.value}`);
   for (const r of dbRows.value) {
-    lines.push(`${r.label}：${r.exists ? r.size : '缺失'} ${r.sha}`);
+    lines.push(`${r.label}：${r.exists ? r.size : '缺失'} ${r.sha}　日志模式 ${r.journal}${r.walPending ? '（有未合并 WAL）' : ''}`);
   }
   lines.push(`云控配置 ${configCount.value} 行 / 规则 ${ruleCount.value} 行 / 解析告警 ${state.parseIssues.length}`);
   lines.push(`teg：${teg.value ? (teg.value.frozen ? '已冻结' : '未冻结') : '未知'}　备份 ${stat.value?.backup_count ?? 0} / 历史 ${stat.value?.history_count ?? 0}`);
