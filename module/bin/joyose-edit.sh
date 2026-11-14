@@ -421,14 +421,18 @@ _apply_file_attrs() {
 _selinux_context() {
   local out
   if command -v ls >/dev/null 2>&1; then
-    out=$(ls -Zd "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    # `|| out=''` on both probes: this function runs inside a command
+    # substitution of a script with `set -e`, and a `stat -c %C` that exits 1
+    # (any ROM without SELinux) used to abort the caller *after* the databases
+    # had already been swapped. The write had landed; the UI was told it failed.
+    out=$(ls -Zd "$1" 2>/dev/null | awk 'NR==1{print $1}') || out=''
     case "${out:-}" in
       '') ;;
       *:*) printf '%s' "$out"; return 0 ;;
     esac
   fi
   if command -v stat >/dev/null 2>&1; then
-    out=$(stat -c '%C' "$1" 2>/dev/null)
+    out=$(stat -c '%C' "$1" 2>/dev/null) || out=''
     case "${out:-}" in
       ''|'?') ;;
       *:*) printf '%s' "$out"; return 0 ;;

@@ -3332,6 +3332,35 @@ function cleanupHarness(h: HelperHarness) {
   }
 }
 
+/** Run the helper through its real dispatch block, the way the WebUI does.
+ *
+ *  `runHarness` cuts the dispatch off so one function can be called directly;
+ *  that also means it can never prove a command is reachable under the right
+ *  guards. The lock whitelist lives in the dispatch block, and it is exactly
+ *  what a missing entry silently bypasses — so at least one test has to enter
+ *  from the same door the product uses. */
+function runDispatch(h: HelperHarness, args: string[], env: Record<string, string> = {}) {
+  const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8')
+    .replace(/^DATA_ROOT=.*$/m, `DATA_ROOT=${h.dataDir}`)
+    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`);
+  const file = path.join(h.dir, `dispatch-${Math.random().toString(36).slice(2)}.sh`);
+  writeFileSync(file, src);
+  const r = spawnSync('sh', [file, ...args], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: {
+      ...process.env,
+      ...env,
+      ...(h.sysbin ? { PATH: `${h.bin}:${h.sysbin}` } : { PATH: `${h.bin}:${process.env.PATH}` }),
+      FAKE: h.fake,
+    },
+  });
+  // A helper killed by a signal has no exit status. Report it as 128+N so a
+  // test can assert "the writer died mid-swap" without guessing.
+  const code = r.status ?? (r.signal === 'SIGKILL' ? 137 : r.signal === 'SIGTERM' ? 143 : -1);
+  return { code, out: r.stdout ?? '', err: r.stderr ?? '' };
+}
+
 function jettison(h: HelperHarness): string[] {
   return readdirSync(h.dbDir).filter((f) => f.includes('.jedit.'));
 }
@@ -3887,6 +3916,37 @@ echo "EXIT=$?"`,
     if (stillRecorded) throw new Error('transaction record was not cleared');
     if (!/rolled-back/.test(note)) throw new Error('recovery not recorded: ' + note);
     return 'half-applied pair rolled back on next lock';
+  });
+
+  await check('标签：stat 读不到 context 时，已落地的写入不再被报告为失败', () => {
+    // `_selinux_context` runs inside a command substitution, and the helper
+    // runs with `set -e`. On a ROM where `stat -c %C` exits non-zero (any ROM
+    // without SELinux), that status escaped the substitution and aborted the
+    // helper *after* the databases had been renamed: the write landed, the
+    // WebUI was told it failed, and the next attempt met a database that had
+    // already changed underneath it.
+    const h = newHarness();
+    seedPair(h);
+    writeFileSync(
+      path.join(h.bin, 'stat'),
+      `#!/bin/sh
+case "$1" in
+  -c) case "$2" in %C) exit 1 ;; esac ;;
+esac
+exec /usr/bin/stat "$@"
+`,
+    );
+    chmodSync(path.join(h.bin, 'stat'), 0o755);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const r = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
+    const wantSp = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db'));
+    const wantTeg = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db'));
+    const landed =
+      readFileSync(sp).equals(wantSp) && readFileSync(path.join(h.dbDir, 'teg_config.db')).equals(wantTeg);
+    cleanupHarness(h);
+    if (!landed) throw new Error('the pair never landed: ' + r.err.slice(0, 300));
+    if (r.code !== 0) throw new Error('a write that landed was reported as failed: ' + r.err.slice(0, 300));
+    return 'landed and reported as landed';
   });
 
   await check('回滚：设备上少了一个库时，只恢复另一个并报告 skipped', () => {
