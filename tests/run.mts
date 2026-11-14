@@ -4281,6 +4281,31 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     return 'marked by the write, cleared by the restart';
   });
 
+  await check('服务：原本关着的 Joyose 不会被提交后的重启拉起', () => {
+    // A user who had Joyose off gets it back off. The write path already
+    // refuses to claim a stop it did not perform (`_stop_pkg` only marks when
+    // it saw the process), but the restart the front end issues right after
+    // the write used to undo that by launching it anyway — so "edit a config"
+    // silently became "start this app for me".
+    const h = newHarness();
+    seedPair(h);
+    const alive = path.join(h.fake, 'alive');
+    const r = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
+    const restarted = runDispatch(h, ['restart']);
+    const started = existsSync(alive);
+    cleanupHarness(h);
+    if (r.code !== 0) throw new Error('the pair write failed: ' + r.err.slice(0, 300));
+    if (!/"wasRunning":false/.test(r.out)) {
+      throw new Error('the write did not report the original state: ' + r.out);
+    }
+    if (restarted.code !== 0) throw new Error('restart failed: ' + restarted.err.slice(0, 300));
+    if (!/"skipped":"not-running"/.test(restarted.out)) {
+      throw new Error('the restart did not skip: ' + restarted.out);
+    }
+    if (started) throw new Error('a commit launched Joyose that the user had turned off');
+    return 'left off, and said so';
+  });
+
   await check('teg 冻结：写入校验失败时把 Joyose 起回来', () => {
     // The freeze stops Joyose, then writes the preference file. When the write
     // did not verify, the helper died right there — Joyose stayed down, and the

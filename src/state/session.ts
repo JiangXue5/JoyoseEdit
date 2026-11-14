@@ -606,6 +606,8 @@ export interface JsonSaveResult {
   restartError?: string;
   /** Observed running again; null when no restart was attempted. */
   startedAfter?: boolean | null;
+  /** The restart was skipped on purpose: Joyose was already off. */
+  restartSkipped?: boolean;
 }
 
 export async function saveJsonTarget(
@@ -767,6 +769,7 @@ async function saveJsonTargetLocked(
     refreshError: pulled.ok ? undefined : pulled.error,
     restartError,
     startedAfter: restarted?.started ?? null,
+    restartSkipped: restarted?.skipped === 'not-running',
   };
 }
 
@@ -1140,6 +1143,7 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
           restartAttempted: true,
           startedAfter: restarted?.started ?? null,
           rebased: state.rebasedAt !== null,
+          restartSkipped: restarted?.skipped === 'not-running',
         }),
         databaseChanged: wroteSmartp || wroteTeg,
         // A commit always takes its restore point before writing.

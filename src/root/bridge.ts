@@ -430,6 +430,9 @@ export interface RestartResult {
   stopped?: boolean;
   /** Whether Joyose came back up and therefore re-read the DBs. */
   started?: boolean;
+  /** Set when nothing was started on purpose: `not-running` means the user had
+   *  Joyose off before this operation, so it was left off. */
+  skipped?: string;
 }
 
 export async function restart(): Promise<RestartResult> {

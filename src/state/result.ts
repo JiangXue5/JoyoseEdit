@@ -25,6 +25,11 @@ export type OperationCode =
   | 'written-restart-failed'
   /** DB written; Joyose is now stopped and will read the DB on next launch. */
   | 'written-stopped'
+  /** DB written; Joyose was already off before the module ran, and was left
+   *  off. Same database outcome as `written-stopped`, different cause — and
+   *  the difference is exactly what the user needs in order not to think we
+   *  started something behind their back. */
+  | 'written-kept-stopped'
   /** DB written; the history record could not be saved. */
   | 'written-no-history'
   /** Nothing to write: the working copy equals the database. */
@@ -98,6 +103,7 @@ export function defaultMessage(code: OperationCode): string {  switch (code) {
     case 'written-stop-failed': return '已写入设备，但 Joyose 没有停止，仍在用旧配置';
     case 'written-restart-failed': return '已写入设备，但 Joyose 重启失败';
     case 'written-stopped': return '已写入设备，Joyose 已停止，下次启动时读取新配置';
+    case 'written-kept-stopped': return '已写入设备，Joyose 原本未运行，保持关闭';
     case 'written-no-history': return '已写入设备，但历史记录没有保存';
     case 'no-change': return '没有改动，未写入数据库';
     case 'out-of-scope': return '改动不在当前写入目标范围内，未写入';
@@ -122,11 +128,16 @@ export function commitCode(args: {
   restartAttempted: boolean;
   startedAfter: boolean | null;
   rebased: boolean;
+  /** The restart was deliberately skipped because Joyose was already off. */
+  restartSkipped?: boolean;
 }): OperationCode {
   if (args.historyError) return 'written-no-history';
   if (args.restartError) return 'written-restart-failed';
   if (args.stopConfirmed === false) return 'written-stop-failed';
   if (args.rebased) return 'written-rebased';
+  // Before `written-stopped`: that code says "we stopped it for you", which is
+  // a different sentence and a different fact.
+  if (args.restartSkipped) return 'written-kept-stopped';
   if (args.startedAfter === true) return 'written';
   if (args.restartAttempted && args.startedAfter === false) return 'written-stopped';
   if (args.restartAttempted) return 'written-reload-unconfirmed';

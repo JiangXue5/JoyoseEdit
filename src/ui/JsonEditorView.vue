@@ -307,6 +307,13 @@ async function save() {
         '已写入设备，但 Joyose 没能重启',
         `${targetLabel()} · ${res.restartError} · 进游戏前请手动打开一次 Joyose`,
       );
+    } else if (res.restartSkipped) {
+      // We did not start it because it was already off when we got here.
+      // Saying "已停止" would claim we did something we deliberately avoided.
+      toast.info(
+        '已写入设备',
+        `${targetLabel()} · Joyose 原本未运行，保持关闭；下次打开它时会读取新配置`,
+      );
     } else if (res.startedAfter === false) {
       toast.info(
         '已写入设备',

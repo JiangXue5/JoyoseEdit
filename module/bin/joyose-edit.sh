@@ -1509,6 +1509,21 @@ cmd_revert_latest() {
 
 cmd_restart() {
   local stopped started
+  # Only start a service we are responsible for. There are two reasons Joyose
+  # can be down when this runs, and they look identical from the outside:
+  #
+  #   - a write took it down and still owes it a start  → `$SERVICE_MARKER`
+  #   - the user had it off before the module ever ran  → no marker
+  #
+  # Restarting on the second one turns "edit a config" into "launch an app I
+  # had turned off", which nobody asked for and which the stop path already
+  # refuses to do (`_stop_pkg` only writes the marker when it saw it running).
+  # A process that is *up* is the third case: it is running against the old
+  # bytes, so the restart is exactly what is needed.
+  if [ ! -f "$SERVICE_MARKER" ] && ! _pid_alive; then
+    printf '{"ok":true,"pkg":"%s","stopped":false,"started":false,"skipped":"not-running"}\n' "$PKG"
+    return 0
+  fi
   stopped=$(_stop_pkg)
   started=$(_start_pkg)
   printf '{"ok":true,"pkg":"%s","stopped":%s,"started":%s}\n' "$PKG" "$stopped" "$started"

@@ -414,6 +414,12 @@ async function handlePush() {
       case 'written-stopped':
         toast.info('已提交', withNotes(`${name} · Joyose 已停止，下次启动游戏时会读取新配置`));
         return;
+      case 'written-kept-stopped':
+        // Same bytes on disk as `written-stopped`, different cause: nothing was
+        // started because nothing was owed. The user turned Joyose off before
+        // the commit, and the commit does not get to undo that.
+        toast.info('已提交', withNotes(`${name} · Joyose 原本未运行，没有替你启动；下次打开它时会读取新配置`));
+        return;
       case 'written-reload-unconfirmed':
         toast.warn(
           '已提交，但没能确认 Joyose 已重新启动',
