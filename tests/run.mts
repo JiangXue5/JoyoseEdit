@@ -4403,6 +4403,39 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     return sensitive.length + ' caught, ' + normal.length + ' left alone';
   });
 
+  await check('开机备份：原地改写的数据库也认得出来（大小、inode、mtime 都没动）', () => {
+    // The fingerprint was `%Y#%s#%i` — time, size, inode. A Joyose write edits
+    // its JSON blob in place, so all three can stay put: same length, same
+    // inode, and the write lands inside the same second the stamp was taken.
+    // The next boot then compares equal and skips the snapshot it owes.
+    const h = newHarness();
+    seedPair(h);
+    const backupRoot = path.join(h.dataDir, 'backup');
+    const list = () => readdirSync(backupRoot).sort();
+    const first = runDispatch(h, ['bootstrap-backup']);
+    const after1 = list();
+
+    const smartp = path.join(h.dbDir, 'SmartP.db');
+    const before = statSync(smartp);
+    const bytes = readFileSync(smartp);
+    bytes.fill(0x58, 200, 208); // eight bytes, in place: length and inode hold
+    writeFileSync(smartp, bytes);
+    // Pin the timestamps to what they were: the old fingerprint cannot move.
+    utimesSync(smartp, before.atime, before.mtime);
+
+    const second = runDispatch(h, ['bootstrap-backup']);
+    const after2 = list();
+    cleanupHarness(h);
+    if (first.code !== 0) throw new Error('bootstrap failed: ' + first.err.slice(0, 300));
+    if (after1.length !== 1) throw new Error('no snapshot taken: ' + after1.join(','));
+    if (second.code !== 0) throw new Error('second bootstrap failed: ' + second.err.slice(0, 300));
+    if (/unchanged/.test(second.out)) {
+      throw new Error('the changed database was read as unchanged: ' + second.out.slice(0, 200));
+    }
+    if (after2.length !== 2) throw new Error('the change was not snapshotted: ' + after2.join(','));
+    return 'content, not metadata';
+  });
+
   await check('开机备份：service.sh 真的会跑一次完整快照，第二次开机跳过', () => {
     // Nothing tested service.sh before: it runs at boot, on a path no test
     // touches, and its job is to create the snapshot the user is later told to

@@ -836,13 +836,27 @@ cmd_push_pair_from_stage() {
 
 # Fingerprint of the database pair: a snapshot is only worth taking when one of
 # them changed. SmartP alone missed the boot where only teg moved.
+# "Is this the pair we last snapshotted?" — answered from the bytes, not from
+# the file's metadata. `%Y#%s#%i` was the whole answer before, and it happens to
+# be stable across an in-place rewrite of the same length inside the same second
+# (the common shape of a Joyose write, which edits a JSON blob in place), so the
+# boot snapshot could be skipped for a database that had in fact changed.
+#
+# Prefixing the mode keeps the two evidence levels apart: a phone that gains or
+# loses `sha256sum` between boots re-snapshots once instead of comparing a hash
+# against a stat line and concluding "unchanged".
 _db_pair_fingerprint() {
-  local out='' f
+  local out='' f sha
   for f in "$SMARTP" "$TEG"; do
-    if [ -f "$f" ]; then
-      out="$out$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
-    else
+    if [ ! -f "$f" ]; then
       out="$out-;"
+      continue
+    fi
+    sha=$(_sha256_file "$f")
+    if [ -n "$sha" ]; then
+      out="$out sha256:$sha;"
+    else
+      out="$out stat:$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
     fi
   done
   printf '%s' "$out"
