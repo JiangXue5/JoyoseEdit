@@ -1527,9 +1527,17 @@ cmd_history_get() {
 cmd_history_clear() {
   local keep="$1"
   case "$keep" in ''|*[!0-9]*) die "keep must be a non-negative integer" ;; esac
-  ls -1t "$DATA_ROOT/history" 2>/dev/null | tail -n +$((keep + 1)) | while IFS= read -r f; do
-    [ -n "$f" ] && rm -f "$DATA_ROOT/history/$f"
-  done
+  # Ordered by seq, not by mtime. Two commits inside the same second share an
+  # mtime, and `ls -1t` then broke the tie by directory order — the prune could
+  # delete the newer record and keep the older one, which silently cuts the
+  # chain the "rollback to this record" replay walks.
+  ls -1 "$DATA_ROOT/history" 2>/dev/null \
+    | sed -n 's/^[0-9][0-9]*-\([0-9][0-9]*\)\.json$/\1 &/p' \
+    | sort -k1,1nr \
+    | tail -n +$((keep + 1)) \
+    | while read -r _keep f; do
+        [ -n "$f" ] && rm -f "$DATA_ROOT/history/$f"
+      done
   printf '{"ok":true,"kept":%s}\n' "$keep"
 }
 

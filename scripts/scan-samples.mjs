@@ -14,13 +14,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import initSqlJs from 'sql.js';
 
+import { isSensitiveColumn } from './sensitive-columns.mjs';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** Column names that identify a person or their network. Matched as a whole
- *  word inside a snake_case / camelCase name so `model` does not match `mac`
- *  and `connect_time` does not match `account`. */
-const SENSITIVE_COLUMN =
-  /(^|_)(ssid|bssid|mac(|_address)|imei|meid|serial(|_no|_number)?|android_id|account|phone|email|latitude|longitude)(_|$)/i;
+// Column names that identify a person or their network. The rule lives in
+// ./sensitive-columns.mjs so it can be tested on spellings the current samples
+// do not contain.
 
 /** A bare MAC address inside free-form JSON is just as identifying. */
 const MAC_RE = /\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/i;
@@ -51,7 +51,7 @@ function scan(db, file) {
   for (const table of tables) {
     const colsRes = db.exec(`PRAGMA table_info(${q(table)})`);
     const cols = colsRes[0]?.values?.map((r) => String(r[1])) ?? [];
-    const sensitive = cols.filter((c) => SENSITIVE_COLUMN.test(c));
+    const sensitive = cols.filter((c) => isSensitiveColumn(c));
     if (!sensitive.length) continue;
     for (const col of sensitive) {
       const res = db.exec(

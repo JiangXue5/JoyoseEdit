@@ -87,8 +87,14 @@ npm run build
 npm run scan:samples
 
 # 打包 KernelSU 安装 zip → release/joyose-edit-<ver>-<count>[-dirty]-<sha>.zip
-# commit-count 写入 module.prop 的 versionCode，KernelSU 据此识别更新
+# versionCode 取 module.prop 里的值（为 0 或缺失才退回 commit 数）；
+# 文件名里的 commit 数只是给本地自测区分的，不参与升级判断
 npm run package
+
+# 发版：文件名与 update.json 指向的资产完全一致
+# （release/joyose-edit-<ver>.zip），并同步 update.json 的
+# version / versionCode / zipUrl；工作区不干净会直接拒绝打包
+npm run release
 
 # 浏览器热更新（无 KernelSU 桥，root 操作会报 unavailable）
 npm run dev
@@ -135,8 +141,10 @@ CLAUDE.md                 反编译笔记 + 维护者手册
   换库会让旧 inode 的 rollback journal 在下次打开时把旧页盖回新文件（表现为"要开
   两遍游戏才生效"）。
 - 导出文件写到 `/sdcard/Download/joyose-edit/`，不依赖 WebView 的下载行为。
-- 升级检查走仓库根目录的 `update.json`；打包时 `module.prop` 里的 `versionCode`
-  优先于 commit 数，保证 zip 与清单一致。
+- 升级检查走仓库根目录的 `update.json`。`versionCode` 由 `module.prop` 决定（写 `0`
+  或留空才按 commit 数递增），打包脚本不会改掉它；`npm run release` 会把
+  `update.json` 的 `version` / `versionCode` / `zipUrl` 对齐到本次构建，所以发布时
+  产出的 zip 名就是清单里那个名字，不需要手工改名。
 - 云端下发新版时若未冻结 teg SDK，你的修改可能被覆盖；想稳就用"云控锁定"页的冻结。
 - 小米 17 Pro Max 原厂未声明 `ro.vendor.gpp.frc.support` / `ro.vendor.xiaomi.sr.support`，
   即便 DB 配好游戏助手也不会显示画质增强面板；MifisrView 顶部 banner 会提示，并给出

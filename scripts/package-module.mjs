@@ -1,5 +1,11 @@
 // Produce a KernelSU-installable zip at
 //   release/joyose-edit-<version>-<commit-count>[-dirty][-<short-sha>].zip
+//
+// With `--release` the name is instead `release/joyose-edit-<version>.zip`,
+// which is exactly the file `update.json` advertises, and `update.json` is
+// rewritten to match. Before this, the two names diverged and every release
+// needed a manual rename of the asset — one missed rename and the manifest
+// pointed at a URL that 404s, which reads as "no update available".
 // The zip layout is:
 //   module.prop         (versionCode from module.prop when > 0, else commit
 //                        count; `version` stays at the base semantic version)
@@ -16,6 +22,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 
+import { releaseZipName, releaseZipUrl } from './release-names.mjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
@@ -26,7 +34,8 @@ async function main() {
   // `package:prop` script to bundle the vendor-flag system.prop; plain
   // `package` skips it.
   const lifecycle = process.env.npm_lifecycle_event ?? '';
-  const withProp = lifecycle === 'package:prop';
+  const releaseMode = process.argv.includes('--release');
+  const withProp = lifecycle === 'package:prop' || process.argv.includes('--with-prop');
 
   const distDir = path.join(ROOT, 'dist');
   const moduleDir = path.join(ROOT, 'module');
@@ -95,11 +104,21 @@ async function main() {
   }
 
   await fs.mkdir(releaseDir, { recursive: true });
-  const parts = [`joyose-edit-${baseVersion}`];
-  if (git.commits > 0) parts.push(String(git.commits));
-  if (git.dirty) parts.push('dirty');
-  if (git.sha) parts.push(git.sha);
-  const zipPath = path.join(releaseDir, parts.join('-') + '.zip');
+  let zipPath;
+  if (releaseMode) {
+    // A release build has to be reproducible from the tag: a dirty tree means
+    // the zip would not match the commit the manifest claims to publish.
+    if (git.dirty) {
+      throw new Error('refusing a release build from a dirty tree — commit or stash first');
+    }
+    zipPath = path.join(releaseDir, releaseZipName(baseVersion));
+  } else {
+    const parts = [`joyose-edit-${baseVersion}`];
+    if (git.commits > 0) parts.push(String(git.commits));
+    if (git.dirty) parts.push('dirty');
+    if (git.sha) parts.push(git.sha);
+    zipPath = path.join(releaseDir, parts.join('-') + '.zip');
+  }
 
   await zipDirectory(stagingDir, zipPath);
   console.log(`packaged -> ${zipPath}`);
@@ -108,6 +127,37 @@ async function main() {
   console.log(`  git sha      : ${git.sha || '(unavailable)'}`);
   console.log(`  working tree : ${git.dirty ? 'dirty' : 'clean'}`);
   console.log(`  system.prop  : ${withProp ? 'included (FRC + SR vendor flags)' : 'omitted'}`);
+
+  if (releaseMode) {
+    const synced = await syncUpdateJson({ version: baseVersion, versionCode });
+    console.log(`  update.json  : ${synced}`);
+  }
+}
+
+/** Point update.json at the zip that was just produced.
+ *
+ *  The manager reads this file, not the repository: a `zipUrl` that names a
+ *  differently-spelled file is the difference between "an update is offered"
+ *  and "404 on install". `changelog` is left alone — it is written by hand. */
+async function syncUpdateJson({ version, versionCode }) {
+  const file = path.join(ROOT, 'update.json');
+  let raw;
+  try {
+    raw = await fs.readFile(file, 'utf-8');
+  } catch {
+    return 'missing — not touched';
+  }
+  const json = JSON.parse(raw);
+  const wanted = {
+    version,
+    versionCode,
+    zipUrl: releaseZipUrl(version),
+  };
+  const changed = Object.entries(wanted).filter(([k, v]) => json[k] !== v).map(([k]) => k);
+  if (!changed.length) return 'already in sync';
+  Object.assign(json, wanted);
+  await fs.writeFile(file, JSON.stringify(json, null, 2) + '\n', 'utf-8');
+  return 'updated ' + changed.join(', ');
 }
 
 function readGitInfo(cwd) {

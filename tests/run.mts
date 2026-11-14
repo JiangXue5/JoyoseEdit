@@ -12,7 +12,7 @@
 
 import {
   readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync,
-  statSync, symlinkSync, chownSync, existsSync, unlinkSync,
+  statSync, symlinkSync, chownSync, existsSync, unlinkSync, utimesSync,
 } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -116,6 +116,8 @@ import {
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
 import { planRestore, digestDrift } from '../src/history/restore-plan';
 import { planRebase } from '../src/history/rebase-plan';
+import { isSensitiveColumn } from '../scripts/sensitive-columns.mjs';
+import { releaseZipUrl } from '../scripts/release-names.mjs';
 import { previewThermalUnlock } from '../src/parsers/thermal-unlock';
 import { isPlaceholderPkg, preflightCloudConfig } from '../src/db/preflight';
 import { makeResult, commitCode, defaultMessage } from '../src/state/result';
@@ -2910,6 +2912,28 @@ async function runRestorePlanTest() {
     return 'two deltas undone, fps=90';
   });
 
+  await check('restore: 重放顺序按 seq，而不是调用方给的顺序', () => {
+    // Records are listed by timestamp, and a record whose timestamp does not
+    // line up with its seq (imported, or written by an older build) would be
+    // undone out of order — which silently lands on the wrong snapshot instead
+    // of failing.
+    const s3 = snapOf({ booster_config: { fps: 144 } });
+    const r3 = buildRecord({ seq: 3, timestamp: 3, delta: diff(s2, s3) });
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2, r3]),
+      newerRecords: [r2, r3], // oldest first, the wrong way round
+      targetRecord: r1,
+      anchorDigest: same('aa', null),
+      nowDigest: same('aa', null),
+      current: s3,
+    });
+    if (!out.ok) throw new Error('refused: ' + out.message);
+    if (fps(out.snapshot) !== 90) throw new Error('replayed out of order: ' + fps(out.snapshot));
+    return 'sorted by seq, fps=90';
+  });
+
   await check('restore: 撤销 teg 提交时保留前一条的 SmartP 改动', () => {
     // seq 1 edits SmartP, seq 2 edits teg. Rolling back to seq 1 must undo the
     // teg edit and KEEP the SmartP edit from seq 1 — not rewind both.
@@ -4281,6 +4305,77 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
       throw new Error('the preference file was damaged: ' + pref);
     }
     return 'error reported, Joyose back up, pref untouched';
+  });
+
+  await check('历史：裁剪按 seq，不是按 mtime', () => {
+    // `ls -1t | tail -n +N` decided what to delete. Two records can share an
+    // mtime (two commits in one second) or carry a timestamp that does not
+    // follow their seq (a record imported from another device). The prune then
+    // deletes by the wrong key, and cutting the chain is invisible until a
+    // rollback fails.
+    const h = newHarness();
+    const historyDir = path.join(h.dataDir, 'history');
+    mkdirSync(historyDir, { recursive: true });
+    const old = path.join(historyDir, '100-10.json');
+    const stale = path.join(historyDir, '100-9.json');
+    writeFileSync(old, '{"seq":10}');
+    writeFileSync(stale, '{"seq":9}');
+    // seq 9 has the newer file mtime — backwards, exactly what mtime cannot see.
+    utimesSync(old, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+    const r = runHarness(h, `( cmd_history_clear 1 )\necho "EXIT=$?"`);
+    const left = readdirSync(historyDir).sort();
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('clear failed: ' + r.err.slice(0, 200));
+    if (!left.includes('100-10.json')) throw new Error('the newest seq was pruned: ' + left.join(','));
+    if (left.includes('100-9.json')) throw new Error('the older seq survived: ' + left.join(','));
+    return 'kept seq 10, dropped seq 9';
+  });
+
+  await check('发布：update.json 与 module.prop 说同一件事', () => {
+    // Not a reproduction — a guard. The names in `update.json` and in the
+    // release build were maintained separately, and a single missed rename
+    // makes the manifest point at a 404, which reads as "no update available".
+    // Both sides now call `release-names.mjs`, and this is what keeps the
+    // checked-in manifest honest.
+    const prop = readFileSync(path.join(ROOT, 'module/module.prop'), 'utf8');
+    const version = /^version=(.*)$/m.exec(prop)?.[1]?.trim() ?? '';
+    const code = Number.parseInt(/^versionCode=(.*)$/m.exec(prop)?.[1]?.trim() ?? '', 10);
+    const up = JSON.parse(readFileSync(path.join(ROOT, 'update.json'), 'utf8'));
+    if (!version) throw new Error('module.prop has no version');
+    if (up.version !== version) throw new Error(`update.json version ${up.version} != ${version}`);
+    if (up.versionCode !== code) throw new Error(`update.json versionCode ${up.versionCode} != ${code}`);
+    if (up.zipUrl !== releaseZipUrl(version)) throw new Error('zipUrl: ' + up.zipUrl);
+    if (!up.changelog || !String(up.changelog).trim()) throw new Error('update.json has no changelog');
+    return `${version} / ${code} / ${up.zipUrl.split('/').pop()}`;
+  });
+
+  await check('隐私：列名判定认 camelCase，也不误伤普通列', () => {
+    // The pattern needs a word boundary, and `wifiSsid` gives it a lowercase
+    // letter instead — so the spellings a ROM actually uses were the ones the
+    // scanner could not see.
+    const sensitive = [
+      'ssid',
+      'wifi_ssid',
+      'wifiSsid',
+      'bssid',
+      'macAddress',
+      'androidId',
+      'android_id',
+      'deviceSerial',
+      'serialNo',
+      'imei',
+      'latitude',
+      'longitude',
+      'phone',
+      'email',
+      'account',
+    ];
+    const normal = ['model', 'connect_time', 'serialized_blob', 'macaron', 'bssidless', 'value', 'key'];
+    const missed = sensitive.filter((c) => !isSensitiveColumn(c));
+    const falseAlarm = normal.filter((c) => isSensitiveColumn(c));
+    if (missed.length) throw new Error('missed: ' + missed.join(','));
+    if (falseAlarm.length) throw new Error('false positive: ' + falseAlarm.join(','));
+    return sensitive.length + ' caught, ' + normal.length + ' left alone';
   });
 
   await check('开机备份：service.sh 真的会跑一次完整快照，第二次开机跳过', () => {

@@ -32,7 +32,8 @@ export interface RestoreRequest {
   floor: number;
   /** All history files, newest first (listHistory()'s order). */
   meta: HistoryFileMeta[];
-  /** Records with `seq > targetSeq`, newest first. */
+  /** Records with `seq > targetSeq`. Order does not matter: `planRestore`
+   *  replays them by descending `seq`. */
   newerRecords: HistoryRecord[];
   targetRecord: HistoryRecord;
   /** Digests as the newest recorded commit left the databases, or null when
@@ -105,8 +106,14 @@ export function planRestore(req: RestoreRequest): RestoreOutcome {
 
   let snap: ConfigSnapshot = JSON.parse(JSON.stringify(req.current));
   const missing: string[] = [];
-  // newest first: undo the newest delta before the older one.
-  for (const rec of req.newerRecords) {
+  // Newest first: undo the newest delta before the older one. The order is
+  // taken from `seq`, not from the order the caller listed the files in —
+  // `listHistory()` sorts by timestamp, and a file whose timestamp did not
+  // match its seq (an imported or hand-edited record) would otherwise be
+  // undone out of order, which fails the replay or, worse, succeeds against
+  // the wrong base.
+  const newer = [...req.newerRecords].sort((a, b) => b.seq - a.seq);
+  for (const rec of newer) {
     const rep = applyDeltaReport(snap, invertDelta(rec.delta));
     snap = rep.value;
     for (const p of rep.missing) missing.push(formatPath(p));

@@ -13,6 +13,7 @@
     "test": "tsx tests/run.mts",
     "package": "node scripts/package-module.mjs",
     "package:prop": "node scripts/package-module.mjs",
+    "release": "node scripts/package-module.mjs --release",
     "scan:samples": "node scripts/scan-samples.mjs"
   },
   "dependencies": {
