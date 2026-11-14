@@ -1737,11 +1737,27 @@ cmd_history_save_from_stage() {
   safe_name "$1" || die "invalid history name"
   safe_name "$2" || die "invalid stage name"
   local f="$DATA_ROOT/history/$1"
+  # Temp lives in the stage directory, not next to the target: a crash leaves a
+  # file the stage GC already knows how to prune, never a half-written record
+  # inside `history/`.
+  local tmp="$STAGE_DIR/hist-$1.$$"
   local stage_file="$STAGE_DIR/$2"
   [ -f "$stage_file" ] || die "stage file missing: $2"
   umask 077
-  base64 -d < "$stage_file" > "$f" 2>/dev/null || die "base64 decode failed"
-  chmod 600 "$f"
+  # Decode next to the target, never over it: a kill mid-decode used to leave a
+  # truncated record under its final name, and the next reader treated it as a
+  # valid parent in the chain.
+  base64 -d < "$stage_file" > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  # The seq is chosen by the WebView from a directory listing, so two of them
+  # can pick the same number. `ln` is create-or-fail everywhere Android has
+  # filesystems: the loser is told, instead of silently overwriting a record
+  # the other WebView just wrote.
+  if ! ln "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp"
+    die "history name already taken: $1" not-needed duplicate-history
+  fi
+  rm -f "$tmp"
   rm -f "$stage_file"
   printf '{"ok":true,"path":"%s"}\n' "$f"
 }

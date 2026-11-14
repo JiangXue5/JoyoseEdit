@@ -1075,26 +1075,25 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     let fname: string | null = null;
     let historyError: string | undefined;
     try {
-      const existing = await bridge.historyList();
-      const seq = nextSeq(existing);
       const ts = Math.floor(Date.now() / 1000);
       // Where the databases ended up. Read after the swap so the record
       // describes reality, not our intention: "we asked for these bytes" and
       // "the file now holds them" are different claims.
       const afterDigest = await bridge.digest().catch(() => null);
-      const rec = buildRecord({
-        seq,
-        timestamp: ts,
-        source: opts.source ?? 'webui',
-        note: opts.note ?? '',
-        delta,
-        dbKind: wroteSmartp && wroteTeg ? 'both' : wroteSmartp ? 'smartp' : 'teg',
-        beforeDigest: beforeDigest ?? undefined,
-        afterDigest: afterDigest ?? undefined,
-        canRevert: delta.length > 0,
+      fname = await saveHistoryRecord((seq) => {
+        const rec = buildRecord({
+          seq,
+          timestamp: ts,
+          source: opts.source ?? 'webui',
+          note: opts.note ?? '',
+          delta,
+          dbKind: wroteSmartp && wroteTeg ? 'both' : wroteSmartp ? 'smartp' : 'teg',
+          beforeDigest: beforeDigest ?? undefined,
+          afterDigest: afterDigest ?? undefined,
+          canRevert: delta.length > 0,
+        });
+        return { name: buildHistoryFilename(ts, seq), body: JSON.stringify(rec) };
       });
-      fname = buildHistoryFilename(ts, seq);
-      await bridge.historySave(fname, JSON.stringify(rec));
       // Keep the timeline short: one delta record per commit adds up on a phone
       // with a 1 MB cloud config, and ten entries is plenty to walk back.
       await bridge.historyClear(HISTORY_KEEP).catch(() => null);
@@ -1666,6 +1665,30 @@ export async function readHistory(name: string): Promise<HistoryRecord> {
   return JSON.parse(await bridge.historyGet(name));
 }
 
+/** Write one history record, with the sequence number settled on the device.
+ *
+ *  The seq comes from a directory listing the WebView makes, so two WebViews
+ *  (or the same one twice, fast) can both decide on #7. The helper creates the
+ *  file exclusively, so the loser gets `duplicate-history` instead of
+ *  overwriting a record that is already part of the chain — and this is where
+ *  that refusal is turned into "list again, take a fresh number".
+ */
+async function saveHistoryRecord(
+  make: (seq: number) => { name: string; body: string },
+): Promise<string> {
+  for (let attempt = 0; ; attempt++) {
+    const existing = await bridge.historyList();
+    const { name, body } = make(nextSeq(existing));
+    try {
+      await bridge.historySave(name, body);
+      return name;
+    } catch (err) {
+      const code = err instanceof bridge.RootBridgeError ? err.code : undefined;
+      if (code !== 'duplicate-history' || attempt >= 3) throw err;
+    }
+  }
+}
+
 /**
  * Write a marker history entry noting that a raw DB backup was taken.
  * Empty delta = timeline anchor, no state transition. Restoration still
@@ -1673,20 +1696,20 @@ export async function readHistory(name: string): Promise<HistoryRecord> {
  * to the commit chain. File size: ~200 bytes.
  */
 export async function recordBackupCheckpoint(backupName: string): Promise<void> {
-  const existing = await bridge.historyList();
-  const seq = nextSeq(existing);
   const ts = Math.floor(Date.now() / 1000);
-  const rec = buildRecord({
-    seq,
-    timestamp: ts,
-    source: 'backup',
-    note: backupName,
-    delta: [],
-    // A marker with no delta has nothing to replay: offering it as a rollback
-    // target would silently do nothing and still look like a restore.
-    canRevert: false,
+  await saveHistoryRecord((seq) => {
+    const rec = buildRecord({
+      seq,
+      timestamp: ts,
+      source: 'backup',
+      note: backupName,
+      delta: [],
+      // A marker with no delta has nothing to replay: offering it as a rollback
+      // target would silently do nothing and still look like a restore.
+      canRevert: false,
+    });
+    return { name: buildHistoryFilename(ts, seq), body: JSON.stringify(rec) };
   });
-  await bridge.historySave(buildHistoryFilename(ts, seq), JSON.stringify(rec));
   await bridge.historyClear(HISTORY_KEEP).catch(() => null);
 }
 

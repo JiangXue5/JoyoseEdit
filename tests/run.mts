@@ -4201,6 +4201,47 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     return 'marked by the write, cleared by the restart';
   });
 
+  await check('历史：同一序号不会被第二个写入覆盖', () => {
+    // The seq is chosen by the WebView from a directory listing, so two of them
+    // can pick the same number. The old write was a plain redirect, so the
+    // second one replaced a record the first had already committed to the
+    // chain — one commit vanished from the timeline with no error anywhere.
+    const h = newHarness();
+    mkdirSync(path.join(h.dataDir, 'stage'), { recursive: true });
+    const stage = (name: string, body: string) =>
+      writeFileSync(path.join(h.dataDir, 'stage', name), Buffer.from(body).toString('base64'));
+    stage('first', '{"which":1}');
+    stage('second', '{"which":2}');
+    const a = runHarness(h, `( cmd_history_save_from_stage rec.json first )\necho "EXIT=$?"`);
+    const b = runHarness(h, `( cmd_history_save_from_stage rec.json second )\necho "EXIT=$?"`);
+    const kept = readFileSync(path.join(h.dataDir, 'history', 'rec.json'), 'utf8');
+    cleanupHarness(h);
+    if (!a.out.includes('EXIT=0')) throw new Error('the first save failed: ' + a.err.slice(0, 200));
+    if (b.out.includes('EXIT=0')) throw new Error('the second save overwrote an existing record');
+    if (!/duplicate-history/.test(b.err)) throw new Error('wrong code: ' + b.err.slice(0, 300));
+    if (kept !== '{"which":1}') throw new Error('the first record was replaced: ' + kept);
+    return 'first kept, second refused with a code';
+  });
+
+  await check('历史：解码失败不会在 history/ 里留下半条记录', () => {
+    // `base64 -d > "$f"` truncated the destination before it knew whether the
+    // payload decoded. A failed upload left an empty file under the final
+    // name, and the next reader walked the chain straight into it.
+    const h = newHarness();
+    mkdirSync(path.join(h.dataDir, 'stage'), { recursive: true });
+    writeFileSync(path.join(h.dataDir, 'stage', 'rotten'), 'not base64 at all %%%');
+    const r = runHarness(h, `( cmd_history_save_from_stage rec.json rotten )\necho "EXIT=$?"`);
+    const left = readdirSync(path.join(h.dataDir, 'history'));
+    const staged = readdirSync(path.join(h.dataDir, 'stage'));
+    cleanupHarness(h);
+    if (r.out.includes('EXIT=0')) throw new Error('a corrupt payload was accepted');
+    if (left.length) throw new Error('a half-written record was left behind: ' + left.join(','));
+    // The payload is kept: the caller may retry the same stage name (an older
+    // installed helper only ever reads it once).
+    if (!staged.includes('rotten')) throw new Error('the staged payload was dropped');
+    return 'nothing named, payload kept for a retry';
+  });
+
   await check('崩溃：双库提交会先恢复上一次遗留事务，而不是覆盖它', () => {
     const h = newHarness();
     seedPair(h);
