@@ -144,24 +144,31 @@ _lock_owner_alive() {
 
 # True when the lock is safe to take over.
 #
-# A directory with no owner file is ambiguous: it is either a crashed writer or
-# a live one that won `mkdir` a microsecond ago and has not written its owner
-# yet. Stealing the second kind hands both writers the critical section, so an
-# owner-less directory only counts as dead after a short grace period.
+# A directory whose owner cannot be read is ambiguous: it is either a crashed
+# writer or a live one that won `mkdir` a moment ago and has not finished
+# writing its owner yet. Stealing the second kind hands both writers the
+# critical section at once — which the 20-writer test caught on a 2-core CI
+# runner, because the old grace period only covered a *missing* owner file and
+# `printf > owner` creates the file before it fills it.
+#
+# Two changes: the owner file is published by rename (so it is either absent or
+# complete), and the grace period now applies whenever the owner is not
+# provably alive — a crashed lock's directory is already older than the grace,
+# so this only delays a takeover that was about to happen anyway.
+LOCK_GRACE=${LOCK_GRACE:-2}
+
 _lock_stale() {
+  local mtime now
   [ -d "$LOCK_DIR" ] || return 1
   _lock_owner_alive && return 1
-  if [ ! -f "$LOCK_DIR/owner" ]; then
-    local mtime now
-    mtime=$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null || echo 0)
-    now=$(date +%s)
-    [ $((now - mtime)) -ge 2 ] || return 1
-  fi
+  mtime=$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  [ $((now - mtime)) -ge "$LOCK_GRACE" ] || return 1
   return 0
 }
 
 _acquire_lock() {
-  local kind="$1" i=0 start
+  local kind="$1" i=0 start ino ino_now owner_token
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     if _lock_stale; then
       # Rename first: only one waiter can move a given inode, so two processes
@@ -178,15 +185,33 @@ _acquire_lock() {
     fi
     sleep 0.2 2>/dev/null || sleep 1
   done
+  ino=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
   start=$(_proc_start "$$")
   [ -n "$start" ] || start='-'
   MY_LOCK_TOKEN=$(_new_token)
   [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
-  # If this write fails, the directory we just created was moved out from under
-  # us by a waiter that judged it stale. We do not hold the lock; carrying on
-  # would run two writers at once.
-  printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/owner" 2>/dev/null \
-    || die "lost the device lock during initialisation; retry"
+  # Publish the owner by rename, never by writing in place: a reader that sees
+  # `owner` must see all of it. `printf > owner` truncates first, and a waiter
+  # landing in that window saw an unreadable owner for a lock that was about to
+  # be held.
+  if ! printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/.owner.$$" 2>/dev/null \
+     || ! mv -f "$LOCK_DIR/.owner.$$" "$LOCK_DIR/owner" 2>/dev/null; then
+    rm -f "$LOCK_DIR/.owner.$$" 2>/dev/null || true
+    # If this write fails, the directory we just created was moved out from
+    # under us by a waiter that judged it stale. We do not hold the lock;
+    # carrying on would run two writers at once.
+    die "lost the device lock during initialisation; retry"
+  fi
+  # Confirm the directory is still the one we created. A waiter that judged us
+  # stale moves the directory away, and a third process can create its own in
+  # the same path a moment later — publishing our owner into *that* directory
+  # hands two writers the same lock. The inode is the identity; the token says
+  # the owner file is ours.
+  read -r _ _ _ owner_token _ < "$LOCK_DIR/owner" 2>/dev/null || owner_token=''
+  ino_now=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
+  if [ "$owner_token" != "$MY_LOCK_TOKEN" ] || [ "$ino_now" != "$ino" ]; then
+    die "lost the device lock during initialisation; retry"
+  fi
   trap '_release_lock' EXIT
   trap '_release_lock; exit 130' INT TERM HUP
   # A write that was killed mid-swap left a record behind. Resolve it now, with

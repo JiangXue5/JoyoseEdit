@@ -4015,6 +4015,19 @@ echo "EXIT=$?"`,
     return 'nothing to repair, record cleared';
   });
 
+  await check('锁：owner 刚创建还没来得及写完时不算死锁', () => {
+    const h = newHarness();
+    // The window the 20-writer test hit on a slower machine: `printf > owner`
+    // creates the file before filling it, and a waiter that read it in between
+    // saw "no owner" on a lock that was about to be held.
+    mkdirSync(path.join(h.dataDir, 'lock'), { recursive: true });
+    writeFileSync(path.join(h.dataDir, 'lock', 'owner'), '');
+    const r = runHarness(h, `( _lock_stale )\necho "STALE=$?"`);
+    cleanupHarness(h);
+    if (!r.out.includes('STALE=1')) throw new Error('an initialising lock was judged stale: ' + r.out.trim());
+    return 'grace period covers an unreadable owner';
+  });
+
   await check('锁：20 个写入者并发抢锁，临界区始终只有一个', () => {
     const h = newHarness();
     const n = 20;
