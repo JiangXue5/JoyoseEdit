@@ -1832,8 +1832,19 @@ shift
 # Every command that can stop Joyose or change a file takes the device lock.
 # Read-only probes (stat/digest/pull/status) stay lock-free so a long upload
 # never blocks the dashboard.
+#
+# `push-pair-from-stage` belongs here more than anything else does: it is the
+# command the WebUI uses for a normal commit (both databases move as one), and
+# for a while it was the only mutating command missing from this list — the
+# single-database path was serialised while the common one was not. A missing
+# entry also skipped `_recover_pending_pair`, so a commit could overwrite the
+# record left by an interrupted one.
+#
+# `history-save-from-stage` / `history-clear` write and delete files the next
+# commit reads (seq allocation scans the same directory), and they are called
+# by every WebView, so they need the same mutex.
 case "$cmd" in
-  push|push-from-stage|backup|revert|revert-latest|reset-cloud|teg-freeze|teg-unfreeze|restart)
+  push|push-from-stage|push-pair-from-stage|backup|revert|revert-latest|reset-cloud|teg-freeze|teg-unfreeze|restart|history-save-from-stage|history-clear)
     _acquire_lock "$cmd" ;;
 esac
 

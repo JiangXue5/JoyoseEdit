@@ -19,7 +19,7 @@ import path from 'node:path';
 import os from 'node:os';
 import initSqlJs from 'sql.js';
 import { fileURLToPath } from 'node:url';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 import { parseFrc, serializeFrc, blankFrc, validateFrc } from '../src/parsers/frc-string';
@@ -3332,6 +3332,23 @@ function cleanupHarness(h: HelperHarness) {
   }
 }
 
+/** Start a driver script in the background so a test can observe the helper
+ *  while it is still running. `runHarness` is synchronous and would have
+ *  finished before the assertion looked at the lock. */
+function spawnHarness(h: HelperHarness, driver: string, env: Record<string, string> = {}) {
+  const file = path.join(h.dir, `bg-${Math.random().toString(36).slice(2)}.sh`);
+  writeFileSync(file, harnessScript(h, driver));
+  return spawn('sh', [file], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      ...env,
+      ...(h.sysbin ? { PATH: `${h.bin}:${h.sysbin}` } : {}),
+      FAKE: h.fake,
+    },
+  });
+}
+
 /** Run the helper through its real dispatch block, the way the WebUI does.
  *
  *  `runHarness` cuts the dispatch off so one function can be called directly;
@@ -3359,6 +3376,15 @@ function runDispatch(h: HelperHarness, args: string[], env: Record<string, strin
   // test can assert "the writer died mid-swap" without guessing.
   const code = r.status ?? (r.signal === 'SIGKILL' ? 137 : r.signal === 'SIGTERM' ? 143 : -1);
   return { code, out: r.stdout ?? '', err: r.stderr ?? '' };
+}
+
+function waitFor(pred: () => boolean, ms = 5000): boolean {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    execFileSync('sleep', ['0.05']);
+  }
+  return false;
 }
 
 function jettison(h: HelperHarness): string[] {
@@ -3918,6 +3944,49 @@ echo "EXIT=$?"`,
     return 'half-applied pair rolled back on next lock';
   });
 
+  await check('锁：双库提交从分发入口进来也要排队', () => {
+    // Every other write command was serialised; the one the WebUI actually
+    // uses for a commit was not, because its name was missing from the
+    // whitelist. Calling cmd_push_pair_from_stage directly cannot prove this —
+    // the whitelist lives in the dispatch block, so the test has to enter
+    // there.
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const before = shaOf(sp);
+    const held = path.join(h.fake, 'held');
+    const lockDir = path.join(h.dataDir, 'lock');
+    const holder = spawnHarness(
+      h,
+      // Acquire in this shell, not in a subshell: a subshell that takes the
+      // lock also installs the EXIT trap in itself, and releasing it on the way
+      // out is exactly what this test must not do.
+      '_acquire_lock holder\n: > "$FAKE/held"\nsleep 4',
+      { LOCK_WAIT_TICKS: '20' },
+    );
+    const started = waitFor(() => existsSync(held));
+    const r = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', ''], {
+      LOCK_WAIT_TICKS: '3',
+    });
+    const unchanged = shaOf(sp) === before;
+    // SIGTERM runs the helper's own trap, so the lock is released the way a
+    // killed write releases it; SIGKILL would leave a stale directory and turn
+    // the second half of this test into a stale-lock test instead.
+    holder.kill('SIGTERM');
+    const released = waitFor(() => !existsSync(lockDir), 5000);
+    const ok = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', ''], {
+      LOCK_WAIT_TICKS: '20',
+    });
+    cleanupHarness(h);
+    if (!started) throw new Error('the lock holder never took the lock');
+    if (r.code === 0) throw new Error('a second pair write entered while the lock was held');
+    if (!/device is busy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 300));
+    if (!unchanged) throw new Error('the database changed under a held lock');
+    if (!released) throw new Error('the holder did not release the lock');
+    if (ok.code !== 0) throw new Error('pair write never succeeds through dispatch: ' + ok.err.slice(0, 300));
+    return 'refused while held, succeeds afterwards';
+  });
+
   await check('标签：stat 读不到 context 时，已落地的写入不再被报告为失败', () => {
     // `_selinux_context` runs inside a command substitution, and the helper
     // runs with `set -e`. On a ROM where `stat -c %C` exits non-zero (any ROM
@@ -3947,6 +4016,36 @@ exec /usr/bin/stat "$@"
     if (!landed) throw new Error('the pair never landed: ' + r.err.slice(0, 300));
     if (r.code !== 0) throw new Error('a write that landed was reported as failed: ' + r.err.slice(0, 300));
     return 'landed and reported as landed';
+  });
+
+  await check('崩溃：双库提交会先恢复上一次遗留事务，而不是覆盖它', () => {
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    const beforeSp = shaOf(sp);
+    const beforeTeg = shaOf(teg);
+    touchState(h, 'mv-kills-on-teg');
+    const dead = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
+    unlinkSync(path.join(h.fake, 'mv-kills-on-teg'));
+    const rec = existsSync(path.join(h.dataDir, '.pending-pair'));
+    const again = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
+    const note = existsSync(path.join(h.dataDir, '.pending-pair.note'))
+      ? readFileSync(path.join(h.dataDir, '.pending-pair.note'), 'utf8')
+      : '';
+    const afterSp = readFileSync(sp);
+    const afterTeg = readFileSync(teg);
+    const moved = shaOf(sp) !== beforeSp || shaOf(teg) !== beforeTeg;
+    const wantSp = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db'));
+    const wantTeg = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db'));
+    cleanupHarness(h);
+    if (dead.code !== 137) throw new Error('the write was not killed between swaps: ' + dead.err.slice(0, 200));
+    if (!rec) throw new Error('no transaction record was left behind');
+    if (again.code !== 0) throw new Error('pair write after a crash failed: ' + again.err.slice(0, 300));
+    if (!/rolled-back/.test(note)) throw new Error('the leftover transaction was not recovered first: ' + note);
+    if (!afterSp.equals(wantSp) || !afterTeg.equals(wantTeg)) throw new Error('the new pair did not land');
+    if (!moved) throw new Error('nothing changed');
+    return 'recovered, then committed';
   });
 
   await check('回滚：设备上少了一个库时，只恢复另一个并报告 skipped', () => {
