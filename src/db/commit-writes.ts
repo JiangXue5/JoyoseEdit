@@ -36,6 +36,10 @@ export interface SmartpWrite {
 export interface SmartpPlan {
   writes: SmartpWrite[];
   skipped: Record<string, SkipReason>;
+  /** Rows whose `params` on disk could not be parsed, with the parse error.
+   *  They are left byte-for-byte alone; naming them is what lets the UI say
+   *  "one row is unreadable" instead of the commit just failing. */
+  brokenRows: { name: string; message: string }[];
 }
 
 /** Decide which `cloud_config` rows this commit should rewrite.
@@ -51,12 +55,22 @@ export function planSmartpWrites(
   workBase: Record<string, any>,
 ): SmartpPlan {
   const diskParams: Record<string, any> = {};
+  const unparseable: Record<string, string> = {};
   for (const row of listCloudConfig(db)) {
-    diskParams[row.config_name] = parseParams(row.params);
+    // One unreadable row used to throw out of here and take the whole commit
+    // with it — every other edit in the batch was lost because of a row the
+    // user never touched. Parse per row instead, and decide below whether that
+    // row is actually part of this commit.
+    try {
+      diskParams[row.config_name] = parseParams(row.params);
+    } catch (err: any) {
+      unparseable[row.config_name] = err?.message ?? String(err);
+    }
   }
 
   const writes: SmartpWrite[] = [];
   const skipped: Record<string, SkipReason> = {};
+  const brokenRows: { name: string; message: string }[] = [];
 
   for (const [name, obj] of Object.entries(cloudConfig)) {
     const meta = obj?.meta;
@@ -77,6 +91,25 @@ export function planSmartpWrites(
       continue;
     }
     const raw = diskParams[name];
+    if (unparseable[name] !== undefined) {
+      // The row's bytes on disk are not what this session parsed. Leave them
+      // untouched — unless this commit is the thing that wants to change the
+      // row, in which case there is nothing to merge onto and guessing would
+      // overwrite whatever is there.
+      const untouched =
+        workBase[name] === undefined ||
+        stringifyParams(workBase[name]) === stringifyParams(obj.params);
+      if (untouched) {
+        skipped[name] = 'broken';
+        brokenRows.push({ name, message: unparseable[name] });
+        continue;
+      }
+      throw new Error(
+        `cloud_config 中 ${name} 这一行的 JSON 在设备上已经损坏（${unparseable[name]}），` +
+          `而本次提交要改它。已停止提交，其它配置的修改仍然保留在界面里；` +
+          `请先在设备上修复该行（或重新拉取后再改）再提交。`,
+      );
+    }
     const plan = planSmartpWrite({
       raw,
       workBefore: workBase[name],
@@ -98,7 +131,7 @@ export function planSmartpWrites(
     writes.push({ name, params: plan.params, serialized, version: pickSmartpVersion(meta) });
   }
 
-  return { writes, skipped };
+  return { writes, skipped, brokenRows };
 }
 
 /** Apply a plan. Separate from planning so a caller can write both databases

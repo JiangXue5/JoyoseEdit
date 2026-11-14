@@ -2201,6 +2201,62 @@ async function runCommitWritesTest(SQL: Awaited<ReturnType<typeof initSqlJs>>) {
     }
   });
 
+  await check('writes: 一行坏 JSON 不再拖垮整次提交', () => {
+    // The row was fine when the WebUI pulled it and something (another editor,
+    // a half-written cloud push) left unparseable bytes behind. Parsing every
+    // row up front threw out of the planner, and the user's edit to an
+    // unrelated row never landed.
+    const db = new SQL.Database(smartpBytes);
+    try {
+      const rows = listCloudConfig(db);
+      const target = rows[0];
+      const victim = rows[1];
+      const victimParsed = JSON.parse(String(victim.params));
+      const victimBefore = String(victim.params);
+      db.run('UPDATE cloud_config SET params = ? WHERE config_name = ?', [
+        '{"oops": ',
+        victim.config_name,
+      ]);
+      const raw = JSON.parse(String(target.params));
+      const edited = { ...raw, __ok: 1 };
+      const cloudConfig = {
+        [target.config_name]: { meta: { _real: true, source: 'smartp' }, params: edited },
+        [victim.config_name]: { meta: { _real: true, source: 'smartp' }, params: victimParsed },
+      };
+      const workBase = { [target.config_name]: raw, [victim.config_name]: victimParsed };
+      const plan = planSmartpWrites(db, cloudConfig, workBase);
+      applySmartpWrites(db, plan.writes);
+      const after = Object.fromEntries(listCloudConfig(db).map((r) => [r.config_name, String(r.params)]));
+      if (plan.writes.length !== 1) throw new Error('planned ' + plan.writes.length + ' writes');
+      if (plan.skipped[victim.config_name] !== 'broken') {
+        throw new Error('broken row reason: ' + plan.skipped[victim.config_name]);
+      }
+      if (plan.brokenRows.length !== 1 || plan.brokenRows[0].name !== victim.config_name) {
+        throw new Error('broken row not reported: ' + JSON.stringify(plan.brokenRows));
+      }
+      if (!after[target.config_name].includes('__ok')) throw new Error('the good edit did not land');
+      if (after[victim.config_name] !== '{"oops": ') throw new Error('the broken row was rewritten');
+
+      // Changing that same row is the one case that must stop: there is no
+      // base to merge onto, and overwriting would destroy whatever is there.
+      let refused = '';
+      try {
+        planSmartpWrites(
+          db,
+          { [victim.config_name]: { meta: { _real: true, source: 'smartp' }, params: { fixed: true } } },
+          { [victim.config_name]: victimParsed },
+        );
+      } catch (err: any) {
+        refused = String(err?.message ?? err);
+      }
+      if (!refused.includes(victim.config_name)) throw new Error('editing the broken row was not refused: ' + refused);
+      if (victimBefore === '{"oops": ') throw new Error('fixture did not corrupt the row');
+      return '别的行照常写入，改到坏行才拒绝';
+    } finally {
+      db.close();
+    }
+  });
+
   await check('writes: teg updates the newest revision and inserts a missing module', () => {
     const db = new SQL.Database(tegBytes);
     try {

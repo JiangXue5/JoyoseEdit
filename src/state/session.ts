@@ -958,6 +958,10 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     /** Params we actually wrote into SmartP, so the in-memory raw copy keeps
      *  matching the database after this commit. */
     const writtenRaw: Record<string, any> = {};
+    /** Rows left untouched because their JSON on disk is unreadable. They are
+     *  reported, not swallowed: otherwise the commit looks complete while one
+     *  config silently keeps its old bytes. */
+    const brokenRowsSeen: { name: string; message: string }[] = [];
     try {
       // Only rewrite rows the user actually touched. Re-serialising every row
       // meant that a cloud push landing between our pull and our commit was
@@ -972,6 +976,7 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
         const plan = planSmartpWrites(dbS, state.cloudConfig, workBase);
         applySmartpWrites(dbS, plan.writes);
         for (const w of plan.writes) writtenRaw[w.name] = w.params;
+        brokenRowsSeen.push(...plan.brokenRows);
       }
       if (dbT) {
         applyTegWrites(dbT, planTegWrites(dbT, state.rulesByModule));
@@ -1143,7 +1148,17 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
         joyoseStopped: stopConfirmed,
         joyoseWasRunning: wasRunning.length > 0 ? wasRunning.some(Boolean) : null,
         joyoseRestarted: restarted?.started ?? null,
-        warnings: writeWarnings(writeResults),
+        warnings: [
+          ...writeWarnings(writeResults),
+          ...(brokenRowsSeen.length
+            ? [
+                `有 ${brokenRowsSeen.length} 行配置的 JSON 无法解析（${brokenRowsSeen
+                  .slice(0, 3)
+                  .map((r) => r.name)
+                  .join('、')}），已保持原样未改动`,
+              ]
+            : []),
+        ],
       }),
     };
   } catch (err) {
