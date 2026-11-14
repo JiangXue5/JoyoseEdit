@@ -12,7 +12,7 @@
 
 import {
   readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync,
-  statSync, symlinkSync, chownSync,
+  statSync, symlinkSync, chownSync, existsSync, unlinkSync,
 } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -195,6 +195,7 @@ async function main() {
   await runRestorePlanTest();
   await runOperationResultTest();
   await runHelperFailureTest();
+  await runTransactionTest();
   await runCompatMatrixTest();
   await runImportPackageTest();
   await runFrcStringTest();
@@ -3178,7 +3179,22 @@ if [ -f "$FAKE/mv-fails-teg" ]; then
   for last; do :; done
   case "$last" in *teg_config.db) printf 'mv: cannot replace %s\\n' "$last" >&2; exit 1 ;; esac
 fi
+# Kills the helper between the two renames: the one failure no error handling
+# inside the process can undo, so it is the only honest way to prove the
+# crash-recovery record works.
+if [ -f "$FAKE/mv-kills-on-teg" ]; then
+  for last; do :; done
+  case "$last" in
+    *teg_config.db) kill -9 "$PPID" 2>/dev/null; sleep 1; exit 1 ;;
+  esac
+fi
 exec /usr/bin/mv "$@"
+`,
+    // Prints 0 by default. A ROM where the relabel fails is the branch that
+    // `restorecon ... || true` used to hide.
+    restorecon: `#!/bin/sh
+[ -f "$FAKE/restorecon-fails" ] && exit 1
+exit 0
 `,
   };
   for (const [name, body] of Object.entries(tools)) {
@@ -3681,6 +3697,349 @@ echo "EXIT=$?"`,
     }
     return 'four string fields, no crash';
   });
+}
+
+// ---- device-side transaction, metadata and crash recovery ----------------
+//
+// Four claims that only a real shell can prove, because each one is about what
+// survives a process that is no longer running:
+//
+//   * a backup directory is either complete or refused, never half-restored;
+//   * a failed SELinux relabel is reported instead of swallowed;
+//   * a write that could not be digest-checked says so;
+//   * a swap interrupted between its two renames is repaired on the next run.
+
+async function runTransactionTest() {
+  console.log('\n=== transaction, metadata and crash recovery ===');
+  if (!shHasTools()) {
+    await check('tx: 故障注入跳过（本机没有 sh）', () => 'skipped');
+    return;
+  }
+
+  const push = `B64=$(base64 -w0 "$DB/new.db")
+( cmd_push smartp "$B64" "$(stat -c %s "$DB/new.db")" "" )
+echo "EXIT=$?"`;
+
+  // A device with both databases, and both candidates staged for a pair write.
+  const seedPair = (h: HelperHarness) => {
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    writeFileSync(
+      path.join(stageDir, 'sp'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')).toString('base64'),
+    );
+    writeFileSync(
+      path.join(stageDir, 'teg'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db')).toString('base64'),
+    );
+    writeFileSync(
+      path.join(h.dbDir, 'teg_config.db'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 15/teg_config.db')),
+    );
+  };
+  const pairWrite = `( cmd_push_pair_from_stage sp teg "" "" "" "" "" "" )
+echo "EXIT=$?"`;
+  // Any mutating command takes the lock, and taking the lock is where a
+  // leftover transaction record is resolved.
+  const takeLock = `( _acquire_lock probe )
+echo "EXIT=$?"`;
+
+  await check('备份：完整才写 COMPLETE，缺一个库的备份拒绝回滚', () => {
+    const h = newHarness();
+    seedPair(h);
+    const r1 = runHarness(h, `( cmd_backup --no-restore )\necho "EXIT=$?"`);
+    const names = readdirSync(path.join(h.dataDir, 'backup')).sort();
+    const dir = path.join(h.dataDir, 'backup', names[0] ?? 'missing');
+    const marked = existsSync(path.join(dir, 'COMPLETE'));
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const before = shaOf(sp);
+    // The shape of a run killed between its two `cp` calls: SmartP landed,
+    // teg never did.
+    rmSync(path.join(dir, 'teg_config.db'), { force: true });
+    const r2 = runHarness(h, `( cmd_revert ${names[0]} )\necho "EXIT=$?"`);
+    const after = shaOf(sp);
+    cleanupHarness(h);
+    if (!r1.out.includes('EXIT=0')) throw new Error('backup failed: ' + r1.err.slice(0, 300));
+    if (!marked) throw new Error('backup directory has no completeness marker');
+    if (!r2.out.includes('EXIT=1')) throw new Error('half backup was restored');
+    if (!/incomplete-backup/.test(r2.err)) throw new Error('wrong code: ' + r2.err.slice(0, 300));
+    if (after !== before) throw new Error('live database changed on a refused revert');
+    return 'marker written, half backup refused';
+  });
+
+  await check('备份：内容与生成时的摘要不符时拒绝回滚', () => {
+    const h = newHarness();
+    seedPair(h);
+    const r1 = runHarness(h, `( cmd_backup --no-restore )\necho "EXIT=$?"`);
+    const name = readdirSync(path.join(h.dataDir, 'backup'))[0] ?? '';
+    const dir = path.join(h.dataDir, 'backup', name);
+    // A different but perfectly valid database: the integrity check passes, so
+    // only the marker can tell that this is not what was snapshotted.
+    writeFileSync(
+      path.join(dir, 'SmartP.db'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')),
+    );
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const before = shaOf(sp);
+    const r2 = runHarness(h, `( cmd_revert ${name} )\necho "EXIT=$?"`);
+    const after = shaOf(sp);
+    cleanupHarness(h);
+    if (!r1.out.includes('EXIT=0')) throw new Error('backup failed: ' + r1.err.slice(0, 300));
+    if (!r2.out.includes('EXIT=1')) throw new Error('tampered backup was restored');
+    if (!/backup-corrupt/.test(r2.err)) throw new Error('wrong code: ' + r2.err.slice(0, 300));
+    if (after !== before) throw new Error('live database changed');
+    return 'tampered snapshot refused';
+  });
+
+  await check('备份：旧版本没有标记时仍然可回滚，但结果标成 legacy', () => {
+    const h = newHarness();
+    seedPair(h);
+    runHarness(h, `( cmd_backup --no-restore )\necho "EXIT=$?"`);
+    const name = readdirSync(path.join(h.dataDir, 'backup'))[0] ?? '';
+    rmSync(path.join(h.dataDir, 'backup', name, 'COMPLETE'), { force: true });
+    const r = runHarness(h, `( cmd_revert ${name} )\necho "EXIT=$?"`);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('legacy backup refused: ' + r.err.slice(0, 300));
+    if (!/"legacy":true/.test(r.out)) throw new Error('did not report legacy: ' + r.out.slice(0, 300));
+    return 'legacy backup restored and flagged';
+  });
+
+  await check('标签：restorecon 失败时写入仍成功，但报告 failed', () => {
+    const h = newHarness();
+    touchState(h, 'restorecon-fails');
+    const r = runHarness(h, push);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write failed: ' + r.err.slice(0, 300));
+    if (!/"labelRestored":"failed"/.test(r.out)) throw new Error('failure not reported: ' + r.out.slice(0, 300));
+    return 'label failure reported, write kept';
+  });
+
+  await check('标签：没有 restorecon 的 ROM 报 unsupported', () => {
+    const h = newHarness();
+    unlinkSync(path.join(h.bin, 'restorecon'));
+    const r = runHarness(h, push);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write failed: ' + r.err.slice(0, 300));
+    if (!/"labelRestored":"unsupported"/.test(r.out)) throw new Error('wrong label state: ' + r.out.slice(0, 300));
+    return 'unsupported, not failed';
+  });
+
+  await check('摘要：无法计算时报告 verifiedBy=length 且未复核在库文件', () => {
+    const h = newHarness();
+    const r = runHarness(h, push);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write failed: ' + r.err.slice(0, 300));
+    if (!/"verifiedBy":"length"/.test(r.out)) throw new Error('downgrade not reported: ' + r.out.slice(0, 300));
+    if (!/"liveChecked":false/.test(r.out)) throw new Error('live re-check claimed: ' + r.out.slice(0, 300));
+    return 'length-only write says so';
+  });
+
+  await check('摘要：带摘要时报告 verifiedBy=sha256', () => {
+    const h = newHarness();
+    const r = runHarness(
+      h,
+      `B64=$(base64 -w0 "$DB/new.db")
+SHA=$(sha256sum "$DB/new.db" | cut -d' ' -f1)
+CUR=$(sha256sum "$DB/SmartP.db" | cut -d' ' -f1)
+( cmd_push smartp "$B64" "$(stat -c %s "$DB/new.db")" "$SHA" "$CUR" )
+echo "EXIT=$?"`,
+    );
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('write failed: ' + r.err.slice(0, 300));
+    if (!/"verifiedBy":"sha256"/.test(r.out)) throw new Error('digest not reported: ' + r.out.slice(0, 300));
+    if (!/"liveChecked":true/.test(r.out)) throw new Error('live check not reported: ' + r.out.slice(0, 300));
+    return 'sha256 + live check';
+  });
+
+  await check('崩溃：第二次换库前被杀，下次加锁时两库回滚到旧的一代', () => {
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    const beforeSp = shaOf(sp);
+    const beforeTeg = shaOf(teg);
+    touchState(h, 'mv-kills-on-teg');
+    const dead = runHarness(h, pairWrite);
+    const halfSp = shaOf(sp);
+    const halfTeg = shaOf(teg);
+    const recorded = existsSync(path.join(h.dataDir, '.pending-pair'));
+    unlinkSync(path.join(h.fake, 'mv-kills-on-teg'));
+    const r2 = runHarness(h, takeLock);
+    const afterSp = shaOf(sp);
+    const afterTeg = shaOf(teg);
+    const stillRecorded = existsSync(path.join(h.dataDir, '.pending-pair'));
+    const note = existsSync(path.join(h.dataDir, '.pending-pair.note'))
+      ? readFileSync(path.join(h.dataDir, '.pending-pair.note'), 'utf8')
+      : '';
+    cleanupHarness(h);
+    // The driver runs the write in a subshell, so the kill lands there: the
+    // subshell dies with 137 and the outer script keeps going. That is a closer
+    // model of a phone losing the writer mid-swap than "no output at all".
+    if (!dead.out.includes('EXIT=137')) {
+      throw new Error('the write was not killed between swaps: ' + (dead.out || dead.err).slice(0, 200));
+    }
+    if (halfSp === beforeSp) throw new Error('SmartP was not swapped before the kill (test did not reach the window)');
+    if (halfTeg !== beforeTeg) throw new Error('teg changed before the kill');
+    if (!recorded) throw new Error('no transaction record was written before the swap');
+    if (!r2.out.includes('EXIT=0')) throw new Error('recovery refused: ' + r2.err.slice(0, 300));
+    if (afterSp !== beforeSp) throw new Error('SmartP was not rolled back');
+    if (afterTeg !== beforeTeg) throw new Error('teg moved during recovery');
+    if (stillRecorded) throw new Error('transaction record was not cleared');
+    if (!/rolled-back/.test(note)) throw new Error('recovery not recorded: ' + note);
+    return 'half-applied pair rolled back on next lock';
+  });
+
+  await check('回滚：设备上少了一个库时，只恢复另一个并报告 skipped', () => {
+    const h = newHarness();
+    seedPair(h);
+    runHarness(h, `( cmd_backup --no-restore )\necho "EXIT=$?"`);
+    const name = readdirSync(path.join(h.dataDir, 'backup'))[0] ?? '';
+    // The device lost teg_config.db entirely. Restoring SmartP is still the
+    // useful thing to do, but the result must say the pair is incomplete.
+    rmSync(path.join(h.dbDir, 'teg_config.db'), { force: true });
+    const r = runHarness(h, `( cmd_revert ${name} )\necho "EXIT=$?"`);
+    const tegBack = existsSync(path.join(h.dbDir, 'teg_config.db'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('revert failed: ' + r.err.slice(0, 300));
+    if (!/teg_config\.db/.test(r.out)) throw new Error('skipped database not reported: ' + r.out.slice(0, 300));
+    if (tegBack) throw new Error('a database the device no longer had was recreated');
+    return 'partial restore reported';
+  });
+
+  await check('崩溃：回滚副本丢失时拒绝写入，而不是猜', () => {
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    const oldSp = shaOf(sp);
+    // SmartP already swapped, teg not, and the rollback copy is gone: there is
+    // no evidence-backed way to put SmartP back.
+    writeFileSync(sp, readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')));
+    const lines = [
+      'created=1',
+      'sp_rb=/nonexistent/sp.rb',
+      'teg_rb=/nonexistent/teg.rb',
+      `sp_old=${oldSp}`,
+      `teg_old=${shaOf(teg)}`,
+      `sp_new=${shaOf(sp)}`,
+      `teg_new=deadbeef`,
+      `sp_old_size=1`,
+      `teg_old_size=1`,
+      `sp_new_size=${statSync(sp).size}`,
+      `teg_new_size=0`,
+      'sp_used=true',
+      'teg_used=true',
+      'was_running=false',
+    ].join('\n');
+    writeFileSync(path.join(h.dataDir, '.pending-pair'), lines + '\n');
+    const r = runHarness(h, takeLock);
+    const kept = existsSync(path.join(h.dataDir, '.pending-pair'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('recovery guessed instead of refusing');
+    if (!/recovery-required/.test(r.err)) throw new Error('wrong code: ' + r.err.slice(0, 300));
+    if (!kept) throw new Error('evidence was deleted on an undecidable state');
+    return 'refused, record kept';
+  });
+
+  await check('崩溃：两库都已写入时只清理记录，不回滚', () => {
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    // State after both swaps landed and the process died before clearing the
+    // record: the digests say "committed", and rolling back would throw away a
+    // finished write.
+    const sha = (f: string) => shaOf(f);
+    const lines = [
+      'created=1',
+      'sp_rb=/nonexistent/sp.rb',
+      'teg_rb=/nonexistent/teg.rb',
+      'sp_old=0000000000000000000000000000000000000000000000000000000000000000',
+      'teg_old=1111111111111111111111111111111111111111111111111111111111111111',
+      `sp_new=${sha(sp)}`,
+      `teg_new=${sha(teg)}`,
+      `sp_old_size=1`,
+      `teg_old_size=1`,
+      `sp_new_size=${statSync(sp).size}`,
+      `teg_new_size=${statSync(teg).size}`,
+      'sp_used=true',
+      'teg_used=true',
+      'was_running=false',
+    ].join('\n');
+    writeFileSync(path.join(h.dataDir, '.pending-pair'), lines + '\n');
+    const beforeSp = sha(sp);
+    const r = runHarness(h, takeLock);
+    const afterSp = sha(sp);
+    const gone = !existsSync(path.join(h.dataDir, '.pending-pair'));
+    const note = existsSync(path.join(h.dataDir, '.pending-pair.note'))
+      ? readFileSync(path.join(h.dataDir, '.pending-pair.note'), 'utf8')
+      : '';
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('recovery refused: ' + r2msg(r));
+    if (!gone) throw new Error('record kept after a committed transaction');
+    if (afterSp !== beforeSp) throw new Error('a committed transaction was rolled back');
+    if (!/committed/.test(note)) throw new Error('wrong note: ' + note);
+    return 'committed record discarded, data kept';
+  });
+
+  await check('崩溃：还没换库就断电时只清理，不碰数据库', () => {
+    const h = newHarness();
+    seedPair(h);
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    const beforeSp = shaOf(sp);
+    const lines = [
+      'created=1',
+      'sp_rb=/nonexistent/sp.rb',
+      'teg_rb=/nonexistent/teg.rb',
+      `sp_old=${shaOf(sp)}`,
+      `teg_old=${shaOf(teg)}`,
+      'sp_new=deadbeef',
+      'teg_new=deadbeef',
+      `sp_old_size=${statSync(sp).size}`,
+      `teg_old_size=${statSync(teg).size}`,
+      'sp_new_size=0',
+      'teg_new_size=0',
+      'sp_used=true',
+      'teg_used=true',
+      'was_running=false',
+    ].join('\n');
+    writeFileSync(path.join(h.dataDir, '.pending-pair'), lines + '\n');
+    const r = runHarness(h, takeLock);
+    const afterSp = shaOf(sp);
+    const gone = !existsSync(path.join(h.dataDir, '.pending-pair'));
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('recovery refused: ' + r.err.slice(0, 300));
+    if (!gone) throw new Error('record kept after a transaction that never started');
+    if (afterSp !== beforeSp) throw new Error('database touched');
+    return 'nothing to repair, record cleared';
+  });
+
+  await check('锁：20 个写入者并发抢锁，临界区始终只有一个', () => {
+    const h = newHarness();
+    const n = 20;
+    const script = Array.from({ length: n }, () =>
+      `( _acquire_lock c; echo in >> "$FAKE/conc.log"; sleep 0.02; echo out >> "$FAKE/conc.log"; _release_lock ) &`,
+    );
+    script.push('wait');
+    const t0 = Date.now();
+    const r = runHarness(h, script.join('\n'));
+    const took = Date.now() - t0;
+    const seq = readFileSync(path.join(h.fake, 'conc.log'), 'utf8').trim().split('\n');
+    cleanupHarness(h);
+    if (seq.length !== n * 2) throw new Error(`expected ${n * 2} entries, got ${seq.length}: ` + r.err.slice(0, 200));
+    // Strictly alternating is the whole assertion: two "in" lines in a row mean
+    // two writers held the lock at the same time.
+    for (let i = 0; i < seq.length; i++) {
+      const want = i % 2 === 0 ? 'in' : 'out';
+      if (seq[i] !== want) throw new Error(`interleaved at ${i}: ${seq.slice(0, i + 1).join(',')}`);
+    }
+    return `${n} writers serialised in ${took} ms`;
+  });
+}
+
+function r2msg(r: { out: string; err: string }): string {
+  return (r.err || r.out).slice(0, 300);
 }
 
 // ---- compatibility matrix (G3) ------------------------------------------
