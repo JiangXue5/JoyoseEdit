@@ -120,7 +120,7 @@ import { isSensitiveColumn } from '../scripts/sensitive-columns.mjs';
 import { releaseZipUrl } from '../scripts/release-names.mjs';
 import { previewThermalUnlock } from '../src/parsers/thermal-unlock';
 import { isPlaceholderPkg, preflightCloudConfig } from '../src/db/preflight';
-import { makeResult, commitCode, defaultMessage } from '../src/state/result';
+import { makeResult, commitCode, defaultMessage, restartStopVerdict } from '../src/state/result';
 import { CAPABILITIES, VERIFICATION_LABEL } from '../src/compat/matrix';
 import { VIEW_IDS } from '../src/state/nav';
 import type { ConfigSnapshot, DbDigests, HistoryFileMeta, HistoryRecord } from '../src/history/store';
@@ -3190,6 +3190,43 @@ async function runOperationResultTest() {
     return 'stopped / unconfirmed / plain';
   });
 
+  await check('result: 跳过重启不能被记成「没停住」', () => {
+    // The skip verdict is `{"stopped":false,"skipped":"not-running"}`. Taking
+    // that `stopped` as the stop result set `stopConfirmed=false`, and
+    // `stopConfirmed === false` is checked before `restartSkipped` — so a
+    // landed write was reported as "Joyose 未能停止", and `written-kept-stopped`
+    // (the sentence written for exactly this case) could never be shown.
+    if (restartStopVerdict({ stopped: false, skipped: 'not-running' }) !== null) {
+      throw new Error('a skipped restart claimed a stop verdict');
+    }
+    if (restartStopVerdict(null) !== null) throw new Error('no restart claimed a verdict');
+    if (restartStopVerdict({ stopped: false }) !== false) throw new Error('a real failed stop was dropped');
+    if (restartStopVerdict({ stopped: true }) !== true) throw new Error('a confirmed stop was dropped');
+    // What the commit path composes: the write confirmed the stop, the restart
+    // was skipped, so the stop is still confirmed and only the "kept off"
+    // sentence applies.
+    const stops = [true];
+    const verdict = restartStopVerdict({ stopped: false, skipped: 'not-running' });
+    if (verdict !== null) stops.push(verdict);
+    const code = commitCode({
+      stopConfirmed: stops.every(Boolean),
+      restartAttempted: true,
+      startedAfter: false,
+      rebased: false,
+      restartSkipped: true,
+    });
+    if (code !== 'written-kept-stopped') throw new Error('skip reported as ' + code);
+    // A stop that really failed still outranks everything below it.
+    const failed = commitCode({
+      stopConfirmed: false,
+      restartAttempted: true,
+      startedAfter: false,
+      rebased: false,
+    });
+    if (failed !== 'written-stop-failed') throw new Error('failed stop lost: ' + failed);
+    return 'kept-stopped, and stop-failed still wins';
+  });
+
   await check('result: 默认字段不撒谎', () => {
     const r = makeResult({ code: 'backed-up' });
     if (!r.ok) throw new Error('backup not ok');
@@ -4303,7 +4340,19 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
       throw new Error('the restart did not skip: ' + restarted.out);
     }
     if (started) throw new Error('a commit launched Joyose that the user had turned off');
-    return 'left off, and said so';
+    // The bytes the device sent back must produce the sentence written for this
+    // case, not "Joyose 未能停止". This is the half that was missing: the helper
+    // was right and the front end turned its answer into the opposite claim.
+    const verdict = restartStopVerdict(JSON.parse(restarted.out));
+    const code = commitCode({
+      stopConfirmed: verdict ?? true,
+      restartAttempted: true,
+      startedAfter: JSON.parse(restarted.out).started ?? null,
+      rebased: false,
+      restartSkipped: JSON.parse(restarted.out).skipped === 'not-running',
+    });
+    if (code !== 'written-kept-stopped') throw new Error('the UI would say ' + code);
+    return 'left off, and the UI says so';
   });
 
   await check('teg 冻结：写入校验失败时把 Joyose 起回来', () => {

@@ -57,7 +57,7 @@ import {
 import { diff } from '@/history/diff';
 import { planRebase } from '@/history/rebase-plan';
 import { planRestore } from '@/history/restore-plan';
-import { makeResult, commitCode, type OperationResult } from '@/state/result';
+import { makeResult, commitCode, restartStopVerdict, type OperationResult } from '@/state/result';
 import { refreshEnvelope } from '@/history/envelope';
 import {
   pickBoosterParams,
@@ -745,13 +745,13 @@ async function saveJsonTargetLocked(
   if (restarted) {
     state.applyStatus = {
       // A failed stop stays failed: the restart path cannot retroactively prove
-      // the first stop worked.
+      // the first stop worked. A skipped restart has no verdict at all — reading
+      // its `stopped:false` as a failed stop is what told the user "Joyose 未能
+      // 停止" after a write that had landed.
       stopConfirmed:
         state.applyStatus?.stopConfirmed === false
           ? false
-          : typeof restarted.stopped === 'boolean'
-            ? restarted.stopped
-            : state.applyStatus?.stopConfirmed ?? null,
+          : (restartStopVerdict(restarted) ?? state.applyStatus?.stopConfirmed ?? null),
       wasRunningBefore: state.applyStatus?.wasRunningBefore ?? null,
       restartAttempted: true,
       startedAfter: restarted.started ?? null,
@@ -1112,7 +1112,11 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
       restartError = err?.message ?? String(err);
       return null;
     });
-    if (restarted) recordStop(restarted);
+    // A skipped restart is not a failed stop. `recordStop` reads `stopped:false`
+    // as "the stop failed", so feeding it the skip result turned a landed commit
+    // into "Joyose 未能停止" and made `written-kept-stopped` unreachable.
+    const restartStop = restartStopVerdict(restarted);
+    if (restartStop !== null) stops.push(restartStop);
     state.applyStatus = {
       stopConfirmed: stops.length > 0 ? stops.every(Boolean) : null,
       // Only report "it was running" when at least one write path told us.

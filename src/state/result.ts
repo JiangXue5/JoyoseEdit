@@ -116,6 +116,21 @@ export function defaultMessage(code: OperationCode): string {  switch (code) {
   }
 }
 
+/** What a restart told us about the stop, in the terms `commitCode` uses.
+ *
+ *  Returns null when the restart has nothing to say about the stop, which is
+ *  exactly the case that used to be misread: a skipped restart reports
+ *  `stopped:false`, and that `false` means "we did not stop it", not "the stop
+ *  failed". Copied into `stopConfirmed` it turned a landed write into
+ *  "Joyose 未能停止" — and, because `stopConfirmed === false` is checked before
+ *  `restartSkipped`, the `written-kept-stopped` branch was unreachable. */
+export function restartStopVerdict(
+  r: { stopped?: boolean; skipped?: string } | null | undefined,
+): boolean | null {
+  if (!r || r.skipped) return null;
+  return typeof r.stopped === 'boolean' ? r.stopped : null;
+}
+
 /** Map the facts collected during a commit to one code.
  *
  *  Order matters and mirrors what the user must be told first: a history that
