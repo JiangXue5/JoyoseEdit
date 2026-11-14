@@ -6,9 +6,12 @@
 // We use the official `kernelsu` npm package (v3.0.2+) for the `exec` bridge.
 // Its ExecOptions deliberately does NOT expose stdin — so any subcommand that
 // used to take data via stdin (push / history-save) now takes a base64
-// argument instead. Modern Android (Android 11+, where KernelSU runs) has
-// ARG_MAX >= 2 MB, comfortably above our largest payloads (~1 MB for the
-// teg_config.db mirror on a K90 Pro Max sample).
+// argument instead. ARG_MAX bounds the whole argument list, but a single
+// argument is capped separately by MAX_ARG_STRLEN (128 KB on Linux/Android),
+// and base64 of the ~1 MB teg_config.db mirror is ~1.4 MB — one argv string
+// would be rejected with E2BIG. That is why payloads are uploaded to the
+// module's stage directory in 48 KB chunks (see `stageUpload`) and the helper
+// is then asked to read from there.
 
 import { exec } from 'kernelsu';
 import type { DbSelector } from '@/db/constants';

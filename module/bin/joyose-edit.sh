@@ -34,9 +34,14 @@
 #                                  (re-enables teg cloud updates)
 #
 # The base64 arguments carry DB bytes / history JSON; the kernelsu WebUI
-# bridge does not expose stdin, so all payload goes through argv. Modern
-# Android has ARG_MAX >= 2 MB which comfortably fits our largest payload
-# (~1 MB for the teg_config.db mirror on a K90 Pro Max sample).
+# bridge does not expose stdin, so payload goes through argv. ARG_MAX is the
+# budget for the whole argument list, not for one argument: a single string is
+# capped separately by MAX_ARG_STRLEN, 128 KB on Linux and Android. Base64 of
+# the ~1 MB teg_config.db mirror on a K90 Pro Max sample is ~1.4 MB, so
+# `push <b64>` fails with E2BIG before this script is even entered. Real
+# payloads therefore go through the stage directory in 48 KB chunks
+# (`stage-append` + `push-from-stage`); `push <b64>` is only usable for small
+# databases typed by hand.
 
 set -eu
 
