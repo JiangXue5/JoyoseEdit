@@ -12,7 +12,7 @@
 
 import {
   readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync,
-  statSync, symlinkSync,
+  statSync, symlinkSync, chownSync,
 } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -50,6 +50,7 @@ import {
   splitPkgGroup,
   groupImpact,
   addPolicyForPkg,
+  removePolicyForPkg,
 } from '../src/parsers/fisr-config';
 import { findPkgRoutes, removePkgRoutes, renamePkgRoutes } from '../src/parsers/pkg-routes';
 import {
@@ -190,6 +191,7 @@ async function main() {
 
   await runHistoryStoreTest();
   await runDiffTest();
+  await runDiffPropertyTest();
   await runRestorePlanTest();
   await runOperationResultTest();
   await runHelperFailureTest();
@@ -1172,6 +1174,41 @@ async function runPolicyResultTest() {
     if ((cfg.enhance_config as any[]).length !== 0) throw new Error('created a group for an empty name');
     return 'invalid-pkg';
   });
+
+  await check('policy: 重复添加不拆分共享组', () => {
+    // A shared group is [com.a, com.b] with feature FI. Adding FI to com.a is a
+    // no-op — and it must stay a no-op, not split the group on the way to
+    // returning `duplicate`. Splitting changes what the other game sees.
+    const cfg: any = {
+      enhance_config: [
+        {
+          game_list: ['com.a', 'com.b'],
+          enhance_policy_config: [{ feature: 'FI', strategy: 1 }],
+        },
+      ],
+    };
+    const before = JSON.stringify(cfg);
+    const res = addPolicyForPkg(cfg, 'com.a', { feature: 'FI', strategy: 1 } as any);
+    if (res.ok || res.reason !== 'duplicate') throw new Error('not duplicate: ' + JSON.stringify(res));
+    if (JSON.stringify(cfg) !== before) throw new Error('shared group was split by a no-op');
+    return 'duplicate, structure untouched';
+  });
+
+  await check('policy: 删除不存在的 feature 不拆分共享组', () => {
+    const cfg: any = {
+      enhance_config: [
+        {
+          game_list: ['com.a', 'com.b'],
+          enhance_policy_config: [{ feature: 'FI', strategy: 1 }],
+        },
+      ],
+    };
+    const before = JSON.stringify(cfg);
+    const removed = removePolicyForPkg(cfg, 'com.a', 'NOPE');
+    if (removed) throw new Error('reported a removal that did not happen');
+    if (JSON.stringify(cfg) !== before) throw new Error('shared group was split by a no-op');
+    return 'missing feature, structure untouched';
+  });
   await check('policy: adding to a shared group reports the split', () => {
     const cfg = emptyFisrConfig();
     (cfg.enhance_config as any[]).push({
@@ -1854,20 +1891,57 @@ async function runThermalUnlockTest() {
     return `${bad.length} rejected / ${good.length} accepted`;
   });
 
-  await check('preflight: 重复占位条目只报一次，正常条目通过', () => {
+  await check('preflight: 用真实 state 结构拦截三个域里的占位包名', () => {
+    // The shape below is what App.vue actually passes. Every per-game list
+    // hangs off booster_config.params.game_booster, and the entries are
+    // serialized strings. The previous fixture used a convenience object
+    // (`{ game_mifisr_config: { params: … } }`) that never occurs at runtime,
+    // which is exactly why the broken path in preflight.ts looked green.
     const raw = (p: string) => serializeMifisr(blankMifisr(p));
-    const dup = {
+    const wrap = (gb: any) => ({ booster_config: { params: { game_booster: gb } } });
+
+    const mifisr = wrap({
+      customize_game_params: {
+        game_mifisr_config: [raw('com.example.newgame'), raw('com.example.newgame')],
+      },
+    });
+    const i1 = preflightCloudConfig(mifisr);
+    if (i1.length !== 1) throw new Error('mifisr: expected 1 issue, got ' + i1.length);
+
+    const frc = wrap({ frc_game_params: [serializeFrc(blankFrc('com.example.newgame'))] });
+    const i2 = preflightCloudConfig(frc);
+    if (i2.length !== 1) throw new Error('frc: expected 1 issue, got ' + i2.length);
+
+    const nt = wrap({
+      novatek_game_params: [serializeNovatek(blankNovatek('com.example.newgame'))],
+    });
+    const i3 = preflightCloudConfig(nt);
+    if (i3.length !== 1) throw new Error('novatek: expected 1 issue, got ' + i3.length);
+
+    const clean = wrap({
+      customize_game_params: { game_mifisr_config: [raw('com.miHoYo.Yuanshen')] },
+      frc_game_params: [serializeFrc(blankFrc('com.tencent.tmgp.sgame'))],
+      novatek_game_params: [serializeNovatek(blankNovatek('com.miHoYo.Yuanshen'))],
+    });
+    if (preflightCloudConfig(clean).length) throw new Error('clean config flagged');
+    // preflight runs on every commit, including one with nothing to write.
+    if (preflightCloudConfig({}).length) throw new Error('empty config flagged');
+    return 'mifisr / frc / novatek all guarded';
+  });
+
+  await check('preflight: 顶层 game_mifisr_config 不是真实结构，不再被读取', () => {
+    // Guard against the old bug coming back: a top-level row with that name
+    // does not exist in the database, so reading it would silently pass every
+    // placeholder. The check must ignore it and look only under game_booster.
+    const wrong = {
       game_mifisr_config: {
-        params: { game_mifisr_config: [raw('com.example.newgame'), raw('com.example.newgame')] },
+        params: { game_mifisr_config: [serializeMifisr(blankMifisr('com.example.newgame'))] },
       },
     };
-    const issues = preflightCloudConfig(dup);
-    if (issues.length !== 1) throw new Error('expected one issue, got ' + issues.length);
-    const clean = {
-      game_mifisr_config: { params: { game_mifisr_config: [raw('com.miHoYo.Yuanshen')] } },
-    };
-    if (preflightCloudConfig(clean).length) throw new Error('clean config flagged');
-    return 'deduped, clean passes';
+    if (preflightCloudConfig(wrong as any).length) {
+      throw new Error('read a path that never exists');
+    }
+    return 'top-level shape ignored';
   });
 
   await check('thermal: scan + apply round trip on a synthetic tree', () => {
@@ -2389,6 +2463,16 @@ async function runImportPackageTest() {
     return 'empty / duplicate rejected';
   });
 
+  await check('import: 大小上限按 UTF-8 字节而不是字符数', () => {
+    // 1.4 M CJK characters: 1.4 M UTF-16 code units, but 4.2 MB on disk. The
+    // old `.length` check saw 1.4 M and let the package through; the limit is
+    // documented in bytes and the device reads bytes.
+    const blob = '中'.repeat(1_400_000);
+    const err = expectReject(validPackage({ pad: blob }), 'cjk size');
+    if (!/过大/.test(err)) throw new Error('rejected for the wrong reason: ' + err);
+    return err.slice(0, 20);
+  });
+
   await check('import: 只有 teg_freeze_hint 的包被拒绝（无可导入内容）', () => {
     expectReject(validPackage({ domains: ['teg_freeze_hint'] }), 'hint only');
     return 'hint-only rejected';
@@ -2822,6 +2906,37 @@ async function runRestorePlanTest() {
     return 'SmartP.db drift refused';
   });
 
+  await check('restore: 摘要读不到时拒绝，而不是当作没漂移', () => {
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2]),
+      newerRecords: [r2],
+      targetRecord: r1,
+      anchorDigest: same('aa', 'bb'),
+      nowDigest: null,
+      current: s2,
+    });
+    if (out.ok) throw new Error('replayed onto an unverifiable base');
+    if (out.code !== 'unknown') throw new Error('wrong code: ' + out.code);
+    return 'unknown digest refused';
+  });
+
+  await check('restore: 旧记录没有摘要时仍然允许回滚', () => {
+    const out = planRestore({
+      targetSeq: 1,
+      floor: 0,
+      meta: metaOf([r1, r2]),
+      newerRecords: [r2],
+      targetRecord: r1,
+      anchorDigest: null,
+      nowDigest: null,
+      current: s2,
+    });
+    if (!out.ok) throw new Error('legacy history blocked: ' + out.message);
+    return 'no anchor, no block';
+  });
+
   await check('restore: 只有 teg 漂移时只报 teg', () => {
     const drift = digestDrift(same('aa', 'bb'), same('aa', 'cc'));
     if (drift.join() !== 'teg_config.db') throw new Error('wrong drift set: ' + drift.join());
@@ -3038,6 +3153,17 @@ exit 0
 `,
     cp: `#!/bin/sh
 if [ -f "$FAKE/cp-fails" ]; then printf 'cp: write error: No space left on device\\n' >&2; exit 1; fi
+# Reports success but writes a short file — the shape of a copy that ran out of
+# space on a filesystem that does not fail the write. Only used for rollback
+# copies so the staging copy stays intact.
+if [ -f "$FAKE/cp-truncates" ]; then
+  for last; do :; done
+  src=''
+  for a in "$@"; do case "$a" in -*) ;; *) src="$a"; break ;; esac; done
+  case "$last" in
+    *.jedit.rb.*) /usr/bin/head -c 4096 "$src" > "$last"; exit 0 ;;
+  esac
+fi
 exec /usr/bin/cp "$@"
 `,
     mv: `#!/bin/sh
@@ -3046,6 +3172,11 @@ if [ -f "$FAKE/mv-fails" ]; then
   case "$last" in
     *SmartP.db|*teg_config.db) printf 'mv: cannot replace %s\\n' "$last" >&2; exit 1 ;;
   esac
+fi
+# Fails only on teg, so the pair path can be tested with the first swap landing.
+if [ -f "$FAKE/mv-fails-teg" ]; then
+  for last; do :; done
+  case "$last" in *teg_config.db) printf 'mv: cannot replace %s\\n' "$last" >&2; exit 1 ;; esac
 fi
 exec /usr/bin/mv "$@"
 `,
@@ -3058,7 +3189,9 @@ exec /usr/bin/mv "$@"
   writeFileSync(path.join(bin, '.fake-dir'), fake);
 }
 
-function newHarness(opts: { sqlite3?: 'corrupt' | 'absent' | 'ok' } = {}): HelperHarness {
+function newHarness(
+  opts: { sqlite3?: 'corrupt' | 'absent' | 'ok'; without?: string[] } = {},
+): HelperHarness {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'joyose-helper-'));
   const dbDir = path.join(dir, 'db');
   const dataDir = path.join(dir, 'data');
@@ -3070,14 +3203,17 @@ function newHarness(opts: { sqlite3?: 'corrupt' | 'absent' | 'ok' } = {}): Helpe
   writeFileSync(path.join(dbDir, 'SmartP.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 15/SmartP.db')));
   writeFileSync(path.join(dbDir, 'new.db'), readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')));
   writeFakeTools(bin, fake);
-  let sysbin: string | undefined;
-  if (opts.sqlite3 === 'absent') {
-    // The helper takes a different branch when sqlite3 is missing, and the
-    // host decides which branch this test hits: the dev sandbox has no
-    // sqlite3, GitHub's ubuntu runner does. Both must exercise the fallback,
-    // so PATH is rebuilt out of symlinks to everything except sqlite3.
-    sysbin = mirrorPathWithout(path.join(dir, 'sysbin'), ['sqlite3']);
-  } else if (opts.sqlite3 === 'corrupt') {
+  // A ROM is defined by which tools it lacks. Excluding a tool means rebuilding
+  // PATH out of symlinks to everything else, because the binary normally lives
+  // next to sh/cp/mv, which the helper needs.
+  const exclude = [
+    ...(opts.sqlite3 === 'absent' ? ['sqlite3'] : []),
+    ...(opts.without ?? []),
+  ];
+  const sysbin = exclude.length
+    ? mirrorPathWithout(path.join(dir, 'sysbin'), exclude)
+    : undefined;
+  if (opts.sqlite3 === 'corrupt') {
     // A ROM that has sqlite3, and a file whose PRAGMA quick_check fails even
     // though the 16-byte header is intact.
     const f = path.join(bin, 'sqlite3');
@@ -3289,6 +3425,135 @@ echo "EXIT=$?"`);
     if (after === before) throw new Error('database was not written');
     return 'quick_check path, written';
   });
+  await check('helper: 文件级恢复保留原库的属主与权限', () => {
+    // The restored bytes are useless if the file ends up owned by root:root or
+    // with a mode Joyose cannot open. The staging copy is created by us, so
+    // without an explicit chown/chmod the attributes silently change.
+    const h = newHarness();
+    const live = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    writeFileSync(teg, readFileSync(path.join(ROOT, 'tests/Xiaomi 15/teg_config.db')));
+    // chown needs root. On a CI runner running as a normal user the ownership
+    // half cannot be exercised; the mode half still can, and both go through
+    // the same helper.
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    if (isRoot) {
+      chownSync(live, 1000, 1000);
+      chownSync(teg, 1000, 1000);
+    }
+    chmodSync(live, 0o640);
+    chmodSync(teg, 0o600);
+
+    const b = runHarness(h, '( cmd_backup test )');
+    const line = b.out.trim().split('\n').filter((l) => l.startsWith('{')).pop() ?? '{}';
+    const dir = JSON.parse(line).dir as string | undefined;
+    if (!dir) throw new Error('backup did not report a directory: ' + b.out.slice(0, 200));
+
+    // Pretend Joyose rewrote the database after the backup.
+    writeFileSync(live, 'changed');
+
+    const r = runHarness(h, `( cmd_revert ${path.basename(dir)} )\necho "EXIT=$?"`);
+    const stLive = statSync(live);
+    const stTeg = statSync(teg);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('revert failed: ' + r.out.slice(0, 300) + r.err.slice(0, 300));
+    if ((stLive.mode & 0o777) !== 0o640) {
+      throw new Error('SmartP mode changed: ' + (stLive.mode & 0o777).toString(8));
+    }
+    if ((stTeg.mode & 0o777) !== 0o600) {
+      throw new Error('teg mode changed: ' + (stTeg.mode & 0o777).toString(8));
+    }
+    if (isRoot && (stLive.uid !== 1000 || stLive.gid !== 1000)) {
+      throw new Error(`SmartP owner changed: ${stLive.uid}:${stLive.gid}`);
+    }
+    if (isRoot && (stTeg.uid !== 1000 || stTeg.gid !== 1000)) {
+      throw new Error(`teg owner changed: ${stTeg.uid}:${stTeg.gid}`);
+    }
+    return isRoot ? 'uid/gid + mode preserved' : 'mode preserved (not root)';
+  });
+
+  await check('helper: 没有 sha256 时截断的回滚副本按大小拦下', () => {
+    // No digest tool means the only remaining guard is size. Skipping it (the
+    // old behaviour) accepted a 4 KB rollback copy as a valid restore point.
+    const h = newHarness({ without: ['sha256sum'] });
+    const live = path.join(h.dbDir, 'SmartP.db');
+    const before = shaOf(live);
+    const b = runHarness(h, '( cmd_backup test )');
+    const line = b.out.trim().split('\n').filter((l) => l.startsWith('{')).pop() ?? '{}';
+    const dir = JSON.parse(line).dir as string | undefined;
+    if (!dir) throw new Error('backup did not report a directory');
+    touchState(h, 'cp-truncates');
+    const r = runHarness(h, `( cmd_revert ${path.basename(dir)} )\necho "EXIT=$?"`);
+    const same = shaOf(live) === before;
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) {
+      throw new Error('truncated rollback copy was accepted: ' + r.out.slice(0, 300) + r.err.slice(0, 300));
+    }
+    if (!same) throw new Error('live database changed despite the abort');
+    if (!/incomplete/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'size mismatch refused';
+  });
+
+  await check('helper: 双库写入有一库失败时两库都回到原样', () => {
+    // The failure this whole mechanism exists for: SmartP swaps fine, teg does
+    // not. Two independent pushes would leave SmartP new and teg old while the
+    // user is told the commit failed.
+    const h = newHarness();
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    writeFileSync(teg, readFileSync(path.join(ROOT, 'tests/Xiaomi 15/teg_config.db')));
+    const beforeSp = shaOf(sp);
+    const beforeTeg = shaOf(teg);
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    writeFileSync(
+      path.join(stageDir, 'sp'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db')).toString('base64'),
+    );
+    writeFileSync(
+      path.join(stageDir, 'teg'),
+      readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db')).toString('base64'),
+    );
+    touchState(h, 'mv-fails-teg');
+    const r = runHarness(
+      h,
+      `( cmd_push_pair_from_stage sp teg "" "" "" "" "" "" )\necho "EXIT=$?"`,
+    );
+    const afterSp = shaOf(sp);
+    const afterTeg = shaOf(teg);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=1')) throw new Error('pair write "succeeded": ' + r.out.slice(0, 300));
+    if (afterSp !== beforeSp) throw new Error('SmartP stayed on the new bytes (half commit)');
+    if (afterTeg !== beforeTeg) throw new Error('teg changed');
+    if (!/restore failed on teg/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 300));
+    return 'both databases back to their previous contents';
+  });
+
+  await check('helper: 双库写入成功时两库同时是新的', () => {
+    const h = newHarness();
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    writeFileSync(teg, readFileSync(path.join(ROOT, 'tests/Xiaomi 15/teg_config.db')));
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    const newSp = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db'));
+    const newTeg = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db'));
+    writeFileSync(path.join(stageDir, 'sp'), newSp.toString('base64'));
+    writeFileSync(path.join(stageDir, 'teg'), newTeg.toString('base64'));
+    const r = runHarness(
+      h,
+      `( cmd_push_pair_from_stage sp teg "" "" "" "" "" "" )\necho "EXIT=$?"`,
+    );
+    const gotSp = readFileSync(sp);
+    const gotTeg = readFileSync(teg);
+    cleanupHarness(h);
+    if (!r.out.includes('EXIT=0')) throw new Error('pair write failed: ' + r.out.slice(0, 300) + r.err.slice(0, 300));
+    if (!gotSp.equals(newSp)) throw new Error('SmartP is not the candidate');
+    if (!gotTeg.equals(newTeg)) throw new Error('teg is not the candidate');
+    if (!r.out.includes('"atomic":true')) throw new Error('did not report the transaction');
+    return 'both databases on the new bytes';
+  });
+
   await check('helper: 替换失败时原库保持且不留副本', () => {
     const h = newHarness();
     const before = shaOf(path.join(h.dbDir, 'SmartP.db'));
@@ -3345,6 +3610,40 @@ echo "RESTART=$?"`);
     if (after !== expected) throw new Error('bytes were not written');
     if (!/"started":false/.test(r.out)) throw new Error('restart failure not reported: ' + r.out.slice(-200));
     return 'write ok, started=false';
+  });
+
+  await check('helper: 刚建好但还没写 owner 的锁不会被抢走', () => {
+    // The window between `mkdir` and writing `owner` is a few microseconds.
+    // A waiter that treats an owner-less directory as dead moves it away while
+    // the first writer is still initialising — both then believe they hold it.
+    const h = newHarness();
+    const r = runHarness(
+      h,
+      `mkdir -p "$LOCK_DIR"
+( _acquire_lock push && echo "GOT_LOCK" )
+echo "EXIT=$?"`,
+      { LOCK_WAIT_TICKS: '3' },
+    );
+    cleanupHarness(h);
+    if (r.out.includes('GOT_LOCK')) throw new Error('stole a lock that was still initialising');
+    if (!r.out.includes('EXIT=1')) throw new Error('acquire did not fail: ' + r.out);
+    if (!/device is busy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'waited instead of stealing';
+  });
+
+  await check('helper: 确实死掉的锁（无 owner 且很旧）可以接管', () => {
+    const h = newHarness();
+    const r = runHarness(
+      h,
+      `mkdir -p "$LOCK_DIR"
+touch -d "@$(( $(date +%s) - 10 ))" "$LOCK_DIR"
+( _acquire_lock push && echo "GOT_LOCK" )
+echo "EXIT=$?"`,
+      { LOCK_WAIT_TICKS: '5' },
+    );
+    cleanupHarness(h);
+    if (!r.out.includes('GOT_LOCK')) throw new Error('a stale lock was never reclaimed: ' + r.out + r.err.slice(0, 200));
+    return 'stale lock reclaimed';
   });
 
   await check('helper: 并发写入被设备锁挡住', () => {
@@ -3421,6 +3720,80 @@ async function runCompatMatrixTest() {
       throw new Error('device-verified set drifted from README: ' + device.join(','));
     }
     return 'only mifisr claims device verification';
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Property tests for the delta engine.
+//
+// The unit cases in runDiffTest each cover one shape. These assert the two
+// laws the whole history system rests on, over a fixed corpus and a
+// deterministic random sweep:
+//
+//   applyDelta(before, diff(before, after))            === after
+//   applyDelta(after,  invertDelta(diff(before, after))) === before
+//
+// A single reverse sweep used to violate both for arrays: multiple insertions
+// landed in the wrong order, and undoing several deletions produced
+// [A,B,D,C] instead of [A,B,C,D].
+
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+async function runDiffPropertyTest() {
+  console.log('\n=== diff / invert properties ===');
+  const clone = (v: any) => JSON.parse(JSON.stringify(v));
+  const same = (x: any, y: any) => JSON.stringify(x) === JSON.stringify(y);
+
+  const round = (name: string, before: any, after: any) => {
+    const d = diff(before, after);
+    const forward = applyDelta(clone(before), d);
+    if (!same(forward, after)) {
+      throw new Error(`${name}: forward replay mismatch ${JSON.stringify(forward)} != ${JSON.stringify(after)}`);
+    }
+    const back = applyDelta(clone(after), invertDelta(d));
+    if (!same(back, before)) {
+      throw new Error(`${name}: inverse replay mismatch ${JSON.stringify(back)} != ${JSON.stringify(before)}`);
+    }
+  };
+
+  await check('diff: 数组增删改重排的前向与逆向都能复原', () => {
+    const cases: [string, any, any][] = [
+      ['multiple inserts', { l: [{ id: 'A' }, { id: 'D' }] }, { l: [{ id: 'A' }, { id: 'B' }, { id: 'C' }, { id: 'D' }] }],
+      ['multiple removals', { l: [{ id: 'A' }, { id: 'B' }, { id: 'C' }, { id: 'D' }] }, { l: [{ id: 'A' }, { id: 'D' }] }],
+      ['non-adjacent removals', { l: [{ id: 'A' }, { id: 'B' }, { id: 'C' }, { id: 'D' }, { id: 'E' }] }, { l: [{ id: 'A' }, { id: 'C' }, { id: 'E' }] }],
+      ['reorder only', { l: [{ id: 'A' }, { id: 'B' }, { id: 'C' }] }, { l: [{ id: 'C' }, { id: 'A' }, { id: 'B' }] }],
+      ['reorder + field edit', { l: [{ id: 'A', v: 1 }, { id: 'B', v: 2 }, { id: 'C', v: 3 }] }, { l: [{ id: 'C', v: 3 }, { id: 'A', v: 1 }, { id: 'B', v: 9 }] }],
+      ['insert + remove', { l: [{ id: 'A' }, { id: 'B' }, { id: 'C' }] }, { l: [{ id: 'A' }, { id: 'C' }, { id: 'D' }] }],
+      ['remove all', { l: [{ id: 'A' }, { id: 'B' }] }, { l: [] }],
+      ['from empty', { l: [] }, { l: [{ id: 'A' }, { id: 'B' }] }],
+    ];
+    for (const [name, before, after] of cases) round(name, before, after);
+    return `${cases.length} shapes, both directions`;
+  });
+
+  await check('diff: 随机数组变换 200 组都能复原', () => {
+    const rnd = lcg(20261114);
+    for (let n = 0; n < 200; n++) {
+      const size = Math.floor(rnd() * 7);
+      const pool = Array.from({ length: size }, (_, i) => ({
+        id: `k${i}`,
+        v: Math.floor(rnd() * 5),
+      }));
+      const kept = pool.filter(() => rnd() > 0.35);
+      const afterArr = kept.map((el) => (rnd() > 0.6 ? { ...el, v: Math.floor(rnd() * 5) } : { ...el }));
+      for (let i = afterArr.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        [afterArr[i], afterArr[j]] = [afterArr[j], afterArr[i]];
+      }
+      round(`random #${n}`, { l: pool }, { l: afterArr });
+    }
+    return '200 random cases';
   });
 }
 
