@@ -4028,9 +4028,11 @@ echo "EXIT=$?"`,
     return 'grace period covers an unreadable owner';
   });
 
-  await check('锁：20 个写入者并发抢锁，临界区始终只有一个', () => {
+  // CONC_WRITERS lets the suite be stressed locally (40/60 on one core) without
+  // changing what CI runs.
+  await check(`锁：${Number(process.env.CONC_WRITERS ?? 20)} 个写入者并发抢锁，临界区始终只有一个`, () => {
     const h = newHarness();
-    const n = 20;
+    const n = Number(process.env.CONC_WRITERS ?? 20);
     const script = Array.from({ length: n }, () =>
       `( _acquire_lock c; echo in >> "$FAKE/conc.log"; sleep 0.02; echo out >> "$FAKE/conc.log"; _release_lock ) &`,
     );

@@ -114,15 +114,30 @@ _new_token() {
   fi
 }
 
+# Read an owner file into one line. Deliberately `cat`, not `read < path`:
+# `read` is a special builtin, and in dash a redirection error on a special
+# builtin aborts the whole script. A release that lost the race with a waiter
+# then took the shell with it (the 40-writer stress showed `cannot open ...
+# lock.release.N/owner` and no further output).
+_owner_line() {
+  [ -f "$1" ] || return 1
+  cat "$1" 2>/dev/null || return 1
+}
+
 # A lock is stale when its owner is *gone* — never merely because it is old.
 # The previous version required `kill -0` AND `age < LOCK_TTL`, so a write that
 # took longer than three minutes had its lock declared dead while still running,
 # and a second writer could enter the critical section underneath it. Age is now
 # only a fallback for the no-procfs / legacy-owner-file case.
 _lock_owner_alive() {
-  local pid ts start token now nowstart
-  [ -f "$LOCK_DIR/owner" ] || return 1
-  read -r pid ts start token _ < "$LOCK_DIR/owner" 2>/dev/null || return 1
+  local pid ts start token now nowstart line
+  line=$(_owner_line "$LOCK_DIR/owner") || return 1
+  [ -n "$line" ] || return 1
+  set -- $line
+  pid=$1
+  ts=$2
+  start=$3
+  token=$4
   [ -n "${pid:-}" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   case "${start:-}" in
@@ -161,15 +176,32 @@ _lock_stale() {
   local mtime now
   [ -d "$LOCK_DIR" ] || return 1
   _lock_owner_alive && return 1
-  mtime=$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null || echo 0)
+  # A stat that fails must not read as "infinitely old": that turned a lock
+  # directory racing with its own removal into an instant steal.
+  mtime=$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null) || return 1
+  [ -n "$mtime" ] || return 1
   now=$(date +%s)
   [ $((now - mtime)) -ge "$LOCK_GRACE" ] || return 1
   return 0
 }
 
 _acquire_lock() {
-  local kind="$1" i=0 start ino ino_now owner_token
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  local kind="$1" i=0 start ino ino_now owner_token owner_line owner_text
+  # Build everything the owner line needs *before* the directory exists, and
+  # write it with a builtin. Between `mkdir` and the owner landing there must be
+  # no fork at all: on a loaded machine (CI, 2 cores, 20 writers) each fork cost
+  # hundreds of milliseconds, the gap grew past the grace period, and a waiter
+  # reclaimed a lock that was about to be held. Two writers then shared the
+  # critical section, which is exactly what this lock exists to prevent.
+  start=$(_proc_start "$$")
+  [ -n "$start" ] || start='-'
+  MY_LOCK_TOKEN=$(_new_token)
+  [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
+  owner_text="$$ $(date +%s) $start $MY_LOCK_TOKEN $kind"
+  while :; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      break
+    fi
     if _lock_stale; then
       # Rename first: only one waiter can move a given inode, so two processes
       # that both judged the lock stale cannot both delete a freshly created
@@ -185,31 +217,21 @@ _acquire_lock() {
     fi
     sleep 0.2 2>/dev/null || sleep 1
   done
-  ino=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
-  start=$(_proc_start "$$")
-  [ -n "$start" ] || start='-'
-  MY_LOCK_TOKEN=$(_new_token)
-  [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
-  # Publish the owner by rename, never by writing in place: a reader that sees
-  # `owner` must see all of it. `printf > owner` truncates first, and a waiter
-  # landing in that window saw an unreadable owner for a lock that was about to
-  # be held.
-  if ! printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/.owner.$$" 2>/dev/null \
-     || ! mv -f "$LOCK_DIR/.owner.$$" "$LOCK_DIR/owner" 2>/dev/null; then
-    rm -f "$LOCK_DIR/.owner.$$" 2>/dev/null || true
-    # If this write fails, the directory we just created was moved out from
-    # under us by a waiter that judged it stale. We do not hold the lock;
-    # carrying on would run two writers at once.
+  # First command after winning the directory: no fork, no temp file.
+  if ! printf '%s\n' "$owner_text" > "$LOCK_DIR/owner" 2>/dev/null; then
     die "lost the device lock during initialisation; retry"
   fi
-  # Confirm the directory is still the one we created. A waiter that judged us
-  # stale moves the directory away, and a third process can create its own in
-  # the same path a moment later — publishing our owner into *that* directory
-  # hands two writers the same lock. The inode is the identity; the token says
-  # the owner file is ours.
-  read -r _ _ _ owner_token _ < "$LOCK_DIR/owner" 2>/dev/null || owner_token=''
+  # Now that the owner is visible, it is safe to spend forks. Confirm we are
+  # still inside the directory we created: a waiter that judged us stale moves
+  # it away, and a third process can put its own directory at the same path.
+  ino=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
+  owner_line=$(_owner_line "$LOCK_DIR/owner") || owner_line=''
+  # Unquoted on purpose: this splits the five fields into $1..$5.
+  # shellcheck disable=SC2086
+  if [ -n "$owner_line" ]; then set -- $owner_line; fi
+  owner_token=${4:-}
   ino_now=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
-  if [ "$owner_token" != "$MY_LOCK_TOKEN" ] || [ "$ino_now" != "$ino" ]; then
+  if [ "$owner_token" != "$MY_LOCK_TOKEN" ] || [ -z "$ino" ] || [ "$ino_now" != "$ino" ]; then
     die "lost the device lock during initialisation; retry"
   fi
   trap '_release_lock' EXIT
@@ -224,16 +246,27 @@ _acquire_lock() {
 }
 
 _release_lock() {
-  local pid _ start token
-  [ -f "$LOCK_DIR/owner" ] || return 0
-  read -r pid _ start token _ < "$LOCK_DIR/owner" 2>/dev/null || return 0
-  [ "${pid:-}" = "$$" ] || return 0
-  # Pid alone is not identity: after we exit, an unrelated process can inherit
-  # our number and create its own lock. Only remove the lock we created.
-  if [ -n "${token:-}" ] && [ -n "${MY_LOCK_TOKEN:-}" ] && [ "$token" != "$MY_LOCK_TOKEN" ]; then
+  local line pid token
+  [ -d "$LOCK_DIR" ] || return 0
+  line=$(_owner_line "$LOCK_DIR/owner") || return 0
+  # Unquoted on purpose: splits the five fields into $1..$5.
+  # shellcheck disable=SC2086
+  if [ -n "$line" ]; then set -- $line; fi
+  pid=${1:-}
+  token=${4:-}
+  # Pid alone is not identity: every subshell of one script shares `$$`, and an
+  # unrelated process can inherit the number. Only the token says "this is the
+  # lock I took".
+  [ "$pid" = "$$" ] || return 0
+  if [ -n "$token" ] && [ -n "$MY_LOCK_TOKEN" ] && [ "$token" != "$MY_LOCK_TOKEN" ]; then
     return 0
   fi
-  rm -rf "$LOCK_DIR" 2>/dev/null
+  # Remove the owner file first, then the (now empty) directory. The previous
+  # version moved the whole directory aside and inspected it afterwards, which
+  # could move a lock that a waiter had just created at the same path — the
+  # waiter then died with "lost the device lock", or two writers ran at once.
+  rm -f "$LOCK_DIR/owner" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
   return 0
 }
 
