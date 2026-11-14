@@ -191,49 +191,54 @@ _acquire_lock() {
   # write it with a builtin. Between `mkdir` and the owner landing there must be
   # no fork at all: on a loaded machine (CI, 2 cores, 20 writers) each fork cost
   # hundreds of milliseconds, the gap grew past the grace period, and a waiter
-  # reclaimed a lock that was about to be held. Two writers then shared the
-  # critical section, which is exactly what this lock exists to prevent.
+  # reclaimed a lock that was about to be held.
   start=$(_proc_start "$$")
   [ -n "$start" ] || start='-'
   MY_LOCK_TOKEN=$(_new_token)
   [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
   owner_text="$$ $(date +%s) $start $MY_LOCK_TOKEN $kind"
   while :; do
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-      break
-    fi
-    if _lock_stale; then
-      # Rename first: only one waiter can move a given inode, so two processes
-      # that both judged the lock stale cannot both delete a freshly created
-      # one. The loser simply loops and retries.
-      if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
-        rm -rf "$LOCK_DIR.stale.$$" 2>/dev/null || true
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+      if _lock_stale; then
+        # Rename first: only one waiter can move a given inode, so two
+        # processes that both judged the lock stale cannot both delete a
+        # freshly created one. The loser simply loops and retries.
+        if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
+          rm -rf "$LOCK_DIR.stale.$$" 2>/dev/null || true
+        fi
+        continue
       fi
+      i=$((i + 1))
+      if [ "$i" -ge "$LOCK_WAIT_TICKS" ]; then
+        die "device is busy: another write is still running (pid $(awk '{print $1}' "$LOCK_DIR/owner" 2>/dev/null) · $(awk '{print $5}' "$LOCK_DIR/owner" 2>/dev/null))"
+      fi
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+    # First command after winning the directory: no fork, no temp file.
+    if ! printf '%s\n' "$owner_text" > "$LOCK_DIR/owner" 2>/dev/null; then
+      i=$((i + 1))
+      [ "$i" -lt "$LOCK_WAIT_TICKS" ] || die "device is busy: cannot publish the lock owner"
       continue
     fi
-    i=$((i + 1))
-    if [ "$i" -ge "$LOCK_WAIT_TICKS" ]; then
-      die "device is busy: another write is still running (pid $(awk '{print $1}' "$LOCK_DIR/owner" 2>/dev/null) · $(awk '{print $5}' "$LOCK_DIR/owner" 2>/dev/null))"
+    # Now that the owner is visible, spending forks is safe. Confirm we are
+    # still inside the directory we created: a waiter that judged us stale
+    # moves it away, and a third process can put its own directory at the same
+    # path. Nothing has been touched yet, so the honest response is to try
+    # again — dying here turned a millisecond race into a failed write.
+    ino=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
+    owner_line=$(_owner_line "$LOCK_DIR/owner") || owner_line=''
+    # Unquoted on purpose: this splits the five fields into $1..$5.
+    # shellcheck disable=SC2086
+    if [ -n "$owner_line" ]; then set -- $owner_line; fi
+    owner_token=${4:-}
+    ino_now=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
+    if [ -z "$ino" ] || [ "$ino_now" != "$ino" ] || [ "$owner_token" != "$MY_LOCK_TOKEN" ]; then
+      i=$((i + 1))
+      [ "$i" -lt "$LOCK_WAIT_TICKS" ] || die "device is busy: the lock changed hands during initialisation"
+      continue
     fi
-    sleep 0.2 2>/dev/null || sleep 1
+    break
   done
-  # First command after winning the directory: no fork, no temp file.
-  if ! printf '%s\n' "$owner_text" > "$LOCK_DIR/owner" 2>/dev/null; then
-    die "lost the device lock during initialisation; retry"
-  fi
-  # Now that the owner is visible, it is safe to spend forks. Confirm we are
-  # still inside the directory we created: a waiter that judged us stale moves
-  # it away, and a third process can put its own directory at the same path.
-  ino=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
-  owner_line=$(_owner_line "$LOCK_DIR/owner") || owner_line=''
-  # Unquoted on purpose: this splits the five fields into $1..$5.
-  # shellcheck disable=SC2086
-  if [ -n "$owner_line" ]; then set -- $owner_line; fi
-  owner_token=${4:-}
-  ino_now=$(stat -c '%i' "$LOCK_DIR" 2>/dev/null || echo '')
-  if [ "$owner_token" != "$MY_LOCK_TOKEN" ] || [ -z "$ino" ] || [ "$ino_now" != "$ino" ]; then
-    die "lost the device lock during initialisation; retry"
-  fi
   trap '_release_lock' EXIT
   trap '_release_lock; exit 130' INT TERM HUP
   # A write that was killed mid-swap left a record behind. Resolve it now, with
