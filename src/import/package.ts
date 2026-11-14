@@ -93,7 +93,10 @@ export function validateImportPackage(obj: unknown): ImportValidation {
   }
   let size = 0;
   try {
-    size = JSON.stringify(obj).length;
+    // Bytes, not code units. `.length` counts UTF-16 units, so a package full
+    // of CJK text reported ~1/3 of what it actually weighs on disk — the limit
+    // said 4 MB while the file could be 12 MB.
+    size = new TextEncoder().encode(JSON.stringify(obj)).byteLength;
   } catch {
     return { ok: false, err: '导入包无法序列化' };
   }

@@ -161,8 +161,20 @@ function diffArray(
   }
 
   const start = out.length;
-  const bByKey = new Map(b.map((el) => [String((el as any)[key]), el]));
-  const aByKey = new Map(a.map((el) => [String((el as any)[key]), el]));
+  const keyOf = (el: any) => String(el?.[key]);
+  const bByKey = new Map(b.map((el) => [keyOf(el), el]));
+  const aByKey = new Map(a.map((el) => [keyOf(el), el]));
+
+  // If the shared elements appear in a different relative order, per-element
+  // records cannot express it: they describe what each element looks like, not
+  // where it sits. `[A,B,C] -> [C,A,B']` used to produce only B's field change,
+  // and replaying it left the array in the old order.
+  const commonA = a.filter((el) => bByKey.has(keyOf(el))).map(keyOf);
+  const commonB = b.filter((el) => aByKey.has(keyOf(el))).map(keyOf);
+  if (commonA.join('\u0000') !== commonB.join('\u0000')) {
+    out.push({ path, kind: 'changed', before: a, after: b });
+    return;
+  }
 
   a.forEach((el, i) => {
     const k = String((el as any)[key]);
@@ -285,12 +297,32 @@ function step(container: any, seg: PathSegment): unknown {
   return container[seg];
 }
 
+/** Resolve the container that owns the last segment of `segs`. */
+function resolveParent(root: any, segs: PathSegment[]): any | undefined {
+  let parent: any = root;
+  for (const s of segs.slice(0, -1)) {
+    const next = step(parent, s);
+    if (next === undefined) return undefined;
+    parent = next;
+  }
+  return parent ?? undefined;
+}
+
 /** Apply a forward delta (produced by `diff(before, after)`) to a clone of
- *  `snap` and report which paths could not be resolved. Deltas are applied in
- *  REVERSE order so trailing array operations compose correctly. */
+ *  `snap` and report which paths could not be resolved.
+ *
+ *  Two passes, because the two kinds of array operation need opposite orders:
+ *  removals/rewrites run in reverse (numeric indices stay valid when several
+ *  elements are deleted), while keyed insertions run afterwards in ascending
+ *  index order (their index is a position in the target array, which only
+ *  exists once the removals are done). Applying everything in one reverse
+ *  sweep inserted B and C at indices meant for the finished array and produced
+ *  [A,B,D,C] for [A,D] -> [A,B,C,D]. */
 export function applyDeltaReport<T>(snap: T, delta: DiffRecord[]): ApplyReport<T> {
   const out = JSON.parse(JSON.stringify(snap)) as T;
   const missing: PathSegment[][] = [];
+  const keyedAdds: { segs: PathSegment[]; d: DiffRecord }[] = [];
+
   for (let i = delta.length - 1; i >= 0; i--) {
     const d = delta[i];
     const segs = normalizePath(d.path);
@@ -298,35 +330,21 @@ export function applyDeltaReport<T>(snap: T, delta: DiffRecord[]): ApplyReport<T
       missing.push(segs);
       continue;
     }
-    let parent: any = out;
-    let ok = true;
-    for (const s of segs.slice(0, -1)) {
-      const next = step(parent, s);
-      if (next === undefined) {
-        ok = false;
-        break;
-      }
-      parent = next;
+    const last = segs[segs.length - 1];
+    if (typeof last === 'object' && d.kind === 'added') {
+      keyedAdds.push({ segs, d });
+      continue;
     }
-    if (!ok || parent == null) {
+    const parent = resolveParent(out, segs);
+    if (parent === undefined) {
       missing.push(segs);
       continue;
     }
-    const last = segs[segs.length - 1];
 
     if (typeof last === 'object') {
       // Keyed element: locate it now, because its position may have moved.
       if (!Array.isArray(parent)) {
         missing.push(segs);
-        continue;
-      }
-      if (d.kind === 'added') {
-        // The element does not exist yet: insert at the recorded position.
-        const at =
-          typeof d.index === 'number'
-            ? Math.max(0, Math.min(d.index, parent.length))
-            : parent.length;
-        parent.splice(at, 0, d.after);
         continue;
       }
       const idx = parent.findIndex(
@@ -349,6 +367,20 @@ export function applyDeltaReport<T>(snap: T, delta: DiffRecord[]): ApplyReport<T
     } else {
       parent[last] = d.after;
     }
+  }
+
+  keyedAdds.sort((x, y) => (x.d.index ?? 0) - (y.d.index ?? 0));
+  for (const { segs, d } of keyedAdds) {
+    const parent = resolveParent(out, segs);
+    if (parent === undefined || !Array.isArray(parent)) {
+      missing.push(segs);
+      continue;
+    }
+    const at =
+      typeof d.index === 'number'
+        ? Math.max(0, Math.min(d.index, parent.length))
+        : parent.length;
+    parent.splice(at, 0, d.after);
   }
   return { value: out, missing };
 }

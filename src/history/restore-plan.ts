@@ -20,6 +20,9 @@ export type RestoreFailure =
   | 'no-delta'
   /** The databases were rewritten after the newest commit. */
   | 'drift'
+  /** A record has a base digest but the current one cannot be read, so there
+   *  is no way to tell whether the base still holds. */
+  | 'unknown'
   /** A path in the delta no longer exists in the snapshot. */
   | 'replay';
 
@@ -72,6 +75,22 @@ export function planRestore(req: RestoreRequest): RestoreOutcome {
     };
   }
 
+  // "I could not check" is not "nothing changed". When the newest record knows
+  // the digest it was written against and the current one cannot be read, the
+  // replay would run on an unverified base and still report success.
+  // `anchorDigest === null` is the older case — records from before v1.2.0
+  // carry no digest at all — and stays allowed, otherwise upgrading the module
+  // would block every rollback of the existing history.
+  if (req.anchorDigest && !req.nowDigest) {
+    return {
+      ok: false,
+      code: 'unknown',
+      message:
+        '无法读取当前数据库摘要（设备端 sha256 不可用），所以不能确认这份历史记录是否仍对应当前数据库。'
+        + '已停止回滚：请重启设备后重试，或用「备份」里的文件级回滚。',
+    };
+  }
+
   const drift = digestDrift(req.anchorDigest, req.nowDigest);
   if (drift.length) {
     return {
@@ -107,8 +126,11 @@ export function planRestore(req: RestoreRequest): RestoreOutcome {
 }
 
 /** Names of the databases whose live bytes no longer match what the newest
- *  commit left behind. Empty when nothing drifted, both digests are unknown,
- *  or a side is missing (a file that does not exist cannot have changed). */
+ *  commit left behind. Empty when nothing drifted, either digest is unknown,
+ *  or a side is missing (a file that does not exist cannot have changed).
+ *
+ *  "Either digest unknown" is why planRestore rejects that case separately:
+ *  this helper answers "what drifted", not "is it safe to proceed". */
 export function digestDrift(anchor: DbDigests | null, now: DbDigests | null): string[] {
   if (!anchor || !now) return [];
   const out: string[] = [];

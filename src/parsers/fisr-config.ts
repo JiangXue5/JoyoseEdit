@@ -214,13 +214,17 @@ export function addPolicyForPkg(
   if (!Array.isArray(cfg.enhance_config)) cfg.enhance_config = [];
   const existing = findGroupForPkg(cfg, pkg);
   if (existing) {
+    // Check the no-op case BEFORE splitting. A shared group's policy list is
+    // common to every listed game, so a feature already present there is
+    // already enabled for this package: `duplicate` must not restructure the
+    // group on its way to returning false.
+    if (existing.enhance_policy_config.some((p) => p.feature === policy.feature)) {
+      return { ok: false, reason: 'duplicate' };
+    }
     // A shared group's policy list is common to every listed game; adding to
     // it would enable the feature for all of them.
     const splitShared = existing.game_list.length > 1;
     const target = splitShared ? splitPkgGroup(cfg, pkg)! : existing;
-    if (target.enhance_policy_config.some((p) => p.feature === policy.feature)) {
-      return { ok: false, reason: 'duplicate' };
-    }
     target.enhance_policy_config.push(clone(policy));
     return { ok: true, splitShared };
   }
@@ -244,14 +248,16 @@ export function removePolicyForPkg(
 ): boolean {
   const existing = findGroupForPkg(cfg, pkg);
   if (!existing) return false;
-  // Same reason as addPolicyForPkg: removing from a shared list would disable
-  // the feature for the other games in the group.
+  // Same reason as addPolicyForPkg: ask whether there is anything to remove
+  // first. Splitting a shared group on a no-op leaves the config looking
+  // different while the caller was told "nothing changed".
+  if (!existing.enhance_policy_config.some((p) => p.feature === feature)) return false;
+  // Removing from a shared list would disable the feature for the other games
+  // in the group.
   const target = existing.game_list.length > 1 ? splitPkgGroup(cfg, pkg)! : existing;
-  const before = target.enhance_policy_config.length;
   target.enhance_policy_config = target.enhance_policy_config.filter(
     (p) => p.feature !== feature,
   );
-  if (target.enhance_policy_config.length === before) return false;
   if (target.enhance_policy_config.length === 0) removePkg(cfg, pkg);
   return true;
 }
