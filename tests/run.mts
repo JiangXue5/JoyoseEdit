@@ -4986,22 +4986,30 @@ async function runWalTest() {
     return 'refused, and the copy would have been short';
   });
 
-  await check('wal: 有 sqlite3 时先把 WAL 合并进主库，再交出去', () => {
+  await check('wal: 有 sqlite3 时合并的是副本，活库一个字节都不动', () => {
     const h = newHarness();
     installCheckpointingSqlite(h);
     const db = path.join(h.dbDir, 'SmartP.db');
     seedPendingWal(db);
-    const r = runDispatch(h, ['pull', 'smartp']);
     const wal = `${db}-wal`;
+    const beforeDb = shaOf(db);
+    const beforeWal = statSync(wal).size;
+    const r = runDispatch(h, ['pull', 'smartp']);
     const left = existsSync(wal) ? statSync(wal).size : 0;
+    const afterDb = shaOf(db);
+    const leftover = readdirSync(h.dataDir).filter((n) => n.startsWith('pull.'));
     const got = r.code === 0 ? Buffer.from(r.out.trim(), 'base64') : Buffer.alloc(0);
     cleanupHarness(h);
     if (r.code !== 0) throw new Error('a checkpointed pull failed: ' + r.err.slice(0, 220));
-    if (left !== 0) throw new Error(`the -wal still holds ${left} bytes`);
     if (!got.includes(Buffer.from(WAL_MARKER))) {
       throw new Error('the row that lived in the -wal is not in the returned bytes');
     }
-    return 'merged, then served';
+    // `pull` runs without the write lock, so it is a read: merging the live
+    // file would write <db> and truncate <db>-wal behind the lock's back.
+    if (afterDb !== beforeDb) throw new Error('pull wrote to the live database');
+    if (left !== beforeWal) throw new Error(`pull changed the live -wal: ${beforeWal} -> ${left} bytes`);
+    if (leftover.length) throw new Error('temporary copy left behind: ' + leftover.join(','));
+    return 'merged on a copy, live files untouched';
   });
 
   await check('wal: 备份拒绝留下半份快照，并把 Joyose 放回去', () => {

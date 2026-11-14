@@ -848,17 +848,57 @@ cmd_stat() {
 }
 
 cmd_pull() {
-  local target why
+  local target why dir
   target=$(resolve_db "$1")
   [ -f "$target" ] || die "missing: $target"
   # Serving the main file alone would hand the WebView a database without its
   # newest commits — and every write computed from it would then drop them.
+  #
+  # `pull` is deliberately outside the write lock (the panel has to stay
+  # responsive while an upload is in flight), so it must not merge the *live*
+  # file: a checkpoint writes <db> and truncates <db>-wal, which is a write
+  # by a command the lock list calls read-only. Merge a private copy instead
+  # and serve that. The live files are only ever read here.
   if _wal_pending "$target"; then
-    why=$(_wal_checkpoint "$target")
+    dir="$DATA_ROOT/pull.$$"
+    rm -rf "$dir"
+    mkdir -p "$dir" || die "cannot create a temporary directory: $dir"
+    if ! cp "$target" "$dir/db" 2>/dev/null; then
+      rm -rf "$dir"
+      die "cannot copy the database for a read: $target"
+    fi
+    if [ -s "$target-wal" ]; then
+      if ! cp "$target-wal" "$dir/db-wal" 2>/dev/null; then
+        # The log moved under us. Serving the main file alone would be the
+        # short database this whole branch exists to avoid.
+        rm -rf "$dir"
+        die "the -wal changed while it was being copied; refresh and try again"
+      fi
+    else
+      # The log was merged into the live file between the check above and the
+      # copy, so that copy predates the merge. Take it again — it now holds the
+      # rows that were in the log.
+      if ! cp "$target" "$dir/db" 2>/dev/null; then
+        rm -rf "$dir"
+        die "cannot copy the database for a read: $target"
+      fi
+    fi
+    why=$(_wal_checkpoint "$dir/db")
     case "$why" in
       ok|merged) ;;
-      *) die "$(_wal_reason "$target" "$why")" not-needed wal-unmerged ;;
+      *)
+        rm -rf "$dir"
+        die "$(_wal_reason "$target" "$why")" not-needed wal-unmerged
+        ;;
     esac
+    if [ "$(_verify_db "$dir/db")" = "failed" ]; then
+      rm -rf "$dir"
+      die "the copied database failed its integrity check; refusing to serve it"
+    fi
+    base64 -w0 "$dir/db"
+    echo
+    rm -rf "$dir"
+    return 0
   fi
   # base64 -w0 — single line so the WebUI can slurp it directly.
   base64 -w0 "$target"
