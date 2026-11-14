@@ -115,6 +115,7 @@ import {
 } from '../src/history/store';
 import { diff, summarizeRecord, applyDelta, applyDeltaReport, invertDelta } from '../src/history/diff';
 import { planRestore, digestDrift } from '../src/history/restore-plan';
+import { planRebase } from '../src/history/rebase-plan';
 import { previewThermalUnlock } from '../src/parsers/thermal-unlock';
 import { isPlaceholderPkg, preflightCloudConfig } from '../src/db/preflight';
 import { makeResult, commitCode, defaultMessage } from '../src/state/result';
@@ -918,6 +919,31 @@ async function runDiffTest() {
     const good = applyDeltaReport(before, d);
     if (good.missing.length) throw new Error('healthy replay reported missing: ' + JSON.stringify(good.missing));
     return 'reported';
+  });
+
+  await check('rebase: 新库没有的行让整次重放被拒绝，而不是只丢那一处', () => {
+    // The cloud pushed a new row set while the user was editing, and the row
+    // they changed is gone. `applyDelta` replays the rest and returns happily —
+    // which is how a commit reported success while carrying only part of the
+    // work, with nothing in the history record saying what was dropped.
+    const base: any = {
+      smartp: { cloud_config: { a: { v: 1 }, b: { v: 1 } } },
+      teg: { rules: {} },
+    };
+    const working: any = {
+      smartp: { cloud_config: { a: { v: 2 }, b: { v: 2 } } },
+      teg: { rules: {} },
+    };
+    const delta = diff(base, working);
+    const newest: any = { smartp: { cloud_config: { a: { v: 7 } } }, teg: { rules: {} } };
+    const bad = planRebase(newest, delta);
+    if (bad.missing.length !== 1) throw new Error('missing: ' + JSON.stringify(bad.missing));
+    if (bad.missing[0] !== 'smartp.cloud_config.b.v') throw new Error('wrong path: ' + bad.missing[0]);
+    // The same edits onto a base that still has both rows replay in full.
+    const good = planRebase(base, delta);
+    if (good.missing.length) throw new Error('healthy replay reported missing');
+    if ((good.snapshot.smartp.cloud_config as any).b.v !== 2) throw new Error('edit was not applied');
+    return 'b.v 报缺，健康的库照常重放';
   });
 
   await check('apply: legacy string paths still replay', () => {

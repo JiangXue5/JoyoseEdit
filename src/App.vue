@@ -102,7 +102,7 @@
 
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, onMounted, ref, watch, type Component } from 'vue';
-import { state, initialize, pullAll, pushAll } from '@/state/session';
+import { state, initialize, pullAll, pushAll, RebaseConflictError } from '@/state/session';
 import { preflightCloudConfig } from '@/db/preflight';
 import { isCloudLocked } from '@/db/merge';
 import { scanFpsLock } from '@/parsers/fpslock';
@@ -424,6 +424,13 @@ async function handlePush() {
         toast.success('已提交并写入历史', withNotes(name));
     }
   } catch (err) {
+    // A rebase that could not replay every edit stops before writing anything.
+    // That needs to be read and acted on, not a toast that scrolls away: the
+    // working copy is intact and the user has to decide what to redo.
+    if (err instanceof RebaseConflictError) {
+      await dialog.alert('提交已中止，界面里的修改没有丢', err.message);
+      return;
+    }
     toast.fromError(err, '提交失败');
   }
 }

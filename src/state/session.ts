@@ -54,7 +54,8 @@ import {
   type HistoryRecord,
   type HistorySource,
 } from '@/history/store';
-import { diff, applyDelta } from '@/history/diff';
+import { diff } from '@/history/diff';
+import { planRebase } from '@/history/rebase-plan';
 import { planRestore } from '@/history/restore-plan';
 import { makeResult, commitCode, type OperationResult } from '@/state/result';
 import { refreshEnvelope } from '@/history/envelope';
@@ -829,6 +830,25 @@ export class ConflictError extends Error {
   }
 }
 
+/** The fresh database no longer contains the rows some of the user's edits were
+ *  made against (a cloud push replaced the row, or another editor deleted it).
+ *  Replaying the rest would silently drop those edits, so the rebase stops and
+ *  the working copy is kept as it was. `paths` is what could not be replayed —
+ *  the UI names them instead of saying "conflict". */
+export class RebaseConflictError extends Error {
+  readonly paths: string[];
+  constructor(paths: string[]) {
+    const shown = paths.slice(0, 5).join('、');
+    const more = paths.length > 5 ? ` 等 ${paths.length} 处` : '';
+    super(
+      `设备上的数据库已变化，你改过的 ${shown}${more} 在新数据里已经不存在了。` +
+        `为避免把这些修改悄悄丢掉，本次提交已中止，界面里的修改仍然保留，请重新确认后再提交。`,
+    );
+    this.name = 'RebaseConflictError';
+    this.paths = paths;
+  }
+}
+
 /** What a commit actually did. A commit that found no structural difference
  *  must not write a history record or restart Joyose: an empty delta plus a
  *  restart is indistinguishable from a real edit in the UI, and it also costs
@@ -1197,16 +1217,23 @@ function writeWarnings(
  *
  *  The user's changes are expressed as a delta against pristineSnapshot; we
  *  pull the fresh DBs, restore the per-row metadata (a locked version must not
- *  be undone by the rebase), and replay the delta onto the new base. Nothing
- *  is discarded except a change the cloud made to the exact same field. */
+ *  be undone by the rebase), and replay the delta onto the new base.
+ *
+ *  Replay has to be checked, not assumed: when the new base is missing a row
+ *  the delta addresses (cloud replaced it, or another editor deleted it),
+ *  `applyDelta` drops that path and returns the rest, and the commit then
+ *  succeeds while carrying only part of the user's work. So the delta is
+ *  replayed through `applyDeltaReport`, and any unresolved path aborts the
+ *  rebase with the working copy untouched. */
 async function rebaseOntoLatest(): Promise<void> {
   const baseSnap =
     state.pristineSnapshot ??
     snapshotFromMaps({ cloudConfig: state.cloudConfig, rulesByModule: state.rulesByModule });
-  const delta = diff(baseSnap, snapshotFromMaps({
+  const workingSnap = snapshotFromMaps({
     cloudConfig: state.cloudConfig,
     rulesByModule: state.rulesByModule,
-  }));
+  });
+  const delta = diff(baseSnap, workingSnap);
 
   const metasBefore: Record<string, any> = {};
   for (const [k, v] of Object.entries(state.cloudConfig)) {
@@ -1234,7 +1261,15 @@ async function rebaseOntoLatest(): Promise<void> {
     cloudConfig: state.cloudConfig,
     rulesByModule: state.rulesByModule,
   });
-  rehydrateFromSnapshot(applyDelta(newestSnap, delta));
+  const report = planRebase(newestSnap, delta);
+  if (report.missing.length > 0) {
+    // Put the working copy back the way the user left it. `readIntoState`
+    // above already replaced it with the fresh DB, and losing their edits is
+    // exactly what this branch exists to prevent.
+    rehydrateFromSnapshot(workingSnap);
+    throw new RebaseConflictError(report.missing);
+  }
+  rehydrateFromSnapshot(report.snapshot);
   state.pristineSnapshot = newestSnap;
   state.dirty = true;
 }
