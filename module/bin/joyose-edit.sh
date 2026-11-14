@@ -1922,8 +1922,9 @@ cmd_prefs_read() {
 }
 
 cmd_prefs_write() {
-  local b64="${1:?}"
+  local b64="${1:-}"
   local tmp="$PREFS_FILE.tmp.$$"
+  [ -n "$b64" ] || die "prefs-write: missing base64 payload"
   mkdir -p "$DATA_ROOT"
   # Decode into a sibling temp file and rename: a half-written settings file
   # would make every later read fall back to the defaults.
@@ -1931,6 +1932,20 @@ cmd_prefs_write() {
     rm -f "$tmp"
     die "prefs-write: base64 decode failed"
   fi
+  # The exit code is not the verdict. toybox's `base64 -d` (the one Android
+  # ships) skips characters outside the alphabet and still exits 0, so a
+  # payload of `!!!` decoded to nothing and the rename below replaced the
+  # settings file with an empty one — the next read fell back to defaults and
+  # said nothing. Empty is never a settings document, and neither is anything
+  # that does not open an object.
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    die "prefs-write: payload decoded to nothing"
+  fi
+  case "$(head -c 1 "$tmp" 2>/dev/null || true)" in
+    '{') ;;
+    *) rm -f "$tmp"; die "prefs-write: payload is not a JSON object" ;;
+  esac
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$PREFS_FILE"
   printf 'ok'
@@ -1986,32 +2001,32 @@ case "$cmd" in
   digest)         cmd_digest ;;
   install-ts)     cmd_install_ts ;;
   prefs-read)     cmd_prefs_read ;;
-  prefs-write)    cmd_prefs_write "${1:?}" ;;
-  save-dl-from-stage) cmd_save_dl_from_stage "${1:?}" "${2:?}" ;;
+  prefs-write)    cmd_prefs_write "${1:-}" ;;
+  save-dl-from-stage) cmd_save_dl_from_stage "${1:-}" "${2:-}" ;;
   reset-cloud)    cmd_reset_cloud ;;
-  pull)           cmd_pull "${1:?}" ;;
-  push)           cmd_push "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
+  pull)           cmd_pull "${1:-}" ;;
+  push)           cmd_push "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
   backup)         cmd_backup "$@" ;;
   prune-backups)  prune_backups "${1:-10}" ;;
-  revert)         cmd_revert "${1:?}" ;;
+  revert)         cmd_revert "${1:-}" ;;
   revert-latest)  cmd_revert_latest ;;
   restart)        cmd_restart ;;
   history-list)   cmd_history_list ;;
-  history-get)    cmd_history_get "${1:?}" ;;
-  history-clear)  cmd_history_clear "${1:?}" ;;
+  history-get)    cmd_history_get "${1:-}" ;;
+  history-clear)  cmd_history_clear "${1:-}" ;;
   cat-wasm)       cmd_cat_wasm ;;
   vision-status)  cmd_vision_status ;;
   system-info)    cmd_system_info ;;
   teg-status)     cmd_teg_status ;;
   teg-freeze)     cmd_teg_freeze ;;
   teg-unfreeze)   cmd_teg_unfreeze ;;
-  stage-clear)    cmd_stage_clear "${1:?}" ;;
+  stage-clear)    cmd_stage_clear "${1:-}" ;;
   stage-gc)       cmd_stage_gc ;;
-  stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
+  stage-append)   cmd_stage_append "${1:-}" "${2:-}" ;;
   bootstrap-backup)        cmd_bootstrap_backup ;;
-  push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
-  push-pair-from-stage)    cmd_push_pair_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
+  push-from-stage)         cmd_push_from_stage "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+  push-pair-from-stage)    cmd_push_pair_from_stage "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
   lock-status)             cmd_lock_status ;;
-  history-save-from-stage) cmd_history_save_from_stage "${1:?}" "${2:?}" ;;
+  history-save-from-stage) cmd_history_save_from_stage "${1:-}" "${2:-}" ;;
   *) die "unknown subcommand: $cmd" ;;
 esac

@@ -3938,6 +3938,51 @@ echo "EXIT=$?"`,
     return 'refused in ~0.6 s';
   });
 
+  await check('helper: 解不出内容的设置载荷不会把 settings.json 清空', () => {
+    // toybox `base64 -d` (what Android ships) skips characters outside the
+    // alphabet and exits 0, so `!!!` decoded to nothing. The old code only
+    // looked at the exit code, renamed the empty temp over the settings file,
+    // and every later read fell back to defaults without a word.
+    const h = newHarness();
+    // Android ships toybox, whose `base64 -d` skips characters outside the
+    // alphabet and still exits 0 — GNU coreutils fails instead, which is why
+    // the guard looked sufficient. Stand the real one aside for this test so
+    // the branch being asserted is the one a phone takes.
+    const realBase64 = execFileSync('sh', ['-c', 'command -v base64'], { encoding: 'utf8' }).trim();
+    if (!realBase64) throw new Error('no base64 on PATH to stand in for');
+    const toy = path.join(h.bin, 'base64');
+    writeFileSync(toy, `#!/bin/sh\n# toybox: bad input is skipped, the status stays 0\n${realBase64} "$@" 2>/dev/null\nexit 0\n`);
+    chmodSync(toy, 0o755);
+    const prefs = path.join(h.dataDir, 'settings.json');
+    mkdirSync(path.dirname(prefs), { recursive: true });
+    writeFileSync(prefs, '{"theme":"dark"}');
+    const bad = runDispatch(h, ['prefs-write', '!!!']);
+    const still = readFileSync(prefs, 'utf8');
+    const good = runDispatch(h, ['prefs-write', Buffer.from('{"theme":"light"}').toString('base64')]);
+    const applied = readFileSync(prefs, 'utf8');
+    cleanupHarness(h);
+    if (bad.code === 0) throw new Error('a payload that decodes to nothing was accepted');
+    if (!/"ok":false/.test(bad.err)) throw new Error('no JSON error: ' + bad.err.slice(0, 200));
+    if (still !== '{"theme":"dark"}') throw new Error('settings were replaced by nothing: ' + still);
+    if (good.code !== 0) throw new Error('a valid payload was rejected: ' + good.err.slice(0, 200));
+    if (applied !== '{"theme":"light"}') throw new Error('valid payload not applied: ' + applied);
+    return 'refused empty, applied valid';
+  });
+
+  await check('helper: 缺参数由命令自己报 JSON，不是 shell 的 parameter not set', () => {
+    // `${2:?}` in the dispatch block failed before the command ran, so the
+    // caller got exit 1 and an empty stderr instead of `{"ok":false,…}` — the
+    // friendly `missing base64 payload` below it was unreachable.
+    const h = newHarness();
+    const r = runDispatch(h, ['push', 'smartp', '']);
+    cleanupHarness(h);
+    if (r.code === 0) throw new Error('an empty payload was accepted');
+    if (/parameter not set or null/.test(r.err)) throw new Error('the shell rejected it first: ' + r.err.slice(0, 200));
+    if (!/"ok":false/.test(r.err)) throw new Error('no JSON error: ' + r.err.slice(0, 200));
+    if (!/missing base64 payload/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 200));
+    return 'JSON, with the reason';
+  });
+
   await check('helper: system-info 在缺 getprop/dumpsys 时仍输出可解析 JSON', () => {
     const h = newHarness();
     const r = runHarness(h, `( cmd_system_info )\necho "EXIT=$?"`);
