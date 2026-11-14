@@ -401,9 +401,9 @@ _abort_after_stop() {
   if [ "$restore" = "false" ]; then
     # Swallowing this used to mean the user was told only "write failed" while
     # Joyose stayed down until the next game launch — and nothing said so.
-    die "${2:-write aborted}；Joyose 原本在运行，但这次没能重新启动，进游戏前请手动打开一次" "$restore"
+    die "${2:-write aborted}；Joyose 原本在运行，但这次没能重新启动，进游戏前请手动打开一次" "$restore" "${3:-}"
   fi
-  die "${2:-write aborted}" "$restore"
+  die "${2:-write aborted}" "$restore" "${3:-}"
 }
 
 # sha256 of a file, or nothing when the ROM has no tool. Callers must treat an
@@ -498,6 +498,104 @@ _drop_sidecars() {
   rm -f "$1-journal" "$1-wal" "$1-shm" 2>/dev/null || true
 }
 
+# ---- WAL -------------------------------------------------------------------
+# A `-wal` holds transactions SQLite has committed but not yet merged into the
+# main file. Everything else here treats `<db>` as the whole database: `pull`
+# reads it, `cmd_backup` copies it, `_drop_sidecars` deletes the `-wal` as part
+# of a swap. That is correct for the rollback journal and wrong for WAL — the
+# snapshot would be missing its newest commits and the swap would throw them
+# away, both reported as success.
+#
+# One rule, applied everywhere below: before `<db>` is read or replaced as a
+# whole, its `-wal` must be empty. sqlite3 can make that true — it copies the
+# frames in and truncates the log — so a WAL device that has sqlite3 works like
+# any other. A ROM without sqlite3 cannot merge them at all, and there the
+# operation stops with `wal-unmerged` instead of handing out half a database.
+#
+# Ten sample databases under `tests/` all report `rollback`, so no known device
+# takes this path. It is a guard rail, not a redesign.
+_journal_mode() {
+  local f="$1" b
+  [ -f "$f" ] || { printf 'absent'; return 0; }
+  # Bytes 18/19 of the header are the read/write format versions: 1 = rollback
+  # journal, 2 = WAL. Read out of the file, so this needs neither sqlite3 nor
+  # the database to be open.
+  b=$(od -An -tu1 -j18 -N1 "$f" 2>/dev/null | tr -d ' \n') || b=''
+  case "${b:-}" in
+    1) printf 'rollback' ;;
+    2) printf 'wal' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# Non-empty `-wal`. A zero-length one is what a clean checkpoint leaves behind
+# and holds nothing to lose, so it does not count.
+_wal_pending() {
+  [ -s "$1-wal" ]
+}
+
+# Try to make the main file whole. Prints one of:
+#   ok      nothing was pending
+#   merged  the frames were copied in and the log truncated
+#   no-tool this ROM has no sqlite3, so nothing here can merge them
+#   busy    sqlite3 ran but the log is still not empty (a writer holds it open)
+_wal_checkpoint() {
+  local f="$1"
+  _wal_pending "$f" || { printf 'ok'; return 0; }
+  command -v sqlite3 >/dev/null 2>&1 || { printf 'no-tool'; return 0; }
+  # TRUNCATE only truncates when no other connection is holding the log open,
+  # and the exit status is not evidence of anything. Read the answer back from
+  # the file instead: `_wal_pending` is the only thing that decides.
+  sqlite3 "$f" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null 2>&1 || true
+  if _wal_pending "$f"; then printf 'busy'; else printf 'merged'; fi
+}
+
+# One sentence for every refusal, so the three call sites cannot drift apart
+# into three different explanations of the same file.
+_wal_reason() {
+  local f="$1" why="$2" size
+  size=$(stat -c '%s' "$1-wal" 2>/dev/null || echo '?')
+  if [ "$why" = "busy" ]; then
+    printf '数据库存在未合并的 WAL（%s，%s 字节），sqlite3 未能完成合并（Joyose 可能正持有该库）；继续会把已提交的记录丢掉' \
+      "$(basename "$f")-wal" "$size"
+  else
+    printf '数据库存在未合并的 WAL（%s，%s 字节），本机没有可用的 sqlite3 可以合并它；继续会把已提交的记录丢掉' \
+      "$(basename "$f")-wal" "$size"
+  fi
+}
+
+# Decide whether a settled `-wal` makes a write unsafe. Prints the reason, or
+# nothing when the write may go ahead.
+#
+#   $1 the live database   $2 the digest the caller read   $3 _wal_checkpoint's answer
+#   $4 "true" when the new bytes were built by a client from an earlier read
+#
+# A merge means committed rows just moved into the file the client never saw.
+# Its replacement was built before that, so applying it would roll those rows
+# back — the same data loss the merge was meant to prevent, one step later.
+# A restore is different: it does not depend on anything a client read, and
+# merging first is what makes its rollback copy complete.
+_wal_write_obstacle() {
+  local f="$1" cur="$2" why="$3" from_client="${4:-true}" now
+  case "$why" in
+    ok) return 0 ;;
+    merged)
+      if [ "$from_client" != "true" ]; then return 0; fi
+      if [ -z "$cur" ] || [ "$cur" = "none" ]; then
+        printf '数据库存在未合并的 WAL（%s），已合并；但这次写入没有附带摘要，无法证明它基于合并后的内容' \
+          "$(basename "$f")-wal"
+        return 0
+      fi
+      now=$(_sha256_file "$f")
+      if [ -z "$now" ] || [ "$now" != "$cur" ]; then
+        printf '%s 在读取之后又有提交（原本在 -wal 里，现已合并）；拒绝用基于旧内容的副本覆盖它' \
+          "$(basename "$f")"
+      fi
+      return 0 ;;
+    *) _wal_reason "$f" "$why"; return 0 ;;
+  esac
+}
+
 # Structural fallback for ROMs without sqlite3. A correct magic word is not
 # enough: a truncated copy still starts with "SQLite format 3". Read the page
 # geometry out of the 100-byte header and require the file to hold every page
@@ -556,7 +654,7 @@ _verify_db() {
 _install_db() {
   local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
   local uid gid stopped chk size sha rollback cur now_sha was_running=false rb_mode='size' src_sha dst_sha
-  local label vby live_checked
+  local label vby live_checked why obstacle
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
 
@@ -574,18 +672,6 @@ _install_db() {
     if [ "$sha" != "$expect_sha" ]; then
       rm -f "$tmp"
       die "staged database checksum mismatch"
-    fi
-  fi
-
-  # TOCTOU guard: the caller read this file, built a new one, and is now
-  # asking us to swap it in. If the live file changed in between (Joyose pulled
-  # a fresh cloud config), the new bytes were computed on a stale base and
-  # applying them would silently roll that update back.
-  if [ -n "$expect_current" ] && [ "$expect_current" != "none" ]; then
-    cur=$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)
-    if [ "$cur" != "$expect_current" ]; then
-      rm -f "$tmp"
-      die "database changed after it was read ($(printf '%s' "$cur" | cut -c1-12) != $(printf '%s' "$expect_current" | cut -c1-12)); refusing to overwrite"
     fi
   fi
 
@@ -610,6 +696,32 @@ _install_db() {
     rm -f "$tmp"
     # It is still running, so there is nothing to put back.
     die "Joyose is still running; refusing to replace $target"
+  fi
+
+  # 2b. Now that nothing holds the file: a pending `-wal` means the live
+  # database is the main file *plus* that log, and everything below — the
+  # digest comparison, the rollback copy, `_drop_sidecars` — looks at the main
+  # file only. Merge it in first, or stop: swapping in bytes computed without
+  # those rows drops them. This runs after the stop because a live connection
+  # is exactly what keeps a checkpoint from truncating the log.
+  why=$(_wal_checkpoint "$target")
+  obstacle=$(_wal_write_obstacle "$target" "$expect_current" "$why" true)
+  if [ -n "$obstacle" ]; then
+    rm -f "$tmp"
+    _abort_after_stop "$was_running" "$obstacle" wal-unmerged
+  fi
+
+  # TOCTOU guard: the caller read this file, built a new one, and is now
+  # asking us to swap it in. If the live file changed in between (Joyose pulled
+  # a fresh cloud config, or committed into the log we just merged), the new
+  # bytes were computed on a stale base and applying them would silently roll
+  # that update back.
+  if [ -n "$expect_current" ] && [ "$expect_current" != "none" ]; then
+    cur=$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)
+    if [ "$cur" != "$expect_current" ]; then
+      rm -f "$tmp"
+      _abort_after_stop "$was_running" "database changed after it was read ($(printf '%s' "$cur" | cut -c1-12) != $(printf '%s' "$expect_current" | cut -c1-12)); refusing to overwrite"
+    fi
   fi
 
   # From here on we already stopped Joyose: every exit must restore it.
@@ -688,13 +800,17 @@ _install_db() {
 stat_one() {
   local f="$1" key="$2"
   if [ -f "$f" ]; then
-    local mtime size uid gid
+    local mtime size uid gid pending=false wb=0
     mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
     size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
     uid=$(stat -c '%u' "$f" 2>/dev/null || echo 0)
     gid=$(stat -c '%g' "$f" 2>/dev/null || echo 0)
-    printf '"%s":{"exists":true,"path":"%s","mtime":%s,"size":%s,"uid":%s,"gid":%s}' \
-      "$key" "$f" "$mtime" "$size" "$uid" "$gid"
+    # A pending `-wal` means the file on disk is not the whole database, and
+    # the UI should say so rather than show a size and a date as if it were.
+    if _wal_pending "$f"; then pending=true; fi
+    wb=$(stat -c '%s' "$f-wal" 2>/dev/null || echo 0)
+    printf '"%s":{"exists":true,"path":"%s","mtime":%s,"size":%s,"uid":%s,"gid":%s,"journal":"%s","wal_pending":%s,"wal_bytes":%s}' \
+      "$key" "$f" "$mtime" "$size" "$uid" "$gid" "$(_journal_mode "$f")" "$pending" "$wb"
   else
     printf '"%s":{"exists":false,"path":"%s"}' "$key" "$f"
   fi
@@ -732,9 +848,18 @@ cmd_stat() {
 }
 
 cmd_pull() {
-  local target
+  local target why
   target=$(resolve_db "$1")
   [ -f "$target" ] || die "missing: $target"
+  # Serving the main file alone would hand the WebView a database without its
+  # newest commits — and every write computed from it would then drop them.
+  if _wal_pending "$target"; then
+    why=$(_wal_checkpoint "$target")
+    case "$why" in
+      ok|merged) ;;
+      *) die "$(_wal_reason "$target" "$why")" not-needed wal-unmerged ;;
+    esac
+  fi
   # base64 -w0 — single line so the WebUI can slurp it directly.
   base64 -w0 "$target"
   echo
@@ -786,6 +911,10 @@ _check_staged_db() {
     [ "$(_sha256_file "$file")" = "$sha" ] \
       || { rm -f "$file"; die "staged $label checksum mismatch"; }
   fi
+  # A pending `-wal` is settled in _restore_pair, after the stop — a live
+  # connection is what keeps a checkpoint from truncating the log. This
+  # comparison is the early one; the same digest is checked again once the log
+  # is merged, where a merge that moved rows shows up as a mismatch.
   if [ -n "$cur" ] && [ "$cur" != "none" ]; then
     [ "$(_sha256_file "$live")" = "$cur" ] \
       || { rm -f "$file"; die "$label changed after it was read; refusing to overwrite"; }
@@ -823,8 +952,9 @@ cmd_push_pair_from_stage() {
   _RESTORE_LABEL_SP=''
   _RESTORE_LABEL_TEG=''
   # Exits on failure, having put both databases back. On success both live
-  # files now hold the new bytes and Joyose is stopped.
-  _restore_pair "$dir"
+  # files now hold the new bytes and Joyose is stopped. The digests go along so
+  # a `-wal` merged after the stop can be compared against what was read.
+  _restore_pair "$dir" "$sp_cur" "$teg_cur" true
 
   # What the two uploads were actually checked against. "sha256" only when both
   # sides carried a digest; otherwise the write was guarded by length alone and
@@ -862,6 +992,13 @@ _db_pair_fingerprint() {
       out="$out sha256:$sha;"
     else
         out="$out stat:$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
+    fi
+    # A `-wal` that has grown holds commits the main file does not, and hashing
+    # the main file alone says "unchanged" while the contents moved. Only
+    # appended when something is pending, so devices without one keep the exact
+    # stamp they already have and take no extra snapshot on upgrade.
+    if _wal_pending "$f"; then
+      out="$out wal:$(stat -c '%s' "$f-wal" 2>/dev/null || echo 0);"
     fi
   done
   # Components are glued with a leading space each, so the whole string used to
@@ -991,7 +1128,7 @@ _verify_backup_marker() {
 }
 
 cmd_backup() {
-  local label="" restore="restore" arg stamp base dir n stopped chk was started
+  local label="" restore="restore" arg stamp base dir n stopped chk was started f why
   for arg in "$@"; do
     case "$arg" in
       --no-restore) restore="no-restore" ;;
@@ -1036,6 +1173,20 @@ cmd_backup() {
   # `cp` inside an `&&` list used to fail silently under `set -e`, which both
   # hid the reason and skipped the restart.
   local copied=0
+  # Quiesced, so a checkpoint can complete. A snapshot of the main file alone
+  # while a `-wal` still holds committed transactions would be marked COMPLETE
+  # and restore short — the one failure this whole command exists to prevent.
+  for f in "$SMARTP" "$TEG"; do
+    [ -f "$f" ] || continue
+    why=$(_wal_checkpoint "$f")
+    case "$why" in
+      ok|merged) ;;
+      *)
+        rm -rf "$dir"
+        _abort_after_stop "$was" "$(_wal_reason "$f" "$why")" wal-unmerged
+        ;;
+    esac
+  done
   if [ -f "$SMARTP" ]; then
     if ! cp -f "$SMARTP" "$dir/SmartP.db" 2>/dev/null; then
       rm -rf "$dir"
@@ -1280,7 +1431,7 @@ _recover_pending_pair() {
 #   ->  verify both  ->  on any failure put BOTH back.
 # Leaves Joyose stopped on success; the caller decides whether to start it.
 _restore_pair() {
-  local dir="$1"
+  local dir="$1" sp_cur="${2:-}" teg_cur="${3:-}" from_client="${4:-false}"
   local sp_bak="$dir/SmartP.db" teg_bak="$dir/teg_config.db"
   local sp_tmp="$SMARTP.jedit.$$" teg_tmp="$TEG.jedit.$$"
   local sp_rb="$SMARTP.jedit.rb.$$" teg_rb="$TEG.jedit.rb.$$"
@@ -1288,7 +1439,7 @@ _restore_pair() {
   # s1/s2 are read by the transaction record even when one side is not being
   # written, so they must exist (under `set -u`) rather than be declared name-only.
   local chk s1='' r1='' s2='' r2='' skipped='' n1='' n2=''
-  local ospsz=0 otgsz=0 nspsz=0 ntgsz=0
+  local ospsz=0 otgsz=0 nspsz=0 ntgsz=0 why obstacle
 
   # A backup that holds both databases says the device had both when it was
   # taken. If one of them is gone now, restoring only the survivor is a
@@ -1339,6 +1490,28 @@ _restore_pair() {
   if [ "$(_stop_pkg)" != "true" ]; then
     rm -f "$sp_tmp" "$teg_tmp"
     die "Joyose is still running; refusing to restore"
+  fi
+
+  # Quiesced: merge any pending `-wal` into the file we are about to copy.
+  # Without this the rollback copy would be missing the rows in the log, and a
+  # failed restore would put back a database that never existed. `$2`/`$3` are
+  # the digests the caller read, when it has them — a merge that moved rows
+  # makes their copy stale, and that is exactly what they are compared against.
+  if [ "$use_sp" = true ]; then
+    why=$(_wal_checkpoint "$SMARTP")
+    obstacle=$(_wal_write_obstacle "$SMARTP" "$sp_cur" "$why" "$from_client")
+    if [ -n "$obstacle" ]; then
+      rm -f "$sp_tmp" "$teg_tmp"
+      _abort_after_stop "$was_running" "$obstacle" wal-unmerged
+    fi
+  fi
+  if [ "$use_teg" = true ]; then
+    why=$(_wal_checkpoint "$TEG")
+    obstacle=$(_wal_write_obstacle "$TEG" "$teg_cur" "$why" "$from_client")
+    if [ -n "$obstacle" ]; then
+      rm -f "$sp_tmp" "$teg_tmp"
+      _abort_after_stop "$was_running" "$obstacle" wal-unmerged
+    fi
   fi
 
   # 3. rollback copies for every target we are about to replace

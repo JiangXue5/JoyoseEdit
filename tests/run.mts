@@ -199,6 +199,7 @@ async function main() {
   await runOperationResultTest();
   await runHelperFailureTest();
   await runTransactionTest();
+  await runWalTest();
   await runCompatMatrixTest();
   await runImportPackageTest();
   await runFrcStringTest();
@@ -4871,6 +4872,282 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
 
 function r2msg(r: { out: string; err: string }): string {
   return (r.err || r.out).slice(0, 300);
+}
+
+// ---- WAL -----------------------------------------------------------------
+//
+// A `-wal` holds transactions SQLite has committed but not merged into the main
+// file. Every other command here treats `<db>` as the whole database — `pull`
+// reads it, `backup` copies it, a swap deletes the log — which is right for the
+// rollback journal and wrong for WAL. The rule the helper now follows is one
+// sentence: merge it in, or refuse. These tests build a real WAL with the
+// SQLite inside python3 and check both halves: the refusal must leave the file
+// alone, and the checkpoint must actually carry the row across.
+
+const WAL_MARKER = 'wal_only_row_5d1f';
+
+function hasPythonSqlite(): boolean {
+  try {
+    execFileSync('python3', ['-c', 'import sqlite3'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A WAL-mode database whose only copy of one committed row is the `-wal`. */
+function seedPendingWal(dbPath: string) {
+  execFileSync('python3', [
+    '-c',
+    [
+      'import os, sqlite3, sys',
+      'c = sqlite3.connect(sys.argv[1])',
+      'c.execute("PRAGMA journal_mode=wal")',
+      'c.execute("PRAGMA wal_autocheckpoint=0")',
+      'c.execute("CREATE TABLE wal_t (id INTEGER PRIMARY KEY, note TEXT)")',
+      'c.execute("INSERT INTO wal_t (note) VALUES (?)", (sys.argv[2],))',
+      'c.commit()',
+      '# Leave without closing: a clean close checkpoints the log, and then there',
+      '# would be nothing left to test.',
+      'os._exit(0)',
+    ].join('\n'),
+    dbPath,
+    WAL_MARKER,
+  ]);
+}
+
+/** Commit another row into an existing WAL database and leave the log dirty —
+ *  what Joyose does between a `pull` and the commit that follows it. */
+function walAppend(dbPath: string, note: string) {
+  execFileSync('python3', [
+    '-c',
+    [
+      'import os, sqlite3, sys',
+      'c = sqlite3.connect(sys.argv[1])',
+      'c.execute("PRAGMA wal_autocheckpoint=0")',
+      'c.execute("INSERT INTO wal_t (note) VALUES (?)", (sys.argv[2],))',
+      'c.commit()',
+      'os._exit(0)',
+    ].join('\n'),
+    dbPath,
+    note,
+  ]);
+}
+
+/** A `sqlite3` that really runs SQLite. The harness stub answers the integrity
+ *  queries without touching the file, which would make a checkpoint test pass
+ *  without proving anything. */
+function installCheckpointingSqlite(h: HelperHarness) {
+  const f = path.join(h.bin, 'sqlite3');
+  writeFileSync(
+    f,
+    `#!/bin/sh
+case "$2" in
+  *wal_checkpoint*)
+    exec python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("PRAGMA wal_checkpoint(TRUNCATE)"); c.close()' "$1" ;;
+  *quick_check*) printf 'ok\\n' ;;
+  *sqlite_master*) printf '3\\n' ;;
+  *) printf 'ok\\n' ;;
+esac
+`,
+  );
+  chmodSync(f, 0o755);
+}
+
+async function runWalTest() {
+  console.log('\n=== WAL ===');
+  if (!shHasTools()) {
+    await check('wal: 跳过（本机没有 sh）', () => 'skipped');
+    return;
+  }
+  if (!hasPythonSqlite()) {
+    await check('wal: 跳过（没有 python3 + sqlite3 模块来造一个真的 WAL 库）', () => 'skipped');
+    return;
+  }
+
+  await check('wal: 没有 sqlite3 时 pull 拒绝，而不是交出缺行的库', () => {
+    const h = newHarness();
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    const before = shaOf(db);
+    const r = runDispatch(h, ['pull', 'smartp']);
+    // The fixture has to be short without its log, or the test proves nothing.
+    const mainHasRow = readFileSync(db).includes(WAL_MARKER);
+    const after = shaOf(db);
+    cleanupHarness(h);
+    if (mainHasRow) throw new Error('fixture is wrong: the main file already holds the row');
+    if (r.code === 0) throw new Error('a database with a pending -wal was served as-is');
+    if (!/"code":"wal-unmerged"/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 220));
+    if (after !== before) throw new Error('the refusal modified the live database');
+    return 'refused, and the copy would have been short';
+  });
+
+  await check('wal: 有 sqlite3 时先把 WAL 合并进主库，再交出去', () => {
+    const h = newHarness();
+    installCheckpointingSqlite(h);
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    const r = runDispatch(h, ['pull', 'smartp']);
+    const wal = `${db}-wal`;
+    const left = existsSync(wal) ? statSync(wal).size : 0;
+    const got = r.code === 0 ? Buffer.from(r.out.trim(), 'base64') : Buffer.alloc(0);
+    cleanupHarness(h);
+    if (r.code !== 0) throw new Error('a checkpointed pull failed: ' + r.err.slice(0, 220));
+    if (left !== 0) throw new Error(`the -wal still holds ${left} bytes`);
+    if (!got.includes(Buffer.from(WAL_MARKER))) {
+      throw new Error('the row that lived in the -wal is not in the returned bytes');
+    }
+    return 'merged, then served';
+  });
+
+  await check('wal: 备份拒绝留下半份快照，并把 Joyose 放回去', () => {
+    const h = newHarness();
+    seedPendingWal(path.join(h.dbDir, 'SmartP.db'));
+    writeFileSync(path.join(h.fake, 'alive'), '');
+    const r = runDispatch(h, ['backup', 'wal']);
+    const dirs = readdirSync(path.join(h.dataDir, 'backup'));
+    const alive = existsSync(path.join(h.fake, 'alive'));
+    cleanupHarness(h);
+    if (r.code === 0) throw new Error('a snapshot missing the -wal rows was marked COMPLETE');
+    if (!/"code":"wal-unmerged"/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 220));
+    if (dirs.length) throw new Error('partial backup left behind: ' + dirs.join(','));
+    if (!alive) throw new Error('Joyose was left stopped');
+    return 'refused after the stop, service back up';
+  });
+
+  await check('wal: 有 sqlite3 时备份拿到的是合并后的完整库', () => {
+    const h = newHarness();
+    installCheckpointingSqlite(h);
+    seedPendingWal(path.join(h.dbDir, 'SmartP.db'));
+    const r = runDispatch(h, ['backup', 'wal']);
+    const dirs = readdirSync(path.join(h.dataDir, 'backup')).sort();
+    const copy = dirs[0] ? path.join(h.dataDir, 'backup', dirs[0], 'SmartP.db') : '';
+    const complete = dirs[0] ? path.join(h.dataDir, 'backup', dirs[0], 'COMPLETE') : '';
+    const bytes = copy && existsSync(copy) ? readFileSync(copy) : Buffer.alloc(0);
+    const marked = complete && existsSync(complete);
+    cleanupHarness(h);
+    if (r.code !== 0) throw new Error('backup failed: ' + r.err.slice(0, 220));
+    if (!marked) throw new Error('the snapshot was not marked complete');
+    if (!bytes.includes(Buffer.from(WAL_MARKER))) {
+      throw new Error('the snapshot is missing the row that lived in the -wal');
+    }
+    return 'complete, and the log row is inside';
+  });
+
+  await check('wal: 没有 sqlite3 时写入不动库，Joyose 放回去', () => {
+    const h = newHarness();
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    writeFileSync(path.join(h.fake, 'alive'), '');
+    const before = shaOf(db);
+    // 300 KB of base64 does not fit in one argv (MAX_ARG_STRLEN), so this goes
+    // through the staging directory — the same door the WebUI uses.
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    const src = readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/SmartP.db'));
+    writeFileSync(path.join(stageDir, 'sp'), src.toString('base64'));
+    const r = runDispatch(h, ['push-from-stage', 'smartp', 'sp', String(src.length), 'none']);
+    const after = shaOf(db);
+    const alive = existsSync(path.join(h.fake, 'alive'));
+    cleanupHarness(h);
+    if (r.code === 0) throw new Error('a write dropped the pending -wal');
+    if (!/"code":"wal-unmerged"/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 220));
+    if (after !== before) throw new Error('the live database changed');
+    if (!alive) throw new Error('Joyose was left stopped');
+    return 'refused, db untouched, service back up';
+  });
+
+  await check('wal: 有 sqlite3 时写入走完整流程，合并进来的行还在', () => {
+    // The whole point of merging instead of refusing: a WAL device with
+    // sqlite3 is a normal device. Pull merges, the commit is computed on the
+    // merged bytes, and the write lands without losing the row that lived in
+    // the log.
+    const h = newHarness();
+    installCheckpointingSqlite(h);
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    const pulled = runDispatch(h, ['pull', 'smartp']);
+    if (pulled.code !== 0) throw new Error('pull failed: ' + pulled.err.slice(0, 200));
+    const bytes = Buffer.from(pulled.out.trim(), 'base64');
+    const cur = createHash('sha256').update(bytes).digest('hex');
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    writeFileSync(path.join(stageDir, 'sp'), bytes.toString('base64'));
+    const w = runDispatch(h, ['push-from-stage', 'smartp', 'sp', String(bytes.length), cur, cur]);
+    const live = readFileSync(db);
+    cleanupHarness(h);
+    if (w.code !== 0) throw new Error('a commit on a merged WAL device failed: ' + w.err.slice(0, 220));
+    if (!live.includes(Buffer.from(WAL_MARKER))) {
+      throw new Error('the write dropped the row that had been in the -wal');
+    }
+    return 'merged, committed, row kept';
+  });
+
+  await check('wal: 读取之后又有提交时，写入拒绝用旧副本覆盖', () => {
+    // Pull merges and the editor builds its new bytes on that. If Joyose
+    // commits again afterwards, the rows live in a fresh `-wal` that the
+    // editor never saw. Merging them and then swapping the editor's bytes in
+    // would delete them — the loss the merge was supposed to prevent, one
+    // step later.
+    const h = newHarness();
+    installCheckpointingSqlite(h);
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    const pulled = runDispatch(h, ['pull', 'smartp']);
+    if (pulled.code !== 0) throw new Error('pull failed: ' + pulled.err.slice(0, 200));
+    const bytes = Buffer.from(pulled.out.trim(), 'base64');
+    const cur = createHash('sha256').update(bytes).digest('hex');
+    walAppend(db, 'committed_after_the_pull');
+    const stageDir = path.join(h.dataDir, 'stage');
+    mkdirSync(stageDir, { recursive: true });
+    writeFileSync(path.join(stageDir, 'sp'), bytes.toString('base64'));
+    const w = runDispatch(h, ['push-from-stage', 'smartp', 'sp', String(bytes.length), cur, cur]);
+    const live = readFileSync(db);
+    cleanupHarness(h);
+    if (w.code === 0) throw new Error('a stale copy overwrote a newer commit');
+    if (!/"code":"wal-unmerged"/.test(w.err)) throw new Error('wrong error: ' + w.err.slice(0, 220));
+    if (!live.includes(Buffer.from('committed_after_the_pull'))) {
+      throw new Error('the newer commit is gone from the live database');
+    }
+    return 'refused, newer commit kept';
+  });
+
+  await check('wal: 回滚不依赖客户端副本，合并后照常回滚', () => {
+    // Not a reproduction — a guard. The refusal rule has to stay narrow: a
+    // restore is not built from anything a client read, so a merge cannot make
+    // its input stale, and merging first is what makes its rollback copy
+    // complete. It passed before this change too (silently, by dropping the
+    // log); the point is that it still passes.
+    const h = newHarness();
+    installCheckpointingSqlite(h);
+    const db = path.join(h.dbDir, 'SmartP.db');
+    seedPendingWal(db);
+    const b = runDispatch(h, ['backup', 'base']);
+    if (b.code !== 0) throw new Error('backup failed: ' + b.err.slice(0, 200));
+    walAppend(db, 'committed_after_the_backup');
+    const r = runDispatch(h, ['revert-latest']);
+    const live = readFileSync(db);
+    cleanupHarness(h);
+    if (r.code !== 0) throw new Error('restore refused: ' + r.err.slice(0, 220));
+    if (live.includes(Buffer.from('committed_after_the_backup'))) {
+      throw new Error('the restore did not go back to the snapshot');
+    }
+    return 'restored over a pending -wal';
+  });
+
+  await check('wal: stat 报出日志模式与未合并的 WAL', () => {
+    const h = newHarness();
+    seedPendingWal(path.join(h.dbDir, 'SmartP.db'));
+    const r = runDispatch(h, ['stat']);
+    cleanupHarness(h);
+    const line = r.out.split('\n').find((l) => l.startsWith('{"ok":true'));
+    if (!line) throw new Error('no stat JSON: ' + r.out.slice(0, 200));
+    const parsed = JSON.parse(line) as any;
+    if (parsed.smartp.journal !== 'wal') throw new Error('journal: ' + parsed.smartp.journal);
+    if (parsed.smartp.wal_pending !== true) throw new Error('wal_pending not reported');
+    if (!(parsed.smartp.wal_bytes > 0)) throw new Error('wal_bytes: ' + parsed.smartp.wal_bytes);
+    return `wal, ${parsed.smartp.wal_bytes} bytes pending`;
+  });
 }
 
 // ---- compatibility matrix (G3) ------------------------------------------
