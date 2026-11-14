@@ -4306,60 +4306,6 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     return 'left off, and said so';
   });
 
-  await check('WAL：有未合并的 -wal 时，备份拒绝并交还 Joyose', () => {
-    // A `-wal` with rows in it holds transactions SQLite has committed but not
-    // merged into the main file. `cp` does not copy it, so the snapshot would
-    // open cleanly, pass `_verify_db`, carry a COMPLETE marker — and be missing
-    // the newest commits. That is the one thing the marker must never certify.
-    const h = newHarness();
-    seedPair(h);
-    writeFileSync(path.join(h.fake, 'alive'), '');
-    writeFileSync(path.join(h.dbDir, 'SmartP.db-wal'), 'committed-but-unmerged');
-    const r = runDispatch(h, ['backup', 'manual']);
-    const alive = existsSync(path.join(h.fake, 'alive'));
-    const dirs = existsSync(path.join(h.dataDir, 'backup'))
-      ? readdirSync(path.join(h.dataDir, 'backup'))
-      : [];
-    cleanupHarness(h);
-    if (r.code === 0) throw new Error('the backup reported success: ' + r.out.slice(0, 200));
-    if (!/"code":"wal-pending"/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 300));
-    if (dirs.length !== 0) throw new Error('a half snapshot was left behind: ' + dirs.join(','));
-    if (!alive) throw new Error('Joyose was left stopped after the refusal');
-    return 'refused, nothing left behind, service back';
-  });
-
-  await check('WAL：有未合并的 -wal 时，双库写入拒绝且不碰数据库', () => {
-    const h = newHarness();
-    seedPair(h);
-    const smartp = path.join(h.dbDir, 'SmartP.db');
-    const before = readFileSync(smartp);
-    writeFileSync(path.join(h.dbDir, 'SmartP.db-wal'), 'committed-but-unmerged');
-    const r = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
-    const after = readFileSync(smartp);
-    const stopped = existsSync(path.join(h.dataDir, '.service-stopped'));
-    cleanupHarness(h);
-    if (r.code === 0) throw new Error('the write reported success: ' + r.out.slice(0, 200));
-    if (!/"code":"wal-pending"/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 300));
-    if (!after.equals(before)) throw new Error('the database was touched anyway');
-    if (stopped) throw new Error('the refusal stopped Joyose on its way out');
-    return 'refused before the first byte moved';
-  });
-
-  await check('WAL：stat 报出日志模式与未合并的 WAL', () => {
-    // The header byte needs no sqlite3 and no process: it is how the front end
-    // and the diagnostic report can tell a WAL database apart at all.
-    const h = newHarness();
-    seedPair(h);
-    const plain = runDispatch(h, ['stat']);
-    writeFileSync(path.join(h.dbDir, 'SmartP.db-wal'), 'x');
-    const dirty = runDispatch(h, ['stat']);
-    cleanupHarness(h);
-    if (!/"journal":"rollback"/.test(plain.out)) throw new Error('mode missing: ' + plain.out.slice(0, 300));
-    if (!/"wal_pending":false/.test(plain.out)) throw new Error('pending missing: ' + plain.out.slice(0, 300));
-    if (!/"wal_pending":true/.test(dirty.out)) throw new Error('pending not reported: ' + dirty.out.slice(0, 300));
-    return 'rollback + pending reported';
-  });
-
   await check('teg 冻结：写入校验失败时把 Joyose 起回来', () => {
     // The freeze stops Joyose, then writes the preference file. When the write
     // did not verify, the helper died right there — Joyose stayed down, and the

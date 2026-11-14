@@ -151,12 +151,6 @@ export interface StatEntry {
   size?: number;
   uid?: number;
   gid?: number;
-  /** `rollback` | `wal` | '' — read from the file header, so it needs neither
-   *  sqlite3 nor a running process. Absent on an older installed helper. */
-  journal?: string;
-  /** A non-empty `-wal` is present: committed rows that a file copy would miss.
-   *  Every mutating path refuses while this is true. */
-  wal_pending?: boolean;
 }
 
 export async function stat(): Promise<StatResult> {

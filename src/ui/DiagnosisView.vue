@@ -225,7 +225,6 @@ const dbRows = computed(() => {
       exists: !!e?.exists,
       size: e?.exists ? `${(e.size ?? 0).toLocaleString()} B` : '—',
       sha: d?.[key] ? d[key]!.slice(0, 12) : (d ? '读不到' : '—'),
-      journal: e?.journal ?? '',
     };
   };
   return [one('smartp', 'SmartP.db'), one('teg', 'teg_config.db')];
@@ -278,16 +277,11 @@ function buildReport(): string {
   lines.push(`Joyose：${sys.value?.joyose || '未知'}`);
   lines.push(`通路：${backendLabel.value}`);
   for (const r of dbRows.value) {
-    lines.push(`${r.label}：${r.exists ? r.size : '缺失'} ${r.sha}${r.journal ? ` · ${r.journal}` : ''}`);
+    lines.push(`${r.label}：${r.exists ? r.size : '缺失'} ${r.sha}`);
   }
   lines.push(`云控配置 ${configCount.value} 行 / 规则 ${ruleCount.value} 行 / 解析告警 ${state.parseIssues.length}`);
   lines.push(`teg：${teg.value ? (teg.value.frozen ? '已冻结' : '未冻结') : '未知'}　备份 ${stat.value?.backup_count ?? 0} / 历史 ${stat.value?.history_count ?? 0}`);
   lines.push(`厂商开关：${visionLabel.value}`);
-  // A `-wal` with rows in it makes every write refuse (wal-pending). Saying so
-  // here means the refusal arrives with an explanation instead of a surprise.
-  if (stat.value?.smartp?.wal_pending || stat.value?.teg?.wal_pending) {
-    lines.push('数据库存在未合并的 WAL：写入会被拒绝（先用 sqlite3 做一次 checkpoint）');
-  }
   if (stat.value?.pending) lines.push('未完成写入：存在残留事务记录');
   else if (recoveryNote.value) lines.push(`上次中断的写入：${recoveryNote.value}`);
   lines.push('能力矩阵：');
