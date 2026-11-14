@@ -53,7 +53,16 @@ chmod 700 "$DATA_ROOT" "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 # Errors go to stderr: callers capture stdout in $(...) all over this file
 # (resolve_db, prune_backups), and a fatal message printed to stdout was being
 # swallowed by command substitution — the user only saw "shell exit 1".
-die() { printf '{"ok":false,"error":%s}\n' "$(printf '%s' "$1" | _json_string)" >&2; exit 1; }
+die() {
+  # Optional second argument is a machine-readable service state that belongs
+  # next to the error: `true` / `false` / `not-needed`. Without it the caller
+  # could only see "write failed" and had no way to learn that Joyose was left
+  # stopped.
+  printf '{"ok":false,"error":%s%s}\n' \
+    "$(printf '%s' "$1" | _json_string)" \
+    "${2:+,\"serviceRestore\":\"$2\"}" >&2
+  exit 1
+}
 
 # ---- helpers --------------------------------------------------------------
 _json_string() {
@@ -128,10 +137,28 @@ _lock_owner_alive() {
   return 0
 }
 
+# True when the lock is safe to take over.
+#
+# A directory with no owner file is ambiguous: it is either a crashed writer or
+# a live one that won `mkdir` a microsecond ago and has not written its owner
+# yet. Stealing the second kind hands both writers the critical section, so an
+# owner-less directory only counts as dead after a short grace period.
+_lock_stale() {
+  [ -d "$LOCK_DIR" ] || return 1
+  _lock_owner_alive && return 1
+  if [ ! -f "$LOCK_DIR/owner" ]; then
+    local mtime now
+    mtime=$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    [ $((now - mtime)) -ge 2 ] || return 1
+  fi
+  return 0
+}
+
 _acquire_lock() {
   local kind="$1" i=0 start
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    if ! _lock_owner_alive; then
+    if _lock_stale; then
       # Rename first: only one waiter can move a given inode, so two processes
       # that both judged the lock stale cannot both delete a freshly created
       # one. The loser simply loops and retries.
@@ -150,7 +177,11 @@ _acquire_lock() {
   [ -n "$start" ] || start='-'
   MY_LOCK_TOKEN=$(_new_token)
   [ -n "$MY_LOCK_TOKEN" ] || MY_LOCK_TOKEN="$$-$(date +%s)"
-  printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/owner"
+  # If this write fails, the directory we just created was moved out from under
+  # us by a waiter that judged it stale. We do not hold the lock; carrying on
+  # would run two writers at once.
+  printf '%s %s %s %s %s\n' "$$" "$(date +%s)" "$start" "$MY_LOCK_TOKEN" "$kind" > "$LOCK_DIR/owner" 2>/dev/null \
+    || die "lost the device lock during initialisation; retry"
   trap '_release_lock' EXIT
   trap '_release_lock; exit 130' INT TERM HUP
 }
@@ -269,10 +300,17 @@ _start_pkg() {
 # whether it was running before we touched it, so a phone where Joyose was
 # already stopped is not started by us.
 _abort_after_stop() {
+  local started restore='not-needed'
   if [ "${1:-false}" = "true" ]; then
-    _start_pkg >/dev/null 2>&1 || true
+    started=$(_start_pkg 2>/dev/null)
+    if [ "$started" = "true" ]; then restore='true'; else restore='false'; fi
   fi
-  die "${2:-write aborted}"
+  if [ "$restore" = "false" ]; then
+    # Swallowing this used to mean the user was told only "write failed" while
+    # Joyose stayed down until the next game launch — and nothing said so.
+    die "${2:-write aborted}；Joyose 原本在运行，但这次没能重新启动，进游戏前请手动打开一次" "$restore"
+  fi
+  die "${2:-write aborted}" "$restore"
 }
 
 # sha256 of a file, or nothing when the ROM has no tool. Callers must treat an
@@ -280,6 +318,35 @@ _abort_after_stop() {
 _sha256_file() {
   command -v sha256sum >/dev/null 2>&1 || return 0
   sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Give a staged replacement the live file's ownership and mode.
+#
+# A database that is byte-perfect but owned by root:root instead of Joyose's
+# uid is not a usable database: the app opens it, fails the access check, and
+# behaves as if the config were empty. `cp` does not carry this over — the
+# staged file is created by us, as root. Restore never had this step; only the
+# single-database install path did, and it hard-coded 660 rather than reading
+# the original.
+_apply_file_attrs() {
+  local src="$1" dst="$2" uid gid mode
+  uid=$(stat -c '%u' "$src" 2>/dev/null) || return 1
+  gid=$(stat -c '%g' "$src" 2>/dev/null) || return 1
+  [ -n "$uid" ] && [ -n "$gid" ] || return 1
+  mode=$(stat -c '%a' "$src" 2>/dev/null)
+  case "$mode" in ''|*[!0-7]*) mode=660 ;; esac
+  chown "$uid:$gid" "$dst" 2>/dev/null || return 1
+  chmod "$mode" "$dst" 2>/dev/null || return 1
+  return 0
+}
+
+# Re-label a file with the SELinux context its directory expects. Replacing a
+# file creates a new inode, and on Android the label is part of how the app is
+# allowed to open it — content correctness alone is not enough.
+_restore_label() {
+  command -v restorecon >/dev/null 2>&1 || return 0
+  restorecon "$1" 2>/dev/null || true
+  return 0
 }
 
 # Sidecars are per-database-name, not per-inode: after a replace they still
@@ -387,8 +454,10 @@ _install_db() {
 
   uid=$(stat -c '%u' "$target")
   gid=$(stat -c '%g' "$target")
-  chown "$uid:$gid" "$tmp" 2>/dev/null || true
-  chmod 660 "$tmp"
+  if ! _apply_file_attrs "$target" "$tmp"; then
+    rm -f "$tmp"
+    die "cannot carry the original ownership/mode onto the candidate; refusing to write"
+  fi
 
   # 2. the consumer must be gone, not merely "am did not throw"
   if _pid_alive; then was_running=true; fi
@@ -450,9 +519,7 @@ _install_db() {
   fi
 
   rm -f "$rollback"
-  if command -v restorecon >/dev/null 2>&1; then
-    restorecon "$target" 2>/dev/null || true
-  fi
+  _restore_label "$target"
   # Digest of the bytes that actually landed. The WebUI stores it in the
   # history record so a later rollback can tell "this database is still the one
   # my delta was computed against" from "somebody replaced it since".
@@ -532,6 +599,65 @@ _finish_staged_write() {
   [ -s "$tmp" ] || { rm -f "$tmp"; die "decoded database is empty"; }
   head -c 16 "$tmp" | grep -qa 'SQLite format 3' || { rm -f "$tmp"; die "not a sqlite db"; }
   _install_db "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
+}
+
+# Validate a staged database against the numbers the WebUI sent and against the
+# live file it is about to replace. The single-database path has these checks
+# inline; the pair path needs the same guards for both files, and duplicating
+# them was how the two paths drifted apart before.
+_check_staged_db() {
+  local file="$1" size="$2" sha="$3" live="$4" cur="$5" label="$6" chk
+  [ -f "$file" ] || die "staged $label missing: $file"
+  if [ -n "$size" ]; then
+    [ "$(stat -c '%s' "$file" 2>/dev/null || echo 0)" = "$size" ] \
+      || { rm -f "$file"; die "staged $label size mismatch"; }
+  fi
+  if [ -n "$sha" ] && [ "$sha" != "none" ]; then
+    [ "$(_sha256_file "$file")" = "$sha" ] \
+      || { rm -f "$file"; die "staged $label checksum mismatch"; }
+  fi
+  if [ -n "$cur" ] && [ "$cur" != "none" ]; then
+    [ "$(_sha256_file "$live")" = "$cur" ] \
+      || { rm -f "$file"; die "$label changed after it was read; refusing to overwrite"; }
+  fi
+  chk=$(_verify_db "$file")
+  [ "$chk" != "failed" ] || { rm -f "$file"; die "staged $label failed integrity check"; }
+}
+
+# Replace BOTH databases as one transaction.
+#
+# `pushCore` used to call bridge.push twice. SmartP landing and teg failing left
+# the phone with a config combination that never existed, while the UI said
+# "提交失败" — so the user retried a write that was already half applied.
+# The staging, stopping, rollback copies and post-checks are the same ones the
+# file-level restore uses: `_restore_pair` already implements "both or neither"
+# and is covered by the failure-injection tests, so this path reuses it instead
+# of growing a second implementation.
+cmd_push_pair_from_stage() {
+  local sp_stage="$1" teg_stage="$2" sp_size="$3" sp_sha="$4" sp_cur="$5"
+  local teg_size="$6" teg_sha="$7" teg_cur="$8"
+  local dir="$STAGE_DIR/pair.$$" sp teg
+  safe_name "$sp_stage" || die "invalid stage name"
+  safe_name "$teg_stage" || die "invalid stage name"
+  sp="$dir/SmartP.db"
+  teg="$dir/teg_config.db"
+  mkdir "$dir" 2>/dev/null || { rm -rf "$dir"; die "cannot create pair staging directory"; }
+  base64 -d < "$STAGE_DIR/$sp_stage" > "$sp" 2>/dev/null || { rm -rf "$dir"; die "SmartP base64 decode failed"; }
+  base64 -d < "$STAGE_DIR/$teg_stage" > "$teg" 2>/dev/null || { rm -rf "$dir"; die "teg base64 decode failed"; }
+
+  _check_staged_db "$sp" "$sp_size" "$sp_sha" "$SMARTP" "$sp_cur" "SmartP.db"
+  _check_staged_db "$teg" "$teg_size" "$teg_sha" "$TEG" "$teg_cur" "teg_config.db"
+
+  _RESTORE_WAS_RUNNING=false
+  _RESTORE_SKIPPED=''
+  # Exits on failure, having put both databases back. On success both live
+  # files now hold the new bytes and Joyose is stopped.
+  _restore_pair "$dir"
+
+  rm -rf "$dir" 2>/dev/null || true
+  rm -f "$STAGE_DIR/$sp_stage" "$STAGE_DIR/$teg_stage" 2>/dev/null || true
+  printf '{"ok":true,"stopConfirmed":true,"wasRunning":%s,"verified":"pair","atomic":true}\n' \
+    "$_RESTORE_WAS_RUNNING"
 }
 
 cmd_push() {
@@ -657,7 +783,15 @@ _restore_pair() {
   local sp_tmp="$SMARTP.jedit.$$" teg_tmp="$TEG.jedit.$$"
   local sp_rb="$SMARTP.jedit.rb.$$" teg_rb="$TEG.jedit.rb.$$"
   local use_sp=false use_teg=false was_running=false failed='' rb_failed=''
-  local chk s1 r1 s2 r2
+  local chk s1 r1 s2 r2 skipped=''
+
+  # A backup that holds both databases says the device had both when it was
+  # taken. If one of them is gone now, restoring only the survivor is a
+  # different operation than the user asked for — report it instead of quietly
+  # doing half the job.
+  if [ -f "$sp_bak" ] && [ ! -f "$SMARTP" ]; then skipped="$skipped SmartP.db"; fi
+  if [ -f "$teg_bak" ] && [ ! -f "$TEG" ]; then skipped="$skipped teg_config.db"; fi
+  _RESTORE_SKIPPED=$skipped
 
   [ -f "$sp_bak" ] && [ -f "$SMARTP" ] && use_sp=true
   [ -f "$teg_bak" ] && [ -f "$TEG" ] && use_teg=true
@@ -673,6 +807,10 @@ _restore_pair() {
       rm -f "$sp_tmp"
       die "staged SmartP copy failed integrity check"
     fi
+    if ! _apply_file_attrs "$SMARTP" "$sp_tmp"; then
+      rm -f "$sp_tmp"
+      die "cannot carry SmartP's ownership/mode onto the restored copy; refusing to restore"
+    fi
   fi
   if [ "$use_teg" = true ]; then
     cp -f "$teg_bak" "$teg_tmp" 2>/dev/null || { rm -f "$sp_tmp"; die "cannot stage the teg backup copy"; }
@@ -680,6 +818,10 @@ _restore_pair() {
     if [ "$chk" = "failed" ]; then
       rm -f "$sp_tmp" "$teg_tmp"
       die "staged teg copy failed integrity check"
+    fi
+    if ! _apply_file_attrs "$TEG" "$teg_tmp"; then
+      rm -f "$sp_tmp" "$teg_tmp"
+      die "cannot carry teg's ownership/mode onto the restored copy; refusing to restore"
     fi
   fi
 
@@ -702,9 +844,18 @@ _restore_pair() {
     fi
     s1=$(_sha256_file "$SMARTP")
     r1=$(_sha256_file "$sp_rb")
-    if [ -n "$s1" ] && [ "$s1" != "$r1" ]; then
+    if [ -n "$s1" ]; then
+      if [ "$s1" != "$r1" ]; then
+        rm -f "$sp_tmp" "$teg_tmp" "$sp_rb"
+        _abort_after_stop "$was_running" "rollback copy for SmartP does not match the original; refusing to restore"
+      fi
+    elif [ "$(stat -c '%s' "$SMARTP" 2>/dev/null || echo 0)" != "$(stat -c '%s' "$sp_rb" 2>/dev/null || echo -1)" ]; then
+      # No digest tool on this ROM: size is the only guard left, and skipping
+      # it entirely (the old behaviour) meant a truncated rollback copy was
+      # treated as valid. The single-database path already degraded to size;
+      # this one silently did not.
       rm -f "$sp_tmp" "$teg_tmp" "$sp_rb"
-      _abort_after_stop "$was_running" "rollback copy for SmartP does not match the original; refusing to restore"
+      _abort_after_stop "$was_running" "rollback copy for SmartP is incomplete (size mismatch, no sha256 tool); refusing to restore"
     fi
   fi
   if [ "$use_teg" = true ]; then
@@ -714,9 +865,14 @@ _restore_pair() {
     fi
     s2=$(_sha256_file "$TEG")
     r2=$(_sha256_file "$teg_rb")
-    if [ -n "$s2" ] && [ "$s2" != "$r2" ]; then
+    if [ -n "$s2" ]; then
+      if [ "$s2" != "$r2" ]; then
+        rm -f "$sp_tmp" "$teg_tmp" "$sp_rb" "$teg_rb"
+        _abort_after_stop "$was_running" "rollback copy for teg does not match the original; refusing to restore"
+      fi
+    elif [ "$(stat -c '%s' "$TEG" 2>/dev/null || echo 0)" != "$(stat -c '%s' "$teg_rb" 2>/dev/null || echo -1)" ]; then
       rm -f "$sp_tmp" "$teg_tmp" "$sp_rb" "$teg_rb"
-      _abort_after_stop "$was_running" "rollback copy for teg does not match the original; refusing to restore"
+      _abort_after_stop "$was_running" "rollback copy for teg is incomplete (size mismatch, no sha256 tool); refusing to restore"
     fi
   fi
 
@@ -767,6 +923,11 @@ _restore_pair() {
     _abort_after_stop "$was_running" "restore failed on $failed; both databases are back to their previous contents"
   fi
 
+  # The bytes are right; make the filesystem agree. A fresh inode carries the
+  # directory's default label, which on some ROMs is not the one Joyose is
+  # allowed to open.
+  if [ "$use_sp" = true ]; then _restore_label "$SMARTP"; fi
+  if [ "$use_teg" = true ]; then _restore_label "$TEG"; fi
   rm -f "$sp_rb" "$teg_rb" "$sp_tmp" "$teg_tmp"
 }
 
@@ -788,14 +949,15 @@ _revert_from_dir() {
   # is. _restore_pair keeps a rollback copy of each live file and puts both back
   # if any step fails, so a half-restored pair cannot reach the phone.
   _RESTORE_WAS_RUNNING=false
+  _RESTORE_SKIPPED=''
   _restore_pair "$dir"
 
   started=false
   if [ "$_RESTORE_WAS_RUNNING" = "true" ]; then
     started=$(_start_pkg)
   fi
-  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"atomic":true}\n' \
-    "$dir" "$_RESTORE_WAS_RUNNING" "$started"
+  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"atomic":true,"skipped":%s}\n' \
+    "$dir" "$_RESTORE_WAS_RUNNING" "$started" "$(printf '%s' "${_RESTORE_SKIPPED# }" | _json_string)"
 }
 
 cmd_revert() {
@@ -1241,6 +1403,7 @@ case "$cmd" in
   stage-gc)       cmd_stage_gc ;;
   stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
   push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
+  push-pair-from-stage)    cmd_push_pair_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
   lock-status)             cmd_lock_status ;;
   history-save-from-stage) cmd_history_save_from_stage "${1:?}" "${2:?}" ;;
   *) die "unknown subcommand: $cmd" ;;

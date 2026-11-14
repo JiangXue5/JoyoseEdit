@@ -53,15 +53,19 @@ const KSU_TIMEOUT_MS = 30000;
 async function runKsu(cmd: string): Promise<string> {
   if (!isKsuAvailable()) throw new RootBridgeUnavailable();
   let result: ExecResults;
+  // Cleared in `finally`. Without it every successful call left a live 30 s
+  // timer behind; a chunked upload fires ~30 calls per MB, so a single commit
+  // could leave hundreds of pending timers in the WebView.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     result = await Promise.race([
       exec(cmd),
-      new Promise<ExecResults>((_, reject) =>
-        setTimeout(
+      new Promise<ExecResults>((_, reject) => {
+        timer = setTimeout(
           () => reject(new Error(`ksu.exec 超时（${KSU_TIMEOUT_MS}ms）`)),
           KSU_TIMEOUT_MS,
-        ),
-      ),
+        );
+      }),
     ]);
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
@@ -73,6 +77,8 @@ async function runKsu(cmd: string): Promise<string> {
       -1,
       '',
     );
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (result.errno !== 0) {
     throw new RootBridgeError(
@@ -270,6 +276,47 @@ export async function lockStatus(): Promise<LockStatus> {
   return JSON.parse(await runKsu(`sh ${HELPER} lock-status`));
 }
 
+/** Replace SmartP and teg in one device-side transaction.
+ *
+ *  Two separate `push()` calls are not a transaction: if the second one fails,
+ *  the first database stays changed while the UI reports the commit as failed.
+ *  The helper's `push-pair-from-stage` stages and verifies both candidates,
+ *  stops Joyose once, keeps a rollback copy of each live file, swaps both, and
+ *  puts both back on any failure. */
+export interface PairWriteResult {
+  ok: true;
+  stopConfirmed?: boolean;
+  wasRunning?: boolean;
+  verified?: string;
+  atomic?: boolean;
+}
+
+export async function pushPair(
+  smartp: Uint8Array,
+  teg: Uint8Array,
+  opts: { smartpExpect?: string | null; tegExpect?: string | null } = {},
+): Promise<PairWriteResult> {
+  const stamp = Date.now().toString(36);
+  const spStage = `pair-sp-${stamp}`;
+  const tegStage = `pair-teg-${stamp}`;
+  await stageUpload(spStage, bytesToBase64(smartp));
+  await stageUpload(tegStage, bytesToBase64(teg));
+  const spSha = await sha256Hex(smartp);
+  const tegSha = await sha256Hex(teg);
+  const args = [
+    'push-pair-from-stage',
+    spStage,
+    tegStage,
+    String(smartp.length),
+    spSha ?? 'none',
+    opts.smartpExpect || 'none',
+    String(teg.length),
+    tegSha ?? 'none',
+    opts.tegExpect || 'none',
+  ];
+  return JSON.parse(await runKsu(`sh ${HELPER} ${args.join(' ')}`));
+}
+
 export interface BackupResult {
   ok: true;
   dir: string;
@@ -304,6 +351,10 @@ export interface RevertResult {
   wasRunning?: boolean;
   /** Whether it was started again afterwards. */
   restarted?: boolean;
+  /** Databases present in the backup but absent on the device, so they were
+   *  not restored. Non-empty means the result is a partial restore and the
+   *  user should be told which side was skipped. */
+  skipped?: string;
 }
 
 export async function revert(name: string): Promise<RevertResult> {

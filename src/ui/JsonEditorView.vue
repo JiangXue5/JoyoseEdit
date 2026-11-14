@@ -300,6 +300,18 @@ async function save() {
         '已写入设备，但界面刷新失败',
         `${targetLabel()} · ${res.refreshError} · 请手动刷新后再继续编辑`,
       );
+    } else if (res.restartError) {
+      // The write landed; the restart did not. Saying "已重启" here was a lie
+      // the user would only discover when the edit did not take effect.
+      toast.warn(
+        '已写入设备，但 Joyose 没能重启',
+        `${targetLabel()} · ${res.restartError} · 进游戏前请手动打开一次 Joyose`,
+      );
+    } else if (res.startedAfter === false) {
+      toast.info(
+        '已写入设备',
+        `${targetLabel()} · Joyose 已停止，下次启动游戏时会读取新配置`,
+      );
     } else {
       toast.success('已写入设备', `${targetLabel()} · Joyose 已重启，进游戏即生效`);
     }

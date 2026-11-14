@@ -174,7 +174,14 @@ async function revertFromBackup() {
     const reverted = await revertToBackup(backupName);
     // The rollback itself succeeded; a failed refresh only means the page is
     // still showing pre-rollback values. Say that instead of "回滚失败".
-    if (reverted.result.joyoseWasRunning === true && reverted.result.joyoseRestarted === false) {
+    if (reverted.skipped) {
+      // The backup had this database, the device does not. Restoring only the
+      // survivor is not what "回滚到备份" means, so say what was left out.
+      toast.warn(
+        '已部分回滚',
+        `${backupName} · ${reverted.skipped} 在备份里有、设备上没有，未恢复`,
+      );
+    } else if (reverted.result.joyoseWasRunning === true && reverted.result.joyoseRestarted === false) {
       toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', backupName);
     } else if (reverted.refreshError) {
       toast.warn('已回滚，但界面刷新失败', `${reverted.refreshError} · 请手动刷新`);

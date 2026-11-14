@@ -281,9 +281,6 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
   const restoredLocks = applyLockedOriginals(cc, getLockedVersions());
   for (const name of restoredLocks.stale) clearLockedVersion(name);
 
-  state.cloudConfig = cc;
-  state.smartpRaw = smartpRaw;
-
   const byModule: Record<string, any[]> = {};
   if (dbT) {
     for (const row of listRules(dbT)) {
@@ -311,9 +308,6 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
       }
     }
   }
-  state.rulesByModule = byModule;
-  state.parseIssues = issues;
-
   // ---- fallback: SmartP has no row (or an empty one) but teg does ----
   // Lets a device whose SmartP was never populated keep working instead of
   // showing an empty dashboard for every page.
@@ -400,6 +394,16 @@ function readIntoState(dbS: Database | null, dbT: Database | null) {
   const booster = cc.booster_config?.params ?? {};
   state.paths = detectPaths(booster);
   state.activeBackend = detectActiveBackend(booster);
+
+  // Publish the new state in one step, after every part of it has been built
+  // and validated. Assigning cloudConfig earlier meant a parse error while
+  // building the teg side left the UI with new SmartP data and old teg data —
+  // a combination that never existed on the phone, which the next commit would
+  // then write back.
+  state.cloudConfig = cc;
+  state.smartpRaw = smartpRaw;
+  state.rulesByModule = byModule;
+  state.parseIssues = issues;
 }
 
 /** Whether a config page has usable content under the current data-source
@@ -586,17 +590,30 @@ const JSON_TARGET_CONFIG: Record<JsonTarget, { name: string; db: 'smartp' | 'teg
  *
  *  Conflict check uses the sha256 baseline, so a cloud push that landed while
  *  the editor was open prompts instead of being silently overwritten. */
+export interface JsonSaveResult {
+  ok: true;
+  target: string;
+  /** The write landed but re-reading the DBs failed; the editor still shows
+   *  pre-write values. */
+  refreshError?: string;
+  /** The write landed but the restart call failed. Distinct from a write
+   *  failure: the config is on disk and will be read on the next launch. */
+  restartError?: string;
+  /** Observed running again; null when no restart was attempted. */
+  startedAfter?: boolean | null;
+}
+
 export async function saveJsonTarget(
   target: JsonTarget,
   jsonText: string,
-): Promise<{ ok: true; target: string; refreshError?: string }> {
+): Promise<JsonSaveResult> {
   return withWriteLock('参数树写入', () => saveJsonTargetLocked(target, jsonText));
 }
 
 async function saveJsonTargetLocked(
   target: JsonTarget,
   jsonText: string,
-): Promise<{ ok: true; target: string; refreshError?: string }> {
+): Promise<JsonSaveResult> {
   const { name, db: which } = JSON_TARGET_CONFIG[target];
 
   let parsed: unknown;
@@ -622,8 +639,12 @@ async function saveJsonTargetLocked(
 
   // A direct write skips the commit bar, so take the restore point here — the
   // user has no "discard" path for a JSON edit. Refuse to write without it.
-  await ensureBackup('json-edit');
+  const backupState = await ensureBackup('json-edit');
 
+  // Past this line the service is stopped because of our backup, not because
+  // the user closed it. Any throw has to put it back: the write path only sees
+  // "not running" and would leave it down without saying so.
+  try {
   if (which === 'smartp') {
     if (target === 'sp_booster') {
       if (!(name in state.smartpRaw)) {
@@ -654,7 +675,13 @@ async function saveJsonTargetLocked(
     } finally {
       closeDb(db);
     }
-    const res = await bridge.push('smartp', out);
+    // The helper re-hashes the live file right before the swap. Without this
+    // the JSON path only checked the baseline *before* pulling, so a cloud
+    // update landing in that window was overwritten with bytes computed on the
+    // old base — the same TOCTOU the commit path already guards against.
+    const res = await bridge.push('smartp', out, {
+      expectCurrent: await bridge.sha256Hex(bytes),
+    });
     state.applyStatus = {
       stopConfirmed: res.stopConfirmed ?? res.stopped ?? null,
       wasRunningBefore: res.wasRunning ?? null,
@@ -679,7 +706,9 @@ async function saveJsonTargetLocked(
     } finally {
       closeDb(db);
     }
-    const res = await bridge.push('teg', out);
+    const res = await bridge.push('teg', out, {
+      expectCurrent: await bridge.sha256Hex(bytes),
+    });
     state.applyStatus = {
       stopConfirmed: res.stopConfirmed ?? res.stopped ?? null,
       wasRunningBefore: res.wasRunning ?? null,
@@ -688,8 +717,24 @@ async function saveJsonTargetLocked(
       at: Date.now(),
     };
   }
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    // A timeout may still be running on the device; racing a restart against
+    // it is worse than leaving the state alone.
+    if (backupState.wasRunning && !TIMEOUT_RE.test(msg)) {
+      await bridge.restart().catch(() => null);
+    }
+    throw err;
+  }
 
-  const restarted = await bridge.restart().catch(() => null);
+  // Report the restart result instead of collapsing it to null. The UI used to
+  // say "Joyose 已重启" whenever the write had landed, which was simply false
+  // when the restart call failed.
+  let restartError: string | undefined;
+  const restarted = await bridge.restart().catch((err) => {
+    restartError = err?.message ?? String(err);
+    return null;
+  });
   if (restarted) {
     state.applyStatus = {
       // A failed stop stays failed: the restart path cannot retroactively prove
@@ -711,7 +756,13 @@ async function saveJsonTargetLocked(
   // here does not invalidate the write, but it must not be swallowed: the
   // editor would keep showing pre-write values while claiming to be current.
   const pulled = await pullAll();
-  return { ok: true, target, refreshError: pulled.ok ? undefined : pulled.error };
+  return {
+    ok: true,
+    target,
+    refreshError: pulled.ok ? undefined : pulled.error,
+    restartError,
+    startedAfter: restarted?.started ?? null,
+  };
 }
 
 /** How many history files / backup directories to keep on the device. */
@@ -729,13 +780,19 @@ export interface PushOptions {
  *
  *  Both write paths used to swallow this error: the user saw a normal commit
  *  while the operation had no restore point at all. The commit chain is the
- *  only way back, so a missing backup means the write must not start. */
-async function ensureBackup(label?: string): Promise<void> {
+ *  only way back, so a missing backup means the write must not start.
+ *
+ *  Returns whether Joyose was running before the backup quiesced it. The
+ *  backup leaves the service stopped so the write can proceed; if the write
+ *  then fails, the caller is the only one left that knows it has to be put
+ *  back. */
+async function ensureBackup(label?: string): Promise<{ wasRunning: boolean }> {
   try {
     const res = await bridge.backup(label, { restore: false });
     if (!res?.ok || !res.dir) {
       throw new Error('备份命令没有返回备份目录');
     }
+    return { wasRunning: res.wasRunning === true };
   } catch (err: any) {
     throw new Error(`自动备份失败，已中止写入：${err?.message ?? String(err)}`);
   }
@@ -796,6 +853,10 @@ export interface CommitResult {
 /** Commit the in-memory edits: build history record, write both DBs, save
  * history, refresh state. Returns the history filename written. */
 async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
+  // Set once the backup has quiesced Joyose. Everything after that point has
+  // to put the service back: the write path only knows "it was not running",
+  // because by the time it looks, the backup has already stopped it.
+  let backupWasRunning = false;
   try {
     // Which database(s) this commit may touch. Global setting, honoured by
     // every page — see the "来源与写入" panel.
@@ -924,7 +985,8 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // silently failed is exactly the commit the user cannot walk back later.
     // Runs after the diff so a no-op never creates a backup, and immediately
     // before the write so the restore point is as close as possible to it.
-    await ensureBackup();
+    const backupState = await ensureBackup();
+    backupWasRunning = backupState.wasRunning;
 
     // persist DBs first, so if anything fails we can re-sync
     const stops: boolean[] = [];
@@ -937,21 +999,35 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // Uploading a DB costs one ksu.exec round-trip per 48 KB of base64 — about
     // 30 calls per MB. Skip the ones whose bytes came back unchanged: editing
     // a SmartP-only config used to re-upload the 1 MB teg mirror for nothing.
-    if (wroteSmartp) {
+    //
+    // When both databases change, they go in as one device-side transaction.
+    // Two independent pushes could leave SmartP written and teg untouched if
+    // the second one failed — a combination that never existed on the phone,
+    // reported to the user as a failed commit they would then retry.
+    if (wroteSmartp && wroteTeg) {
+      const spCurrent = await bridge.sha256Hex(smartpBytes!);
+      const tegCurrent = await bridge.sha256Hex(tegBytes!);
+      recordStop(
+        await bridge.pushPair(outSmartp!, outTeg!, {
+          smartpExpect: spCurrent,
+          tegExpect: tegCurrent,
+        }),
+      );
+    } else if (wroteSmartp) {
       const currentSha = await bridge.sha256Hex(smartpBytes!);
       recordStop(
         await bridge.push('smartp', outSmartp!, { expectCurrent: currentSha }),
       );
+    } else if (wroteTeg) {
+      const currentSha = await bridge.sha256Hex(tegBytes!);
+      recordStop(await bridge.push('teg', outTeg!, { expectCurrent: currentSha }));
+    }
+    if (wroteSmartp) {
       // The row on disk is now what we just wrote. Keeping the pre-commit copy
       // would make the next commit in this session merge onto a stale base.
       for (const [name, params] of Object.entries(writtenRaw)) {
         state.smartpRaw[name] = JSON.parse(JSON.stringify(params));
       }
-    }
-    // only touch teg if we actually have rows to write
-    if (wroteTeg) {
-      const currentSha = await bridge.sha256Hex(tegBytes!);
-      recordStop(await bridge.push('teg', outTeg!, { expectCurrent: currentSha }));
     }
 
     // write history after successful DB push. v2 records store only the
@@ -1042,6 +1118,17 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
   } catch (err) {
     // ConflictError bubbles to pushAll, which rebases and retries; anything
     // else is a genuine failure and must reach the user.
+    //
+    // Before rethrowing: if the backup stopped Joyose and the write did not
+    // put it back, start it now. Without this the phone sits with the game
+    // service down until the next launch, and the error only says "write
+    // failed" — nothing tells the user the config will not load.
+    // A timeout is excluded: the shell command may still be running, and
+    // racing a restart against it would interleave state we cannot see.
+    const msg = (err as Error)?.message ?? String(err);
+    if (backupWasRunning && !TIMEOUT_RE.test(msg)) {
+      await bridge.restart().catch(() => null);
+    }
     throw err;
   }
 }
@@ -1312,7 +1399,10 @@ export async function unfreezeTeg(): Promise<WithResult<bridge.TegRewriteResult>
  *  Only the first few records are scanned: a backup checkpoint carries no
  *  digest, and reading all ten costs ten shell calls for no extra safety. */
 async function newestKnownDigest(): Promise<DbDigests | null> {
-  const meta = await listHistory();
+  // Order by seq, not by timestamp: `listHistory` sorts for display, and a
+  // device whose clock moved backwards would otherwise hand back an older
+  // record as "the newest one we know".
+  const meta = (await listHistory()).sort((a, b) => b.seq - a.seq);
   for (const m of meta.slice(0, 3)) {
     try {
       const rec = await readHistory(m.name);
@@ -1381,18 +1471,33 @@ async function markHistoryFloor(): Promise<void> {
 }
 
 function rehydrateFromSnapshot(snap: ConfigSnapshot): void {
-  // snapshot only carries parsed content; preserve meta from current state
-  for (const [name, params] of Object.entries(snap.smartp.cloud_config)) {
-    if (!state.cloudConfig[name]) continue;
-    state.cloudConfig[name].params = params;
+  // Rebuild, do not patch. The old loop walked the snapshot and skipped any
+  // config that was missing from the working copy (`if (!state.cloudConfig[name])
+  // continue`), and stopped short of the snapshot's length for teg rows. After
+  // rolling back to a version with fewer rows, the extra rows stayed in the
+  // working copy — so the "restored" config still contained what the user
+  // asked to undo, and the next commit wrote them straight back.
+  const next: Record<string, any> = {};
+  for (const [name, params] of Object.entries(snap.smartp.cloud_config ?? {})) {
+    // `meta` is not part of the snapshot: it carries the locked version and the
+    // parse status, which describe the row as it exists now, not as it was.
+    const current = state.cloudConfig[name];
+    next[name] = current ? { ...current, params } : { meta: {}, params };
   }
-  for (const [module, contents] of Object.entries(snap.teg.rules)) {
-    const rows = state.rulesByModule[module];
-    if (!rows) continue;
-    for (let i = 0; i < rows.length && i < contents.length; i++) {
-      rows[i].content = contents[i];
-    }
+  state.cloudConfig = next;
+
+  const rules: Record<string, any[]> = {};
+  for (const [module, contents] of Object.entries(snap.teg.rules ?? {})) {
+    const current = state.rulesByModule[module] ?? [];
+    rules[module] = (contents as any[]).map((content, i) => {
+      const row = current[i];
+      // Rows that did not exist in the working copy become new teg rows; the
+      // commit path inserts them (see applyTegWrites).
+      return row ? { ...row, content } : { meta: { rule_module: module, _real: false }, content };
+    });
   }
+  state.rulesByModule = rules;
+
   if (state.cloudConfig.booster_config) {
     state.paths = detectPaths(state.cloudConfig.booster_config.params ?? {});
   }
