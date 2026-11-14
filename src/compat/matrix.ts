@@ -67,13 +67,13 @@ export const CAPABILITIES: Capability[] = [
     id: 'write',
     label: '数据库写入事务',
     verification: 'sample',
-    evidence: '假 am/cp/mv 注入十种失败；真机 SELinux context 未验',
+    evidence: '假 am/cp/mv 注入十种失败 + 属主/权限继承 + 双库同写同弃；真机 SELinux context 未验',
   },
   {
     id: 'history',
     label: '历史回滚',
     verification: 'sample',
-    evidence: 'delta 链单测 + 基准摘要；真机回滚未验',
+    evidence: 'delta 链单测（含重排 / 多次插入往返）+ 缺基准摘要即拒绝；真机回滚未验',
   },
   {
     id: 'freeze',
