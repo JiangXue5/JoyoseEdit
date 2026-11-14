@@ -1634,9 +1634,13 @@ _teg_rewrite() {
   fi
 
   if ! _teg_write_value "$new_value"; then
-    # Try to put back what was there before we touched it.
-    _teg_write_value "$cur" >/dev/null 2>&1 || true
-    die "pref_local_max_version write verification failed (wanted $new_value)"
+    # Joyose is already stopped at this point. Dying here left it down with
+    # nothing said about it: the user saw only "write verification failed",
+    # and the phone kept running without a config until the next cold start.
+    if _teg_write_value "$cur" >/dev/null 2>&1; then
+      _abort_after_stop "$was" "pref_local_max_version 写入校验失败（目标 $new_value），已把原值 $cur 写回"
+    fi
+    _abort_after_stop "$was" "pref_local_max_version 写入校验失败（目标 $new_value），原值 $cur 也没能写回，请在设置里确认 teg 版本后再试"
   fi
   wrote=$(_teg_current_max)
 

@@ -3256,6 +3256,12 @@ if [ -f "$FAKE/mv-fails" ]; then
     *SmartP.db|*teg_config.db) printf 'mv: cannot replace %s\\n' "$last" >&2; exit 1 ;;
   esac
 fi
+# Fails on the teg SharedPreferences XML, for the freeze path that stops Joyose
+# before it writes.
+if [ -f "$FAKE/mv-fails-pref" ]; then
+  for last; do :; done
+  case "$last" in *.xml) printf 'mv: cannot replace %s\n' "$last" >&2; exit 1 ;; esac
+fi
 # Fails only on teg, so the pair path can be tested with the first swap landing.
 if [ -f "$FAKE/mv-fails-teg" ]; then
   for last; do :; done
@@ -3371,6 +3377,20 @@ function mirrorPathWithout(dir: string, exclude: string[]): string {
   return dir;
 }
 
+/** Where the harness keeps the teg SDK SharedPreferences XML. */
+function tegPrefPath(h: HelperHarness): string {
+  return path.join(h.dir, 'shared_prefs', 'teg_config_pref.xml');
+}
+
+function seedTegPref(h: HelperHarness, value: string) {
+  const f = tegPrefPath(h);
+  mkdirSync(path.dirname(f), { recursive: true });
+  writeFileSync(
+    f,
+    `<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n    <long name="pref_local_max_version" value="${value}" />\n</map>\n`,
+  );
+}
+
 function harnessScript(h: HelperHarness, driver: string): string {
   const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8');
   const cut = src.indexOf('# ---- dispatch');
@@ -3378,7 +3398,10 @@ function harnessScript(h: HelperHarness, driver: string): string {
   const body = src
     .slice(0, cut)
     .replace(/^DATA_ROOT=.*$/m, `DATA_ROOT=${h.dataDir}`)
-    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`);
+    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`)
+    // The teg SDK preference file lives under the app's data dir, which does
+    // not exist in a harness. Redirect it so the freeze path can be exercised.
+    .replace(/^TEG_SP=.*$/m, `TEG_SP=${tegPrefPath(h)}`);
   return [
     '#!/bin/sh',
     body,
@@ -3441,7 +3464,8 @@ function spawnHarness(h: HelperHarness, driver: string, env: Record<string, stri
 function runDispatch(h: HelperHarness, args: string[], env: Record<string, string> = {}) {
   const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8')
     .replace(/^DATA_ROOT=.*$/m, `DATA_ROOT=${h.dataDir}`)
-    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`);
+    .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`)
+    .replace(/^TEG_SP=.*$/m, `TEG_SP=${tegPrefPath(h)}`);
   const file = path.join(h.dir, `dispatch-${Math.random().toString(36).slice(2)}.sh`);
   writeFileSync(file, src);
   const r = spawnSync('sh', [file, ...args], {
@@ -4199,6 +4223,32 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
     if (restarted.code !== 0) throw new Error('restart failed: ' + restarted.err.slice(0, 300));
     if (markedAfterRestart) throw new Error('the restart did not clear the marker');
     return 'marked by the write, cleared by the restart';
+  });
+
+  await check('teg 冻结：写入校验失败时把 Joyose 起回来', () => {
+    // The freeze stops Joyose, then writes the preference file. When the write
+    // did not verify, the helper died right there — Joyose stayed down, and the
+    // error said nothing about it, so the phone ran without a cloud config
+    // until the next cold start.
+    const h = newHarness();
+    seedTegPref(h, '12345');
+    writeFileSync(path.join(h.fake, 'alive'), '');
+    touchState(h, 'mv-fails-pref');
+    const r = runHarness(h, `( _teg_rewrite freeze )\necho "EXIT=$?"`);
+    const aliveAfter = existsSync(path.join(h.fake, 'alive'));
+    const pref = readFileSync(tegPrefPath(h), 'utf8');
+    cleanupHarness(h);
+    if (r.out.includes('EXIT=0')) throw new Error('a freeze that never landed reported success');
+    if (!aliveAfter) throw new Error('Joyose was left stopped: ' + r.err.slice(0, 200));
+    if (!/"serviceRestore":"true"/.test(r.err)) {
+      throw new Error('the error did not report the restart: ' + r.err.slice(0, 300));
+    }
+    // The original value is still there: a failed write must not leave the
+    // preference file half-rewritten.
+    if (!pref.includes('name="pref_local_max_version" value="12345"')) {
+      throw new Error('the preference file was damaged: ' + pref);
+    }
+    return 'error reported, Joyose back up, pref untouched';
   });
 
   await check('历史：同一序号不会被第二个写入覆盖', () => {
