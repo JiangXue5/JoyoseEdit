@@ -68,4 +68,30 @@ if [ "$ok" != "1" ]; then
 fi
 
 chmod 700 "$TARGET"
+
+# Same marker the helper writes: a directory without it may be a snapshot that
+# was interrupted between its two copies, and `revert` refuses those instead of
+# restoring half a pair. Written before the stamp — no marker, no stamp, so the
+# next boot tries again.
+{
+  printf 'schema=1\n'
+  printf 'created=%s\n' "$(date +%s)"
+  for n in SmartP teg_config; do
+    if [ -f "$TARGET/$n.db" ]; then
+      sha=$(sha256sum "$TARGET/$n.db" 2>/dev/null | cut -d' ' -f1)
+      size=$(stat -c '%s' "$TARGET/$n.db" 2>/dev/null || echo 0)
+    else
+      sha=''
+      size=''
+    fi
+    printf '%s_sha=%s\n' "$n" "$sha"
+    printf '%s_size=%s\n' "$n" "$size"
+  done
+} > "$TARGET/COMPLETE.tmp" 2>/dev/null && mv -f "$TARGET/COMPLETE.tmp" "$TARGET/COMPLETE" 2>/dev/null
+
+if [ ! -f "$TARGET/COMPLETE" ]; then
+  rm -rf "$TARGET" 2>/dev/null
+  exit 0
+fi
+
 printf '%s\n' "$FP" > "$STAMP_FILE" 2>/dev/null || true

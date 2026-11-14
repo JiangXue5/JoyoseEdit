@@ -58,9 +58,14 @@ die() {
   # next to the error: `true` / `false` / `not-needed`. Without it the caller
   # could only see "write failed" and had no way to learn that Joyose was left
   # stopped.
-  printf '{"ok":false,"error":%s%s}\n' \
-    "$(printf '%s' "$1" | _json_string)" \
-    "${2:+,\"serviceRestore\":\"$2\"}" >&2
+  #
+  # Optional third argument is a machine-readable reason code. The front end
+  # branches on it (e.g. incomplete backup vs. integrity failure); matching on
+  # the message text instead was one wording change away from breaking the UI.
+  printf '{"ok":false%s%s,"error":%s}\n' \
+    "${3:+,\"code\":\"$3\"}" \
+    "${2:+,\"serviceRestore\":\"$2\"}" \
+    "$(printf '%s' "$1" | _json_string)" >&2
   exit 1
 }
 
@@ -184,6 +189,13 @@ _acquire_lock() {
     || die "lost the device lock during initialisation; retry"
   trap '_release_lock' EXIT
   trap '_release_lock; exit 130' INT TERM HUP
+  # A write that was killed mid-swap left a record behind. Resolve it now, with
+  # the lock held and before this command touches anything: building a new edit
+  # on top of a half-applied pair is how a recoverable state becomes an
+  # unrecoverable one.
+  if ! _recover_pending_pair; then
+    die "上一次双库写入被中断，且现有文件无法证明落在哪一半；回滚副本见 $PENDING_PAIR，请手动处理后重试" not-needed recovery-required
+  fi
 }
 
 _release_lock() {
@@ -340,12 +352,58 @@ _apply_file_attrs() {
   return 0
 }
 
+# SELinux context of a file, or nothing when the ROM cannot tell us. `ls -Z`
+# is toybox; `stat -c %C` is coreutils. Neither is universal, which is why the
+# caller has to distinguish "unlabelled" from "could not read".
+_selinux_context() {
+  local out
+  if command -v ls >/dev/null 2>&1; then
+    out=$(ls -Zd "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    case "${out:-}" in
+      '') ;;
+      *:*) printf '%s' "$out"; return 0 ;;
+    esac
+  fi
+  if command -v stat >/dev/null 2>&1; then
+    out=$(stat -c '%C' "$1" 2>/dev/null)
+    case "${out:-}" in
+      ''|'?') ;;
+      *:*) printf '%s' "$out"; return 0 ;;
+    esac
+  fi
+  return 0
+}
+
 # Re-label a file with the SELinux context its directory expects. Replacing a
 # file creates a new inode, and on Android the label is part of how the app is
 # allowed to open it — content correctness alone is not enough.
+#
+# Prints one of:
+#   applied      restorecon ran and the file now carries a label
+#   unsupported  no restorecon on this ROM
+#   failed       restorecon ran and reported failure
+#   unverified   restorecon succeeded but this ROM cannot read labels back
+#
+# Never fails the caller: on a ROM where restorecon is missing but the label is
+# already correct (a plain `cp` into the same directory inherits it), aborting
+# would turn a working write into a broken one. The caller reports the state
+# instead — the old `restorecon ... || true` reported nothing at all, so a
+# failed relabel was indistinguishable from a successful one.
 _restore_label() {
-  command -v restorecon >/dev/null 2>&1 || return 0
-  restorecon "$1" 2>/dev/null || true
+  local target="$1" after
+  command -v restorecon >/dev/null 2>&1 || { printf 'unsupported'; return 0; }
+  if ! restorecon "$target" 2>/dev/null; then
+    printf 'failed'
+    return 0
+  fi
+  # restorecon can return 0 on a ROM whose policy does not cover this path, so
+  # "it did not complain" is not evidence. Read the label back where possible.
+  after=$(_selinux_context "$target")
+  if [ -n "$after" ]; then
+    printf 'applied'
+  else
+    printf 'unverified'
+  fi
   return 0
 }
 
@@ -413,6 +471,7 @@ _verify_db() {
 _install_db() {
   local target="$1" tmp="$2" expect_size="${3:-}" expect_sha="${4:-}" expect_current="${5:-}"
   local uid gid stopped chk size sha rollback cur now_sha was_running=false rb_mode='size' src_sha dst_sha
+  local label vby live_checked
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
 
@@ -519,17 +578,25 @@ _install_db() {
   fi
 
   rm -f "$rollback"
-  _restore_label "$target"
+  label=$(_restore_label "$target")
   # Digest of the bytes that actually landed. The WebUI stores it in the
   # history record so a later rollback can tell "this database is still the one
   # my delta was computed against" from "somebody replaced it since".
   dst_sha=$(_sha256_file "$target")
+  # How strong the two guards actually were. "checked" used to be implied by
+  # the absence of an error, which read as "sha256-verified" even when the
+  # WebView had no crypto.subtle and the only check was a byte count.
+  vby='none'
+  if [ -n "$expect_size" ]; then vby='length'; fi
+  if [ -n "$expect_sha" ] && [ "$expect_sha" != "none" ]; then vby='sha256'; fi
+  live_checked=false
+  if [ -n "$expect_current" ] && [ "$expect_current" != "none" ]; then live_checked=true; fi
   # `stopped` means "we confirmed the process is gone before swapping"; it is
   # not the final state. `wasRunning` records whether it was up beforehand, so
   # the caller can tell "still running" from "was never running". The restart
   # result comes from cmd_restart, not from here.
-  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopConfirmed":true,"wasRunning":%s,"verified":"%s","rollback":"%s","sha256":"%s"}\n' \
-    "$target" "$uid" "$gid" "$was_running" "$chk" "$rb_mode" "$dst_sha"
+  printf '{"ok":true,"path":"%s","uid":%s,"gid":%s,"stopConfirmed":true,"wasRunning":%s,"verified":"%s","rollback":"%s","sha256":"%s","verifiedBy":"%s","liveChecked":%s,"labelRestored":"%s"}\n' \
+    "$target" "$uid" "$gid" "$was_running" "$chk" "$rb_mode" "$dst_sha" "$vby" "$live_checked" "$label"
 }
 
 
@@ -558,6 +625,18 @@ cmd_stat() {
   stat_one "$TEG" teg
   printf ',"backup_count":%s' "$(ls "$DATA_ROOT/backup" 2>/dev/null | wc -l | tr -d ' \n')"
   printf ',"history_count":%s' "$(ls "$DATA_ROOT/history" 2>/dev/null | wc -l | tr -d ' \n')"
+  # A leftover transaction record means the last pair write was interrupted and
+  # nothing has touched the databases since. `recovery` is the last time one was
+  # resolved automatically — the UI shows it once, keyed by the timestamp, so an
+  # auto-repair never goes unmentioned but also never repeats.
+  if [ -f "$PENDING_PAIR" ]; then printf ',"pending":true'; else printf ',"pending":false'; fi
+  if [ -f "$RECOVERY_NOTE" ]; then
+    printf ',"recovery":{"kind":"%s","at":%s}' \
+      "$(awk 'NR==1{print $2}' "$RECOVERY_NOTE" 2>/dev/null)" \
+      "$(awk 'NR==1{print $1}' "$RECOVERY_NOTE" 2>/dev/null || echo 0)"
+  else
+    printf ',"recovery":null'
+  fi
   printf '}\n'
 }
 
@@ -636,7 +715,7 @@ _check_staged_db() {
 cmd_push_pair_from_stage() {
   local sp_stage="$1" teg_stage="$2" sp_size="$3" sp_sha="$4" sp_cur="$5"
   local teg_size="$6" teg_sha="$7" teg_cur="$8"
-  local dir="$STAGE_DIR/pair.$$" sp teg
+  local dir="$STAGE_DIR/pair.$$" sp teg vby
   safe_name "$sp_stage" || die "invalid stage name"
   safe_name "$teg_stage" || die "invalid stage name"
   sp="$dir/SmartP.db"
@@ -650,14 +729,23 @@ cmd_push_pair_from_stage() {
 
   _RESTORE_WAS_RUNNING=false
   _RESTORE_SKIPPED=''
+  _RESTORE_LABEL_SP=''
+  _RESTORE_LABEL_TEG=''
   # Exits on failure, having put both databases back. On success both live
   # files now hold the new bytes and Joyose is stopped.
   _restore_pair "$dir"
 
+  # What the two uploads were actually checked against. "sha256" only when both
+  # sides carried a digest; otherwise the write was guarded by length alone and
+  # the caller has to say so.
+  vby='length'
+  if [ -n "$sp_sha" ] && [ "$sp_sha" != "none" ] && [ -n "$teg_sha" ] && [ "$teg_sha" != "none" ]; then
+    vby='sha256'
+  fi
   rm -rf "$dir" 2>/dev/null || true
   rm -f "$STAGE_DIR/$sp_stage" "$STAGE_DIR/$teg_stage" 2>/dev/null || true
-  printf '{"ok":true,"stopConfirmed":true,"wasRunning":%s,"verified":"pair","atomic":true}\n' \
-    "$_RESTORE_WAS_RUNNING"
+  printf '{"ok":true,"stopConfirmed":true,"wasRunning":%s,"verified":"pair","atomic":true,"verifiedBy":"%s","label":{"smartp":"%s","teg":"%s"}}\n' \
+    "$_RESTORE_WAS_RUNNING" "$vby" "${_RESTORE_LABEL_SP:-}" "${_RESTORE_LABEL_TEG:-}"
 }
 
 cmd_push() {
@@ -671,6 +759,81 @@ cmd_push() {
   # decode directly into the sibling tmp, then rename atomically.
   printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "base64 decode failed"; }
   _finish_staged_write "$target" "$tmp" "$expect_size" "$expect_sha" "$expect_current"
+}
+
+# ---- backup completeness ---------------------------------------------------
+# A directory under backup/ is not evidence that the snapshot finished. Kill the
+# process between the two `cp` calls and the leftover directory looks exactly
+# like a backup of a device that only had one database — so a later revert
+# restores half the pair and calls it success. The marker is written last and
+# records both digests; a restore refuses a directory it cannot account for.
+#
+# Plain `key=value` lines instead of JSON: this file is read by shell, and the
+# device-side JSON parser would be a grep pretending to be a parser.
+BACKUP_MARKER=COMPLETE
+
+_write_backup_marker() {
+  local dir="$1"
+  local t f sha size
+  t="$dir/$BACKUP_MARKER.$$"
+  {
+    printf 'schema=1\n'
+    printf 'created=%s\n' "$(date +%s)"
+    for f in SmartP teg_config; do
+      if [ -f "$dir/$f.db" ]; then
+        sha=$(_sha256_file "$dir/$f.db")
+        size=$(stat -c '%s' "$dir/$f.db" 2>/dev/null || echo 0)
+      else
+        sha=''
+        size=''
+      fi
+      printf '%s_sha=%s\n' "$f" "$sha"
+      printf '%s_size=%s\n' "$f" "$size"
+    done
+  } > "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+  # rename: a truncated marker must not look like a finished snapshot
+  mv -f "$t" "$dir/$BACKUP_MARKER" 2>/dev/null || { rm -f "$t"; return 1; }
+  return 0
+}
+
+# Read one key from a marker file.
+_marker_get() {
+  local file="$1" key="$2" line k v
+  [ -f "$file" ] || return 0
+  while IFS= read -r line; do
+    k=${line%%=*}
+    if [ "$k" = "$key" ]; then
+      v=${line#*=}
+      printf '%s' "$v"
+      return 0
+    fi
+  done < "$file"
+  return 0
+}
+
+# Confirm the files in a backup still match what was recorded when it was
+# taken. Prints "ok", "no-marker" or "mismatch:<file>".
+_verify_backup_marker() {
+  local dir="$1"
+  local marker f want_sha want_size got_sha got_size
+  marker="$dir/$BACKUP_MARKER"
+  [ -f "$marker" ] || { printf 'no-marker'; return 0; }
+  for f in SmartP teg_config; do
+    [ -f "$dir/$f.db" ] || continue
+    want_sha=$(_marker_get "$marker" "${f}_sha")
+    want_size=$(_marker_get "$marker" "${f}_size")
+    got_size=$(stat -c '%s' "$dir/$f.db" 2>/dev/null || echo -1)
+    if [ -n "$want_sha" ]; then
+      got_sha=$(_sha256_file "$dir/$f.db")
+      if [ "$got_sha" != "$want_sha" ]; then printf 'mismatch:%s.db' "$f"; return 0; fi
+    elif [ -n "$want_size" ] && [ "$got_size" != "$want_size" ]; then
+      # No digest on this ROM at snapshot time: size is the only claim the
+      # marker can make, and it still has to hold.
+      printf 'mismatch:%s.db' "$f"
+      return 0
+    fi
+  done
+  printf 'ok'
 }
 
 cmd_backup() {
@@ -745,6 +908,12 @@ cmd_backup() {
       _abort_after_stop "$was" "backup snapshot failed integrity check ($(basename "$f"))"
     fi
   done
+  # Last step that can fail: everything is on disk and verified, so the
+  # directory may now claim to be a complete snapshot.
+  if ! _write_backup_marker "$dir"; then
+    rm -rf "$dir"
+    _abort_after_stop "$was" "cannot record the backup manifest; snapshot discarded"
+  fi
   prune_backups 10
   # A commit takes its backup immediately before writing, and the write path
   # restarts Joyose itself — starting it here would only add a cold start to
@@ -770,6 +939,172 @@ prune_backups() {
   done
 }
 
+# ---- crash recovery for the two-database swap ------------------------------
+# Two renames cannot be atomic: the phone can lose power between them, and
+# afterwards nothing on disk says which half landed. This is the smallest thing
+# that closes that window: before the first rename, record what is about to
+# happen; after the second database verifies, delete the record. Every mutating
+# subcommand looks for a leftover record before it does anything else and
+# finishes the job the dead process started.
+#
+# Deliberately not a state machine. The swap is milliseconds long and the file
+# digests are the only state that matters; a seven-state log would add states
+# that nothing can distinguish from the outside. A record that the digests
+# cannot resolve is left in place and blocks further writes — after an
+# interrupted swap, guessing is worse than stopping.
+PENDING_PAIR="$DATA_ROOT/.pending-pair"
+RECOVERY_NOTE="$DATA_ROOT/.pending-pair.note"
+
+# $1 sp_rb  $2 teg_rb  $3 sp_old  $4 teg_old  $5 sp_new  $6 teg_new
+# $7 sp_old_size $8 teg_old_size $9 sp_new_size  ${10} teg_new_size
+# ${11} sp_used ${12} teg_used ${13} was_running
+_pending_write() {
+  local tmp="$PENDING_PAIR.$$"
+  {
+    printf 'created=%s\n' "$(date +%s)"
+    printf 'sp_rb=%s\n' "$1"
+    printf 'teg_rb=%s\n' "$2"
+    printf 'sp_old=%s\n' "$3"
+    printf 'teg_old=%s\n' "$4"
+    printf 'sp_new=%s\n' "$5"
+    printf 'teg_new=%s\n' "$6"
+    printf 'sp_old_size=%s\n' "$7"
+    printf 'teg_old_size=%s\n' "$8"
+    printf 'sp_new_size=%s\n' "$9"
+    printf 'teg_new_size=%s\n' "${10}"
+    printf 'sp_used=%s\n' "${11}"
+    printf 'teg_used=%s\n' "${12}"
+    printf 'was_running=%s\n' "${13}"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  # rename, so a half-written record can never be mistaken for a real one
+  mv -f "$tmp" "$PENDING_PAIR" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+_pending_clear() {
+  rm -f "$PENDING_PAIR" 2>/dev/null || true
+}
+
+# One line: "<epoch> <kind>". cmd_stat reads it so the UI can say that a
+# previous operation was interrupted and what happened to it.
+_pending_note() {
+  printf '%s %s\n' "$(date +%s)" "$1" > "$RECOVERY_NOTE" 2>/dev/null || true
+}
+
+# Where is this database relative to the transaction that was in flight?
+#   old | new | missing | other
+# Digests when the ROM has sha256sum, sizes otherwise: a size match is weak
+# evidence, so it is only trusted when there is nothing better.
+_pair_state() {
+  local f="$1" old="$2" new="$3" old_size="$4" new_size="$5" now size
+  [ -f "$f" ] || { printf 'missing'; return 0; }
+  now=$(_sha256_file "$f")
+  if [ -n "$now" ] && [ -n "$old" ] && [ -n "$new" ]; then
+    if [ "$now" = "$new" ]; then printf 'new'; return 0; fi
+    if [ "$now" = "$old" ]; then printf 'old'; return 0; fi
+    printf 'other'
+    return 0
+  fi
+  size=$(stat -c '%s' "$f" 2>/dev/null || echo -1)
+  if [ -n "$new_size" ] && [ "$size" = "$new_size" ]; then printf 'new'; return 0; fi
+  if [ -n "$old_size" ] && [ "$size" = "$old_size" ]; then printf 'old'; return 0; fi
+  printf 'other'
+}
+
+# Resolve a leftover record. Returns 0 when there is nothing left to do (or the
+# record was resolved), 1 when the state cannot be decided from the evidence —
+# the caller must refuse to write rather than build on a half-applied pair.
+_recover_pending_pair() {
+  [ -f "$PENDING_PAIR" ] || return 0
+  local sp_rb='' teg_rb='' sp_old='' teg_old='' sp_new='' teg_new=''
+  local sp_old_size='' teg_old_size='' sp_new_size='' teg_new_size=''
+  local sp_used=true teg_used=true was='false'
+  local k v line sp_state teg_state left
+
+  while IFS= read -r line; do
+    k=${line%%=*}
+    v=${line#*=}
+    case "$k" in
+      sp_rb) sp_rb=$v ;;
+      teg_rb) teg_rb=$v ;;
+      sp_old) sp_old=$v ;;
+      teg_old) teg_old=$v ;;
+      sp_new) sp_new=$v ;;
+      teg_new) teg_new=$v ;;
+      sp_old_size) sp_old_size=$v ;;
+      teg_old_size) teg_old_size=$v ;;
+      sp_new_size) sp_new_size=$v ;;
+      teg_new_size) teg_new_size=$v ;;
+      sp_used) sp_used=$v ;;
+      teg_used) teg_used=$v ;;
+      was_running) was=$v ;;
+    esac
+  done < "$PENDING_PAIR"
+
+  sp_state='skip'
+  teg_state='skip'
+  if [ "$sp_used" = "true" ]; then
+    sp_state=$(_pair_state "$SMARTP" "$sp_old" "$sp_new" "$sp_old_size" "$sp_new_size")
+  fi
+  if [ "$teg_used" = "true" ]; then
+    teg_state=$(_pair_state "$TEG" "$teg_old" "$teg_new" "$teg_old_size" "$teg_new_size")
+  fi
+  # A file that vanished, or that matches neither side, means somebody else
+  # changed it. There is nothing here to reason from.
+  for left in "$sp_state" "$teg_state"; do
+    case "$left" in
+      other|missing) return 1 ;;
+    esac
+  done
+
+  # Both participating databases are on the same side of the swap: nothing to
+  # repair. Either the swap never started (both old) or it finished and only
+  # the record was left behind (both new).
+  if [ "$sp_state" = "$teg_state" ] || [ "$sp_state" = "skip" ] || [ "$teg_state" = "skip" ]; then
+    case "$sp_state$teg_state" in
+      oldold|newnew|oldskip|newskip|skipold|skipnew|skipskip)
+        if [ "$sp_state" = "new" ] || [ "$teg_state" = "new" ]; then
+          _pending_note "committed"
+        else
+          _pending_note "discarded"
+        fi
+        _pending_clear
+        rm -f "$sp_rb" "$teg_rb" 2>/dev/null || true
+        return 0
+        ;;
+    esac
+  fi
+
+  # One side landed, the other did not. Put the landed side back. The rollback
+  # copy is the only thing that can do that, and it has to still match the bytes
+  # we recorded — anything else means it was clobbered by a later run.
+  local st rb oldf od
+  for st in sp teg; do
+    if [ "$st" = "sp" ]; then rb=$sp_rb; oldf=$SMARTP; od=$sp_old; k=$sp_state
+    else rb=$teg_rb; oldf=$TEG; od=$teg_old; k=$teg_state; fi
+    if [ "$k" != "new" ]; then continue; fi
+    if [ ! -f "$rb" ]; then return 1; fi
+    if [ -n "$od" ] && [ "$(_sha256_file "$rb")" != "$od" ]; then return 1; fi
+    _drop_sidecars "$oldf"
+    mv -f "$rb" "$oldf" 2>/dev/null || return 1
+    _drop_sidecars "$oldf"
+  done
+
+  # Prove the rollback before declaring it done.
+  if [ "$sp_used" = "true" ]; then
+    [ "$(_pair_state "$SMARTP" "$sp_old" "$sp_new" "$sp_old_size" "$sp_new_size")" = "old" ] || return 1
+  fi
+  if [ "$teg_used" = "true" ]; then
+    [ "$(_pair_state "$TEG" "$teg_old" "$teg_new" "$teg_old_size" "$teg_new_size")" = "old" ] || return 1
+  fi
+
+  _pending_clear
+  rm -f "$sp_rb" "$teg_rb" 2>/dev/null || true
+  if [ "$was" = "true" ]; then _start_pkg >/dev/null 2>&1 || true; fi
+  _pending_note "rolled-back"
+  return 0
+}
+
 # Restore SmartP *and* teg as one transaction. Two independent _install_db calls
 # (the old behaviour) could leave one database restored and the other still new
 # if the second one failed — a combination that never existed on the device and
@@ -783,7 +1118,10 @@ _restore_pair() {
   local sp_tmp="$SMARTP.jedit.$$" teg_tmp="$TEG.jedit.$$"
   local sp_rb="$SMARTP.jedit.rb.$$" teg_rb="$TEG.jedit.rb.$$"
   local use_sp=false use_teg=false was_running=false failed='' rb_failed=''
-  local chk s1 r1 s2 r2 skipped=''
+  # s1/s2 are read by the transaction record even when one side is not being
+  # written, so they must exist (under `set -u`) rather than be declared name-only.
+  local chk s1='' r1='' s2='' r2='' skipped='' n1='' n2=''
+  local ospsz=0 otgsz=0 nspsz=0 ntgsz=0
 
   # A backup that holds both databases says the device had both when it was
   # taken. If one of them is gone now, restoring only the survivor is a
@@ -876,6 +1214,26 @@ _restore_pair() {
     fi
   fi
 
+  # Record the intent before the first rename. A kill between the two swaps
+  # leaves a half-applied pair that no amount of error handling in this process
+  # can undo, because this process is gone. The next mutating command reads this
+  # record and puts both databases back (see _recover_pending_pair).
+  if [ "$use_sp" = true ]; then
+    n1=$(_sha256_file "$sp_tmp")
+    ospsz=$(stat -c '%s' "$SMARTP" 2>/dev/null || echo 0)
+    nspsz=$(stat -c '%s' "$sp_tmp" 2>/dev/null || echo 0)
+  fi
+  if [ "$use_teg" = true ]; then
+    n2=$(_sha256_file "$teg_tmp")
+    otgsz=$(stat -c '%s' "$TEG" 2>/dev/null || echo 0)
+    ntgsz=$(stat -c '%s' "$teg_tmp" 2>/dev/null || echo 0)
+  fi
+  if ! _pending_write "$sp_rb" "$teg_rb" "$s1" "$s2" "$n1" "$n2" \
+      "$ospsz" "$otgsz" "$nspsz" "$ntgsz" "$use_sp" "$use_teg" "$was_running"; then
+    rm -f "$sp_tmp" "$teg_tmp"
+    _abort_after_stop "$was_running" "cannot record the transaction on disk; refusing to swap"
+  fi
+
   # 4. swap, then verify; the second swap is skipped if the first one failed
   if [ "$use_sp" = true ]; then
     _drop_sidecars "$SMARTP"
@@ -920,20 +1278,54 @@ _restore_pair() {
       # would only make the failure look like a config problem.
       die "restore failed on $failed and the original could not be put back for:$rb_failed. Rollback copies kept: $sp_rb $teg_rb — restore them by hand or reboot before using Joyose"
     fi
+    # Both databases are provably back on their old bytes: the record has done
+    # its job and must not block the next write.
+    _pending_clear
     _abort_after_stop "$was_running" "restore failed on $failed; both databases are back to their previous contents"
   fi
 
   # The bytes are right; make the filesystem agree. A fresh inode carries the
   # directory's default label, which on some ROMs is not the one Joyose is
   # allowed to open.
-  if [ "$use_sp" = true ]; then _restore_label "$SMARTP"; fi
-  if [ "$use_teg" = true ]; then _restore_label "$TEG"; fi
+  _RESTORE_LABEL_SP=''
+  _RESTORE_LABEL_TEG=''
+  if [ "$use_sp" = true ]; then _RESTORE_LABEL_SP=$(_restore_label "$SMARTP"); fi
+  if [ "$use_teg" = true ]; then _RESTORE_LABEL_TEG=$(_restore_label "$TEG"); fi
+  # Both databases are verified and labelled: the swap is committed, so the
+  # record must go before the rollback copies do. A crash after this line
+  # leaves only stray .rb files, which the next run ignores.
+  _pending_clear
   rm -f "$sp_rb" "$teg_rb" "$sp_tmp" "$teg_tmp"
 }
 
 _revert_from_dir() {
-  local dir="$1" f chk started
+  local dir="$1" f chk started missing='' marker legacy=false
   [ -d "$dir" ] || die "no such backup: $dir"
+
+  # A backup has to contain every database the device has right now. One that
+  # does not is either a legacy snapshot (taken when the phone only had one) or
+  # the remains of a run that was killed between its two copies — and restoring
+  # the survivor alone is not what "回滚到备份" means. Do it silently and the
+  # phone ends up holding a pair that never existed on any boot.
+  if [ -f "$SMARTP" ] && [ ! -f "$dir/SmartP.db" ]; then missing="$missing SmartP.db"; fi
+  if [ -f "$TEG" ] && [ ! -f "$dir/teg_config.db" ]; then missing="$missing teg_config.db"; fi
+  if [ -n "$missing" ]; then
+    die "备份不完整：缺少${missing}（设备上存在该库）。请换用完整备份，或先确认这个库可以单独丢弃" not-needed incomplete-backup
+  fi
+
+  marker=$(_verify_backup_marker "$dir")
+  case "$marker" in
+    ok) ;;
+    no-marker)
+      # Older backups predate the marker. They are allowed (the completeness
+      # rule above already ran), but the caller is told this snapshot could not
+      # prove it is untouched.
+      legacy=true
+      ;;
+    mismatch:*)
+      die "备份内容与生成时的摘要不符（${marker#mismatch:}），可能已损坏或被改动；已拒绝回滚" not-needed backup-corrupt
+      ;;
+  esac
 
   # Refuse to restore a corrupt backup: the whole point is that this file is
   # the known-good copy. Check both before touching either live database.
@@ -950,14 +1342,17 @@ _revert_from_dir() {
   # if any step fails, so a half-restored pair cannot reach the phone.
   _RESTORE_WAS_RUNNING=false
   _RESTORE_SKIPPED=''
+  _RESTORE_LABEL_SP=''
+  _RESTORE_LABEL_TEG=''
   _restore_pair "$dir"
 
   started=false
   if [ "$_RESTORE_WAS_RUNNING" = "true" ]; then
     started=$(_start_pkg)
   fi
-  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"atomic":true,"skipped":%s}\n' \
-    "$dir" "$_RESTORE_WAS_RUNNING" "$started" "$(printf '%s' "${_RESTORE_SKIPPED# }" | _json_string)"
+  printf '{"ok":true,"from":"%s","wasRunning":%s,"stopped":true,"restarted":%s,"atomic":true,"skipped":%s,"legacy":%s,"label":{"smartp":"%s","teg":"%s"}}\n' \
+    "$dir" "$_RESTORE_WAS_RUNNING" "$started" "$(printf '%s' "${_RESTORE_SKIPPED# }" | _json_string)" \
+    "$legacy" "${_RESTORE_LABEL_SP:-}" "${_RESTORE_LABEL_TEG:-}"
 }
 
 cmd_revert() {
