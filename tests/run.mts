@@ -3391,6 +3391,38 @@ function seedTegPref(h: HelperHarness, value: string) {
   );
 }
 
+/** Lay out the module the way it is installed, so `service.sh` can be run for
+ *  real: it finds the helper at `${0%/*}/bin/joyose-edit.sh`, exactly as on the
+ *  device. */
+function installModuleCopy(h: HelperHarness): string {
+  const moduleDir = path.join(h.dir, 'module');
+  mkdirSync(path.join(moduleDir, 'bin'), { recursive: true });
+  const rewrite = (src: string) =>
+    src
+      .replace(/^DATA_ROOT=.*$/m, `DATA_ROOT=${h.dataDir}`)
+      .replace(/^DB_DIR=.*$/m, `DB_DIR=${h.dbDir}`)
+      .replace(/^TEG_SP=.*$/m, `TEG_SP=${tegPrefPath(h)}`);
+  writeFileSync(
+    path.join(moduleDir, 'bin', 'joyose-edit.sh'),
+    rewrite(readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8')),
+  );
+  const svc = path.join(moduleDir, 'service.sh');
+  writeFileSync(svc, rewrite(readFileSync(path.join(ROOT, 'module/service.sh'), 'utf8')));
+  return svc;
+}
+
+function runBootScript(h: HelperHarness, svc: string) {
+  return spawnSync('sh', [svc], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: {
+      ...process.env,
+      ...(h.sysbin ? { PATH: `${h.bin}:${h.sysbin}` } : { PATH: `${h.bin}:${process.env.PATH}` }),
+      FAKE: h.fake,
+    },
+  });
+}
+
 function harnessScript(h: HelperHarness, driver: string): string {
   const src = readFileSync(path.join(ROOT, 'module/bin/joyose-edit.sh'), 'utf8');
   const cut = src.indexOf('# ---- dispatch');
@@ -4249,6 +4281,86 @@ if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clea
       throw new Error('the preference file was damaged: ' + pref);
     }
     return 'error reported, Joyose back up, pref untouched';
+  });
+
+  await check('开机备份：service.sh 真的会跑一次完整快照，第二次开机跳过', () => {
+    // Nothing tested service.sh before: it runs at boot, on a path no test
+    // touches, and its job is to create the snapshot the user is later told to
+    // restore. Laid out as installed, with the helper it actually calls.
+    const h = newHarness();
+    seedPair(h);
+    const svc = installModuleCopy(h);
+    const first = runBootScript(h, svc);
+    const dirs = readdirSync(path.join(h.dataDir, 'backup')).sort();
+    const dir = dirs[0] ? path.join(h.dataDir, 'backup', dirs[0]) : '';
+    const files = dir ? readdirSync(dir).sort() : [];
+    const stamp = readFileSync(path.join(h.dataDir, '.bootstrap-version'), 'utf8').trim();
+    const second = runBootScript(h, svc);
+    const after = readdirSync(path.join(h.dataDir, 'backup')).sort();
+    const log = readFileSync(path.join(h.dataDir, 'bootstrap.log'), 'utf8');
+    cleanupHarness(h);
+    if (first.status !== 0) throw new Error('the boot script exited ' + first.status + ': ' + first.stderr);
+    if (dirs.length !== 1) throw new Error('boot snapshots: ' + dirs.join(','));
+    if (!files.includes('SmartP.db') || !files.includes('teg_config.db') || !files.includes('COMPLETE')) {
+      throw new Error('boot snapshot incomplete: ' + files.join(','));
+    }
+    if (!stamp) throw new Error('no fingerprint was recorded');
+    if (second.status !== 0) throw new Error('the second boot exited ' + second.status + ': ' + second.stderr);
+    if (after.length !== 1) throw new Error('the second boot snapshotted again: ' + after.join(','));
+    if (!/unchanged/.test(log)) throw new Error('the helper was not asked: ' + log.slice(0, 300));
+    return 'snapshot on the first boot, skipped on the second';
+  });
+
+  await check('开机备份：两个库的指纹才算数，且走完整快照流程', () => {
+    // service.sh used to fingerprint SmartP alone, so a boot where only teg
+    // moved was skipped and the "baseline" stayed stale. And the snapshot was
+    // a bare `cp` with a size comparison: no marker, no integrity check.
+    const h = newHarness();
+    seedPair(h);
+    const backupRoot = path.join(h.dataDir, 'backup');
+    const list = () => readdirSync(backupRoot).sort();
+    const first = runDispatch(h, ['bootstrap-backup']);
+    const after1 = list();
+    const again = runDispatch(h, ['bootstrap-backup']);
+    const after2 = list();
+    // Only the second database changes.
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    writeFileSync(teg, readFileSync(path.join(ROOT, 'tests/Xiaomi 17 Ultra/teg_config.db')));
+    const third = runDispatch(h, ['bootstrap-backup']);
+    const after3 = list();
+    const dir = after1[0] ? path.join(backupRoot, after1[0]) : '';
+    const files = dir ? readdirSync(dir).sort() : [];
+    cleanupHarness(h);
+    if (first.code !== 0) throw new Error('bootstrap failed: ' + first.err.slice(0, 300));
+    if (after1.length !== 1) throw new Error('no snapshot taken: ' + after1.join(','));
+    if (!files.includes('SmartP.db') || !files.includes('teg_config.db')) {
+      throw new Error('snapshot is missing a database: ' + files.join(','));
+    }
+    if (!files.includes('COMPLETE')) throw new Error('snapshot has no marker: ' + files.join(','));
+    if (!/unchanged/.test(again.out)) throw new Error('a second boot re-snapshotted: ' + again.out.slice(0, 200));
+    if (after2.length !== 1) throw new Error('the second boot added a snapshot');
+    // teg-only change: the old fingerprint would not have moved.
+    if (third.code !== 0) throw new Error('bootstrap after a teg change failed: ' + third.err.slice(0, 300));
+    if (after3.length !== 2) throw new Error('a teg-only change was not snapshotted: ' + after3.join(','));
+    return 'one snapshot per change, complete and marked';
+  });
+
+  await check('开机备份：另一个写入持锁时不会插进去', () => {
+    const h = newHarness();
+    const held = path.join(h.fake, 'held');
+    const holder = spawnHarness(h, '_acquire_lock holder\n: > "$FAKE/held"\nsleep 4', {
+      LOCK_WAIT_TICKS: '20',
+    });
+    const started = waitFor(() => existsSync(held));
+    const r = runDispatch(h, ['bootstrap-backup'], { LOCK_WAIT_TICKS: '3' });
+    holder.kill('SIGTERM');
+    const made = readdirSync(path.join(h.dataDir, 'backup'));
+    cleanupHarness(h);
+    if (!started) throw new Error('the lock holder never took the lock');
+    if (r.code === 0) throw new Error('the boot snapshot ignored the device lock');
+    if (!/device is busy/.test(r.err)) throw new Error('wrong error: ' + r.err.slice(0, 300));
+    if (made.length) throw new Error('a snapshot was taken under a held lock');
+    return 'refused while held, nothing written';
   });
 
   await check('历史：同一序号不会被第二个写入覆盖', () => {

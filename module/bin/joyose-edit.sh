@@ -52,6 +52,8 @@ PKG=com.xiaomi.joyose
 # kills the shell) leaves the phone with Joyose down, and nothing on the device
 # would otherwise know that this was our doing rather than the user's.
 SERVICE_MARKER="$DATA_ROOT/.service-stopped"
+# Fingerprint of the database pair the last boot snapshot was taken from.
+BOOTSTRAP_STAMP="$DATA_ROOT/.bootstrap-version"
 
 mkdir -p "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 chmod 700 "$DATA_ROOT" "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
@@ -830,6 +832,47 @@ cmd_push_pair_from_stage() {
   rm -f "$STAGE_DIR/$sp_stage" "$STAGE_DIR/$teg_stage" 2>/dev/null || true
   printf '{"ok":true,"stopConfirmed":true,"wasRunning":%s,"verified":"pair","atomic":true,"verifiedBy":"%s","label":{"smartp":"%s","teg":"%s"}}\n' \
     "$_RESTORE_WAS_RUNNING" "$vby" "${_RESTORE_LABEL_SP:-}" "${_RESTORE_LABEL_TEG:-}"
+}
+
+# Fingerprint of the database pair: a snapshot is only worth taking when one of
+# them changed. SmartP alone missed the boot where only teg moved.
+_db_pair_fingerprint() {
+  local out='' f
+  for f in "$SMARTP" "$TEG"; do
+    if [ -f "$f" ]; then
+      out="$out$(stat -c '%Y#%s#%i' "$f" 2>/dev/null || echo -);"
+    else
+      out="$out-;"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Boot-time baseline snapshot, called by service.sh once the owner's CE storage
+# is up. It used to be a bare `cp` in service.sh: no lock, so it could copy a
+# database while a commit was halfway through replacing it, and no integrity
+# check beyond a size comparison, so a torn copy passed as a "known good
+# baseline". This runs the same snapshot a manual backup takes — exclusive
+# directory, quiesced consumer, integrity check, COMPLETE marker — under the
+# device lock, so the two can never overlap.
+cmd_bootstrap_backup() {
+  local fp last
+  if [ ! -f "$SMARTP" ] && [ ! -f "$TEG" ]; then
+    printf '{"ok":true,"skipped":"no-databases"}\n'
+    return 0
+  fi
+  fp=$(_db_pair_fingerprint)
+  last=$(cat "$BOOTSTRAP_STAMP" 2>/dev/null || true)
+  if [ -n "$fp" ] && [ "$fp" = "$last" ]; then
+    printf '{"ok":true,"skipped":"unchanged"}\n'
+    return 0
+  fi
+  # `cmd_backup` exits on any failure, having removed its half-written
+  # directory, so reaching the next line means the snapshot is complete and
+  # marked. The stamp is written last for the same reason: a boot that failed
+  # must be retried, not remembered as done.
+  cmd_backup --no-restore initial
+  printf '%s\n' "$fp" > "$BOOTSTRAP_STAMP" 2>/dev/null || true
 }
 
 cmd_push() {
@@ -1893,8 +1936,11 @@ shift
 # `history-save-from-stage` / `history-clear` write and delete files the next
 # commit reads (seq allocation scans the same directory), and they are called
 # by every WebView, so they need the same mutex.
+#
+# `bootstrap-backup` is the boot snapshot: it stops Joyose and copies both
+# databases, which is exactly the window a commit must not share.
 case "$cmd" in
-  push|push-from-stage|push-pair-from-stage|backup|revert|revert-latest|reset-cloud|teg-freeze|teg-unfreeze|restart|history-save-from-stage|history-clear)
+  push|push-from-stage|push-pair-from-stage|backup|bootstrap-backup|revert|revert-latest|reset-cloud|teg-freeze|teg-unfreeze|restart|history-save-from-stage|history-clear)
     _acquire_lock "$cmd" ;;
 esac
 
@@ -1925,6 +1971,7 @@ case "$cmd" in
   stage-clear)    cmd_stage_clear "${1:?}" ;;
   stage-gc)       cmd_stage_gc ;;
   stage-append)   cmd_stage_append "${1:?}" "${2:?}" ;;
+  bootstrap-backup)        cmd_bootstrap_backup ;;
   push-from-stage)         cmd_push_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
   push-pair-from-stage)    cmd_push_pair_from_stage "${1:?}" "${2:?}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
   lock-status)             cmd_lock_status ;;
