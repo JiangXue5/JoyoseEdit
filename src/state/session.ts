@@ -174,6 +174,10 @@ export async function initialize(): Promise<void> {
   }
   state.connected = true;
   await refreshStat();
+  // A write that was interrupted (app closed, shell killed, phone rebooted
+  // mid-commit) may have left Joyose stopped. Opening the WebUI is often the
+  // first thing that happens afterwards, so this is where it gets fixed.
+  await rescueStoppedService('上一次写入没有正常结束');
   // Preferences come from the module's settings file (localStorage is only a
   // cache and a WebView data reset — or a manager switch, which changes the
   // WebUI origin — used to wipe them back to the defaults).
@@ -1265,6 +1269,41 @@ async function waitForDeviceIdle(maxMs = 30000): Promise<boolean> {
   return false;
 }
 
+/** Put Joyose back if a write left it down.
+ *
+ *  Every write stops Joyose and starts it again when it finishes. A write that
+ *  never finishes — the front-end timed out, the WebView was closed, the manager
+ *  killed the shell — leaves the phone running without a cloud config, and
+ *  nothing else would notice: the next game launch just reads nothing. The
+ *  helper leaves a marker for exactly that, and this is the only place that
+ *  acts on it.
+ *
+ *  Silent on success (Joyose being up is the normal state, and the user already
+ *  saw the timeout); loud on failure, because nothing else will try again until
+ *  the app is reopened. */
+async function rescueStoppedService(reason: string): Promise<void> {
+  let st: bridge.StatResult | null = null;
+  try {
+    st = await bridge.stat();
+  } catch {
+    return; // cannot tell — do not guess
+  }
+  if (!st?.service_stopped) return;
+  const r = await bridge.restart().catch(() => null);
+  const started = r?.started === true;
+  state.applyStatus = {
+    // The marker existing *is* the record of a confirmed stop.
+    stopConfirmed: true,
+    wasRunningBefore: true,
+    restartAttempted: true,
+    startedAfter: started,
+    at: Date.now(),
+  };
+  if (!started) {
+    state.lastError = `${reason}，Joyose 仍处于停止状态，进游戏前请手动打开一次。`;
+  }
+}
+
 async function withWriteLock<T>(label: string, fn: () => Promise<T>): Promise<T> {
   if (writeBusy) {
     throw new Error(`上一个写入操作尚未结束，暂时不能${label}，请稍后再试`);
@@ -1285,11 +1324,16 @@ async function withWriteLock<T>(label: string, fn: () => Promise<T>): Promise<T>
       // so a retry is refused locally instead of stacking on top of the
       // command that never answered us.
       void waitForDeviceIdle()
-        .then((idle) => {
+        .then(async (idle) => {
           if (!idle) {
             state.lastError =
               '设备侧的写入在超时后仍未结束。已保持互斥锁，请等它完成或重启手机后再操作。';
+            return;
           }
+          // The device is quiet again. If that write had taken Joyose down, it
+          // is still down, and it is the only cost of the timeout the user
+          // cannot see.
+          await rescueStoppedService('上一次写入超时');
         })
         .finally(() => {
           writeBusy = false;

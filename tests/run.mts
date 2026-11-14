@@ -4068,6 +4068,57 @@ exec /usr/bin/stat "$@"
     return 'landed and reported as landed';
   });
 
+  await check('服务：我们停的留标记，我们起的清标记，本来没跑就不认账', () => {
+    // The marker is the only thing on the device that knows Joyose is down
+    // because of us. A write that never returns cannot clean up after itself,
+    // so the record has to be written before the stop is spent.
+    const h = newHarness();
+    const alive = path.join(h.fake, 'alive');
+    writeFileSync(alive, '');
+    const r = runHarness(
+      h,
+      `_stop_pkg >/dev/null
+if [ -f "$SERVICE_MARKER" ]; then echo "stopped=marked"; else echo "stopped=clean"; fi
+cmd_stat | tr ',' '\\n' | grep service_stopped
+_start_pkg >/dev/null
+if [ -f "$SERVICE_MARKER" ]; then echo "started=marked"; else echo "started=clean"; fi
+cmd_stat | tr ',' '\\n' | grep service_stopped
+rm -f "$FAKE/alive"
+_stop_pkg >/dev/null
+if [ -f "$SERVICE_MARKER" ]; then echo "wasdown=marked"; else echo "wasdown=clean"; fi`,
+    );
+    cleanupHarness(h);
+    const lines = r.out.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (!lines.includes('stopped=marked')) throw new Error('the stop left no trace: ' + r.out + r.err);
+    if (!lines.includes('"service_stopped":true')) throw new Error('stat hid the stop: ' + r.out);
+    if (!lines.includes('started=clean')) throw new Error('the start did not clear the marker: ' + r.out);
+    if (!lines.includes('"service_stopped":false')) throw new Error('stat still reports stopped: ' + r.out);
+    // A phone where Joyose was already down is not ours to start later.
+    if (!lines.includes('wasdown=clean')) throw new Error('an already-stopped Joyose was claimed: ' + r.out);
+    return 'marked on stop, cleared on start, untouched when already down';
+  });
+
+  await check('服务：双库提交把 Joyose 留在停止状态并留下标记，前端重启后标记消失', () => {
+    // The pair write ends with Joyose stopped on purpose — the front end owns
+    // the restart, because that is where the user gets told whether it came
+    // back. So the marker must be there when the command returns: if the WebUI
+    // dies before its restart, this marker is the only thing that will ever
+    // put the service back.
+    const h = newHarness();
+    seedPair(h);
+    writeFileSync(path.join(h.fake, 'alive'), '');
+    const r = runDispatch(h, ['push-pair-from-stage', 'sp', 'teg', '', '', '', '', '', '']);
+    const markedAfterWrite = existsSync(path.join(h.dataDir, '.service-stopped'));
+    const restarted = runDispatch(h, ['restart']);
+    const markedAfterRestart = existsSync(path.join(h.dataDir, '.service-stopped'));
+    cleanupHarness(h);
+    if (r.code !== 0) throw new Error('the pair write failed: ' + r.err.slice(0, 300));
+    if (!markedAfterWrite) throw new Error('the write stopped Joyose without recording it');
+    if (restarted.code !== 0) throw new Error('restart failed: ' + restarted.err.slice(0, 300));
+    if (markedAfterRestart) throw new Error('the restart did not clear the marker');
+    return 'marked by the write, cleared by the restart';
+  });
+
   await check('崩溃：双库提交会先恢复上一次遗留事务，而不是覆盖它', () => {
     const h = newHarness();
     seedPair(h);

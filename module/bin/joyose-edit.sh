@@ -47,6 +47,12 @@ SMARTP="$DB_DIR/SmartP.db"
 TEG="$DB_DIR/teg_config.db"
 PKG=com.xiaomi.joyose
 
+# Set while Joyose is stopped by *us* and removed only once we have seen it come
+# back. A write that never returns (front-end timeout, WebView closed, manager
+# kills the shell) leaves the phone with Joyose down, and nothing on the device
+# would otherwise know that this was our doing rather than the user's.
+SERVICE_MARKER="$DATA_ROOT/.service-stopped"
+
 mkdir -p "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 chmod 700 "$DATA_ROOT" "$DATA_ROOT/backup" "$DATA_ROOT/history" "$STAGE_DIR"
 
@@ -332,10 +338,14 @@ _stop_pkg() {
     printf 'false'
     return 0
   fi
+  local i=0 was=''
+  # Sampled before the stop, so the marker means "this was running and we took
+  # it down". A phone where it was already stopped is not ours to start later.
+  _pid_alive && was=1
   am force-stop "$PKG" >/dev/null 2>&1 || true
-  local i=0
   while [ "$i" -lt 20 ]; do
     if ! _pid_alive; then
+      if [ -n "$was" ]; then printf '%s\n' "$(date +%s 2>/dev/null || echo 0)" > "$SERVICE_MARKER" 2>/dev/null || true; fi
       printf 'true'
       return 0
     fi
@@ -360,6 +370,7 @@ _start_pkg() {
   local i=0
   while [ "$i" -lt 30 ]; do
     if _pid_alive; then
+      rm -f "$SERVICE_MARKER" 2>/dev/null || true
       printf 'true'
       return 0
     fi
@@ -697,6 +708,12 @@ cmd_stat() {
   # resolved automatically — the UI shows it once, keyed by the timestamp, so an
   # auto-repair never goes unmentioned but also never repeats.
   if [ -f "$PENDING_PAIR" ]; then printf ',"pending":true'; else printf ',"pending":false'; fi
+  # `service_stopped` means a write took Joyose down and nothing has brought it
+  # back: the WebUI restarts it, because the phone would otherwise run without
+  # a cloud config until the user opens the app by hand. It is not "is Joyose
+  # running now" — that needs a probe this command does not do — it is "we owe
+  # the user a start".
+  if [ -f "$SERVICE_MARKER" ]; then printf ',"service_stopped":true'; else printf ',"service_stopped":false'; fi
   if [ -f "$RECOVERY_NOTE" ]; then
     printf ',"recovery":{"kind":"%s","at":%s}' \
       "$(awk 'NR==1{print $2}' "$RECOVERY_NOTE" 2>/dev/null)" \

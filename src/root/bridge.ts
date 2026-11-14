@@ -137,6 +137,11 @@ export interface StatResult {
   pending?: boolean;
   /** Last automatic resolution of an interrupted pair write. */
   recovery?: { kind: string; at: number } | null;
+  /** A write stopped Joyose and never started it again (front-end timeout,
+   *  WebView closed, shell killed). The UI owes the user a start; this is not
+   *  "is Joyose running", which would need a probe of its own. Absent on an
+   *  older installed helper. */
+  service_stopped?: boolean;
 }
 
 export interface StatEntry {
