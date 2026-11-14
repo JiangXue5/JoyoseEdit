@@ -11,7 +11,6 @@
 # then take the snapshot. The stamp file keeps it to one snapshot per Joyose
 # DB version.
 
-MODDIR=${0%/*}
 DATA_ROOT=/data/adb/joyose-edit
 DB_DIR=/data/user/0/com.xiaomi.joyose/databases
 STAMP_FILE="$DATA_ROOT/.bootstrap-version"
@@ -43,8 +42,30 @@ if [ "$FP" = "$LAST" ]; then
 fi
 
 TARGET="$DATA_ROOT/backup/initial-$(date +%s)"
-mkdir -p "$TARGET"
-cp -f "$DB_DIR/SmartP.db" "$TARGET/SmartP.db" 2>/dev/null
-cp -f "$DB_DIR/teg_config.db" "$TARGET/teg_config.db" 2>/dev/null
+mkdir -p "$TARGET" 2>/dev/null || exit 0
+
+# Both copies have to land before the stamp is written. The stamp is what makes
+# the next boot skip the snapshot, so recording it after a failed copy meant a
+# half-empty "initial" backup was treated as done — forever.
+ok=1
+if [ -f "$DB_DIR/SmartP.db" ]; then
+  cp -f "$DB_DIR/SmartP.db" "$TARGET/SmartP.db" 2>/dev/null || ok=0
+  if [ "$ok" = "1" ]; then
+    [ "$(stat -c '%s' "$DB_DIR/SmartP.db" 2>/dev/null || echo -1)" = "$(stat -c '%s' "$TARGET/SmartP.db" 2>/dev/null || echo -2)" ] || ok=0
+  fi
+fi
+if [ -f "$DB_DIR/teg_config.db" ]; then
+  cp -f "$DB_DIR/teg_config.db" "$TARGET/teg_config.db" 2>/dev/null || ok=0
+  if [ "$ok" = "1" ]; then
+    [ "$(stat -c '%s' "$DB_DIR/teg_config.db" 2>/dev/null || echo -1)" = "$(stat -c '%s' "$TARGET/teg_config.db" 2>/dev/null || echo -2)" ] || ok=0
+  fi
+fi
+
+if [ "$ok" != "1" ]; then
+  # No stamp: the fingerprint is unchanged, so the next boot tries again.
+  rm -rf "$TARGET" 2>/dev/null
+  exit 0
+fi
+
 chmod 700 "$TARGET"
-echo "$FP" > "$STAMP_FILE"
+printf '%s\n' "$FP" > "$STAMP_FILE" 2>/dev/null || true

@@ -31,9 +31,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax
-        run: sh -n module/bin/joyose-edit.sh
+        # Every script that ships with the module, not just the helper. The
+        # install / boot / uninstall scripts run as root on the device and had
+        # no syntax check at all until now.
+        run: |
+          for f in module/*.sh module/bin/*.sh; do
+            echo "sh -n $f"
+            sh -n "$f"
+          done
       - name: ShellCheck
-        # The helper runs under Android's /system/bin/sh (mksh), where `local`
+        # The scripts run under Android's /system/bin/sh (mksh), where `local`
         # is a builtin. SC3043 is the only rule that flags it, so it is the
         # only one excluded — every other warning fails the build.
-        run: shellcheck -S warning -e SC3043 module/bin/joyose-edit.sh
+        run: shellcheck -S warning -e SC3043 module/*.sh module/bin/*.sh

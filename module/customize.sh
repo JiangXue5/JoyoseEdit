@@ -2,6 +2,8 @@
 # JoyoseEdit — KernelSU install script.
 # Keeps the module scope narrow: sets up the private data dir and surfaces WebUI entry.
 
+# Read by the KernelSU/Magisk installer, not by this script.
+# shellcheck disable=SC2034
 SKIPUNZIP=0
 
 MODDIR="$MODPATH"
