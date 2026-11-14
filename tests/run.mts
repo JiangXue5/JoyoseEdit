@@ -3944,6 +3944,56 @@ echo "EXIT=$?"`,
     return 'half-applied pair rolled back on next lock';
   });
 
+  await check('崩溃：无 sha256 且新旧同大小时，拒绝恢复而不是当已提交', () => {
+    // Size is the only evidence left on a ROM without a digest tool. When the
+    // old and the new file are the same length, "matches the new size" is true
+    // for both and the old code took the first branch — declaring a
+    // half-applied pair committed and deleting the copies that could undo it.
+    const h = newHarness({ without: ['sha256sum'] });
+    const sp = path.join(h.dbDir, 'SmartP.db');
+    const teg = path.join(h.dbDir, 'teg_config.db');
+    const spRb = `${sp}.jedit.rb.1`;
+    const tegRb = `${teg}.jedit.rb.1`;
+    // SmartP already swapped, teg not; all four files are four bytes long.
+    writeFileSync(sp, 'NEW!');
+    writeFileSync(teg, 'OLD!');
+    writeFileSync(spRb, 'OLD!');
+    writeFileSync(tegRb, 'OLD!');
+    const rec = path.join(h.dataDir, '.pending-pair');
+    writeFileSync(
+      rec,
+      [
+        'created=1',
+        `sp_rb=${spRb}`,
+        `teg_rb=${tegRb}`,
+        'sp_old=',
+        'teg_old=',
+        'sp_new=',
+        'teg_new=',
+        'sp_old_size=4',
+        'teg_old_size=4',
+        'sp_new_size=4',
+        'teg_new_size=4',
+        'sp_used=true',
+        'teg_used=true',
+        'was_running=false',
+        '',
+      ].join('\n'),
+    );
+    const r = runHarness(h, takeLock);
+    const kept = existsSync(rec);
+    const rbKept = existsSync(spRb) && existsSync(tegRb);
+    const spNow = readFileSync(sp, 'utf8');
+    const tegNow = readFileSync(teg, 'utf8');
+    cleanupHarness(h);
+    if (r.out.includes('EXIT=0')) throw new Error('ambiguous state was accepted as resolved');
+    if (!/recovery-required/.test(r.err)) throw new Error('wrong code: ' + r.err.slice(0, 300));
+    if (!kept) throw new Error('transaction record was cleared without proof');
+    if (!rbKept) throw new Error('rollback copies were deleted without proof');
+    if (spNow !== 'NEW!' || tegNow !== 'OLD!') throw new Error('recovery touched the databases');
+    return 'refused, record and copies kept';
+  });
+
   await check('锁：双库提交从分发入口进来也要排队', () => {
     // Every other write command was serialised; the one the WebUI actually
     // uses for a commit was not, because its name was missing from the

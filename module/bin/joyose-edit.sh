@@ -1059,9 +1059,15 @@ _pending_note() {
 }
 
 # Where is this database relative to the transaction that was in flight?
-#   old | new | missing | other
+#   old | new | missing | other | ambiguous
 # Digests when the ROM has sha256sum, sizes otherwise: a size match is weak
 # evidence, so it is only trusted when there is nothing better.
+#
+# `ambiguous` is the size-only case where the old and new files are the same
+# length: both comparisons below would pass, and the first one used to win,
+# silently reporting "new" for a file that still holds the old bytes. That is
+# how an interrupted pair swap (SmartP new, teg old) could be declared
+# committed and have its rollback copies deleted — see _recover_pending_pair.
 _pair_state() {
   local f="$1" old="$2" new="$3" old_size="$4" new_size="$5" now size
   [ -f "$f" ] || { printf 'missing'; return 0; }
@@ -1073,6 +1079,11 @@ _pair_state() {
     return 0
   fi
   size=$(stat -c '%s' "$f" 2>/dev/null || echo -1)
+  if [ -n "$old_size" ] && [ -n "$new_size" ] && [ "$old_size" = "$new_size" ] \
+     && [ "$size" = "$new_size" ]; then
+    printf 'ambiguous'
+    return 0
+  fi
   if [ -n "$new_size" ] && [ "$size" = "$new_size" ]; then printf 'new'; return 0; fi
   if [ -n "$old_size" ] && [ "$size" = "$old_size" ]; then printf 'old'; return 0; fi
   printf 'other'
@@ -1116,11 +1127,13 @@ _recover_pending_pair() {
   if [ "$teg_used" = "true" ]; then
     teg_state=$(_pair_state "$TEG" "$teg_old" "$teg_new" "$teg_old_size" "$teg_new_size")
   fi
-  # A file that vanished, or that matches neither side, means somebody else
-  # changed it. There is nothing here to reason from.
+  # A file that vanished, that matches neither side, or whose old and new
+  # lengths are identical (so size cannot tell them apart) means the evidence
+  # is not good enough. Guessing "committed" here deletes the rollback copies
+  # and leaves a half-applied pair behind; stop instead and keep everything.
   for left in "$sp_state" "$teg_state"; do
     case "$left" in
-      other|missing) return 1 ;;
+      other|missing|ambiguous) return 1 ;;
     esac
   done
 
