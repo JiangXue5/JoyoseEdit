@@ -396,9 +396,9 @@ _abort_after_stop() {
   if [ "$restore" = "false" ]; then
     # Swallowing this used to mean the user was told only "write failed" while
     # Joyose stayed down until the next game launch — and nothing said so.
-    die "${2:-write aborted}；Joyose 原本在运行，但这次没能重新启动，进游戏前请手动打开一次" "$restore"
+    die "${2:-write aborted}；Joyose 原本在运行，但这次没能重新启动，进游戏前请手动打开一次" "$restore" "${3:-}"
   fi
-  die "${2:-write aborted}" "$restore"
+  die "${2:-write aborted}" "$restore" "${3:-}"
 }
 
 # sha256 of a file, or nothing when the ROM has no tool. Callers must treat an
@@ -493,6 +493,35 @@ _drop_sidecars() {
   rm -f "$1-journal" "$1-wal" "$1-shm" 2>/dev/null || true
 }
 
+# Which journal mode is this database file in? SQLite writes it into the header:
+# bytes 18/19 are 1 for the rollback journal and 2 for WAL. It is a property of
+# the file, not of any process, so it can be read without sqlite3 and survives a
+# checkpoint.
+_journal_mode() {
+  local f="$1" w r
+  [ -f "$f" ] || return 0
+  w=$(od -An -tu1 -j18 -N1 "$f" 2>/dev/null | tr -d ' \n')
+  r=$(od -An -tu1 -j19 -N1 "$f" 2>/dev/null | tr -d ' \n')
+  if [ "$w" = 2 ] || [ "$r" = 2 ]; then
+    printf 'wal'
+  elif [ "$w" = 1 ] && [ "$r" = 1 ]; then
+    printf 'rollback'
+  fi
+  return 0
+}
+
+# A non-empty `-wal` holds transactions SQLite has committed but not yet merged
+# into the main file. Every file-level operation here treats `<db>` as the whole
+# database — copy it, replace it, delete its sidecars — which is true for the
+# rollback journal and false for WAL: a snapshot without it is short, and a swap
+# that deletes it drops those rows.
+#
+# All ten samples in `tests/` report `rollback`, so this is a guard rail rather
+# than the expected path; it costs one `test -s`.
+_wal_pending() {
+  [ -s "$1-wal" ]
+}
+
 # Structural fallback for ROMs without sqlite3. A correct magic word is not
 # enough: a truncated copy still starts with "SQLite format 3". Read the page
 # geometry out of the 100-byte header and require the file to hold every page
@@ -554,6 +583,14 @@ _install_db() {
   local label vby live_checked
 
   [ -f "$tmp" ] || die "staged database missing: $tmp"
+
+  # Checked before the stop, so a refusal leaves the phone untouched. Replacing
+  # `<db>` deletes `<db>-wal` (`_drop_sidecars`), and those are rows the staged
+  # file was computed without.
+  if _wal_pending "$target"; then
+    rm -f "$tmp"
+    die "database has an uncheckpointed -wal ($(basename "$target")); replacing it would drop those transactions, refusing" not-needed wal-pending
+  fi
 
   if [ -n "$expect_size" ]; then
     size=$(stat -c '%s' "$tmp" 2>/dev/null || echo 0)
@@ -688,8 +725,11 @@ stat_one() {
     size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
     uid=$(stat -c '%u' "$f" 2>/dev/null || echo 0)
     gid=$(stat -c '%g' "$f" 2>/dev/null || echo 0)
-    printf '"%s":{"exists":true,"path":"%s","mtime":%s,"size":%s,"uid":%s,"gid":%s}' \
-      "$key" "$f" "$mtime" "$size" "$uid" "$gid"
+    local mode pending='false'
+    mode=$(_journal_mode "$f")
+    if _wal_pending "$f"; then pending='true'; fi
+    printf '"%s":{"exists":true,"path":"%s","mtime":%s,"size":%s,"uid":%s,"gid":%s,"journal":"%s","wal_pending":%s}' \
+      "$key" "$f" "$mtime" "$size" "$uid" "$gid" "$mode" "$pending"
   else
     printf '"%s":{"exists":false,"path":"%s"}' "$key" "$f"
   fi
@@ -730,6 +770,12 @@ cmd_pull() {
   local target
   target=$(resolve_db "$1")
   [ -f "$target" ] || die "missing: $target"
+  # The WebView would build its working copy — and therefore its next write —
+  # from a database missing the rows that only exist in `-wal`. Pull is
+  # read-only, but it is the base every edit is computed against.
+  if _wal_pending "$target"; then
+    die "database has an uncheckpointed -wal ($(basename "$target")); reading it would miss committed rows, refusing" not-needed wal-pending
+  fi
   # base64 -w0 — single line so the WebUI can slurp it directly.
   base64 -w0 "$target"
   echo
@@ -801,7 +847,7 @@ _check_staged_db() {
 cmd_push_pair_from_stage() {
   local sp_stage="$1" teg_stage="$2" sp_size="$3" sp_sha="$4" sp_cur="$5"
   local teg_size="$6" teg_sha="$7" teg_cur="$8"
-  local dir="$STAGE_DIR/pair.$$" sp teg vby
+  local dir="$STAGE_DIR/pair.$$" sp teg vby f
   safe_name "$sp_stage" || die "invalid stage name"
   safe_name "$teg_stage" || die "invalid stage name"
   sp="$dir/SmartP.db"
@@ -812,6 +858,17 @@ cmd_push_pair_from_stage() {
 
   _check_staged_db "$sp" "$sp_size" "$sp_sha" "$SMARTP" "$sp_cur" "SmartP.db"
   _check_staged_db "$teg" "$teg_size" "$teg_sha" "$TEG" "$teg_cur" "teg_config.db"
+
+  # Rows that only exist in `-wal` are rows neither staged file was computed
+  # from, and `_restore_pair` deletes the sidecars as part of the swap. Refusing
+  # before anything is stopped leaves the phone exactly as it was.
+  for f in "$SMARTP" "$TEG"; do
+    [ -f "$f" ] || continue
+    if _wal_pending "$f"; then
+      rm -rf "$dir"
+      die "database has an uncheckpointed -wal ($(basename "$f")); this write would drop those transactions, refusing" not-needed wal-pending
+    fi
+  done
 
   _RESTORE_WAS_RUNNING=false
   _RESTORE_SKIPPED=''
@@ -1022,6 +1079,19 @@ cmd_backup() {
   # Past this line the service is stopped: every failure has to restart it.
   # `cp` inside an `&&` list used to fail silently under `set -e`, which both
   # hid the reason and skipped the restart.
+  #
+  # A `-wal` with rows in it is the one thing a file copy cannot capture: the
+  # snapshot would open cleanly, pass `_verify_db`, carry a COMPLETE marker, and
+  # be missing the newest committed transactions. That is the exact failure the
+  # marker exists to rule out, so refuse instead of certifying it.
+  local f
+  for f in "$SMARTP" "$TEG"; do
+    [ -f "$f" ] || continue
+    if _wal_pending "$f"; then
+      rm -rf "$dir"
+      _abort_after_stop "$was" "database has an uncheckpointed -wal ($(basename "$f")); a file copy would miss committed rows, refusing" wal-pending
+    fi
+  done
   local copied=0
   if [ -f "$SMARTP" ]; then
     if ! cp -f "$SMARTP" "$dir/SmartP.db" 2>/dev/null; then
