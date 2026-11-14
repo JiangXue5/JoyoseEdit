@@ -351,6 +351,24 @@ async function handlePush() {
   if (note === null) return;
   try {
     const res = await pushAll({ note });
+    // A successful write can still be weaker than the toast implies: the
+    // WebView may have had no SHA-256 (length-only check), or the SELinux
+    // label could not be re-applied. Say it in the same message instead of a
+    // second toast that scrolls away first.
+    const notes = [...(res.result.warnings ?? [])];
+    // A write that was interrupted last time is repaired before this one runs.
+    // Without saying so, the user sees an edit from a minute ago silently gone
+    // and has no way to know it was rolled back on purpose.
+    const rec = state.stat?.recovery;
+    if (rec && Date.now() / 1000 - rec.at < 300) {
+      notes.push(
+        rec.kind === 'rolled-back'
+          ? '上次中断的双库写入已回滚，两个库都回到了那次写入之前'
+          : '上次中断的双库写入没有留下半份结果，残留记录已清理',
+      );
+    }
+    const withNotes = (detail: string) =>
+      notes.length ? `${detail}\n· ${notes.join('\n· ')}` : detail;
     // One code, one branch. The booleans behind it (stop confirmed, restart
     // observed) are still reported separately for the lines that need them,
     // but the decision of *which* message to show no longer depends on the
@@ -369,41 +387,41 @@ async function handlePush() {
       case 'written-no-history':
         toast.warn(
           '已写入设备，但历史记录没有保存',
-          `${res.historyError} · 配置已经生效，只是这次提交不在历史里`,
+          withNotes(`${res.historyError} · 配置已经生效，只是这次提交不在历史里`),
         );
         return;
       case 'written-restart-failed':
         toast.warn(
           '已写入设备，但 Joyose 重启失败',
-          `${res.restartError} · 请手动重启 Joyose 或手机后再进游戏`,
+          withNotes(`${res.restartError} · 请手动重启 Joyose 或手机后再进游戏`),
         );
         return;
       case 'written-stop-failed':
         toast.warn(
           '已写入，但 Joyose 未能停止 —— 请手动重启它（或重启手机）后再进游戏',
-          name,
+          withNotes(name),
         );
         return;
       case 'written-rebased':
-        toast.success('已提交（云端更新已合并）', `${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`);
+        toast.success('已提交（云端更新已合并）', withNotes(`${name} · 提交前 Joyose 刚拉过云控，已自动把你的改动叠加到新配置上`));
         return;
       case 'written':
         // Restarting Joyose right after the write means it has already read the
         // new rows; without this the first game launch raced the cold start and
         // the edit only showed up on the second one.
-        toast.success('已提交，Joyose 已重新加载配置', `${name} · 直接进游戏即可，不需要再开一遍`);
+        toast.success('已提交，Joyose 已重新加载配置', withNotes(`${name} · 直接进游戏即可，不需要再开一遍`));
         return;
       case 'written-stopped':
-        toast.info('已提交', `${name} · Joyose 已停止，下次启动游戏时会读取新配置`);
+        toast.info('已提交', withNotes(`${name} · Joyose 已停止，下次启动游戏时会读取新配置`));
         return;
       case 'written-reload-unconfirmed':
         toast.warn(
           '已提交，但没能确认 Joyose 已重新启动',
-          `${name} · 进游戏前若配置没生效，请手动重启 Joyose`,
+          withNotes(`${name} · 进游戏前若配置没生效，请手动重启 Joyose`),
         );
         return;
       default:
-        toast.success('已提交并写入历史', name);
+        toast.success('已提交并写入历史', withNotes(name));
     }
   } catch (err) {
     toast.fromError(err, '提交失败');

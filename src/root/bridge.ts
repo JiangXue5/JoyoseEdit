@@ -30,9 +30,34 @@ export class RootBridgeError extends Error {
     message: string,
     public readonly errno: number,
     public readonly stderr: string,
+    /** Machine-readable reason from the helper (`incomplete-backup`,
+     *  `recovery-required`, …). Matching on the message text instead would
+     *  break the moment a message is reworded. */
+    public readonly code?: string,
+    /** `true` / `false` / `not-needed`: what happened to Joyose on the way out.
+     *  Absent on an older installed helper. */
+    public readonly serviceRestore?: string,
   ) {
     super(message);
     this.name = 'RootBridgeError';
+  }
+}
+
+/** The helper prints a JSON object on stderr for every fatal error. Showing
+ *  that object verbatim ("shell exit 1: {"ok":false,...}") is unreadable and
+ *  throws away the fields the UI needs. */
+function parseHelperError(stderr: string): { message?: string; code?: string; serviceRestore?: string } {
+  const text = stderr.trim();
+  if (!text.startsWith('{')) return {};
+  try {
+    const obj = JSON.parse(text) as Record<string, unknown>;
+    return {
+      message: typeof obj.error === 'string' ? obj.error : undefined,
+      code: typeof obj.code === 'string' ? obj.code : undefined,
+      serviceRestore: typeof obj.serviceRestore === 'string' ? obj.serviceRestore : undefined,
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -81,10 +106,13 @@ async function runKsu(cmd: string): Promise<string> {
     if (timer) clearTimeout(timer);
   }
   if (result.errno !== 0) {
+    const parsed = parseHelperError(result.stderr ?? '');
     throw new RootBridgeError(
-      `shell exit ${result.errno}: ${result.stderr || result.stdout}`,
+      parsed.message ?? `shell exit ${result.errno}: ${result.stderr || result.stdout}`,
       result.errno,
       result.stderr ?? '',
+      parsed.code,
+      parsed.serviceRestore,
     );
   }
   return result.stdout ?? '';
@@ -103,6 +131,12 @@ export interface StatResult {
   teg: StatEntry;
   backup_count: number;
   history_count: number;
+  /** A pair write was interrupted and nothing has resolved it yet. Every
+   *  mutating command repairs or refuses before it runs, so this should only be
+   *  seen between the crash and the next write. */
+  pending?: boolean;
+  /** Last automatic resolution of an interrupted pair write. */
+  recovery?: { kind: string; at: number } | null;
 }
 
 export interface StatEntry {
@@ -221,6 +255,18 @@ export interface WriteResult {
   /** How the pre-swap rollback copy was verified. `size` means the ROM has no
    *  digest tool, so only the length was compared. */
   rollback?: 'sha256' | 'size';
+  /** What the uploaded bytes were checked against before the swap: `sha256`
+   *  when the WebView could compute a digest, `length` when it could not.
+   *  A `length` write is not wrong, it is just weaker — and it used to be
+   *  indistinguishable from a digest-verified one. */
+  verifiedBy?: 'sha256' | 'length' | 'none';
+  /** Whether the live file was re-hashed immediately before the swap. False
+   *  when no digest was available, which is exactly when a concurrent cloud
+   *  push would slip through. */
+  liveChecked?: boolean;
+  /** Result of re-applying the SELinux label: `applied` / `unsupported` /
+   *  `failed` / `unverified`. Empty on an older installed helper. */
+  labelRestored?: string;
 }
 
 /** SHA-256 as lowercase hex, or null when the WebView has no crypto.subtle
@@ -289,6 +335,8 @@ export interface PairWriteResult {
   wasRunning?: boolean;
   verified?: string;
   atomic?: boolean;
+  verifiedBy?: 'sha256' | 'length';
+  label?: { smartp: string; teg: string };
 }
 
 export async function pushPair(
@@ -355,6 +403,11 @@ export interface RevertResult {
    *  not restored. Non-empty means the result is a partial restore and the
    *  user should be told which side was skipped. */
   skipped?: string;
+  /** True when the backup predates the completeness marker, so its contents
+   *  could not be checked against what was recorded at snapshot time. */
+  legacy?: boolean;
+  /** Per-database SELinux relabel outcome. */
+  label?: { smartp: string; teg: string };
 }
 
 export async function revert(name: string): Promise<RevertResult> {

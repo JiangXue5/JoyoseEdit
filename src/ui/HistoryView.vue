@@ -84,6 +84,7 @@ import {
 } from '@/state/session';
 import * as bridge from '@/root/bridge';
 import { toast } from '@/state/toast';
+import { revertNotes, withNotes } from './revertNotes';
 import PageHeader from './PageHeader.vue';
 import AppIcon from './AppIcon.vue';
 import { dialog } from '@/state/dialog';
@@ -172,6 +173,7 @@ async function revertFromBackup() {
   if (!ok) return;
   try {
     const reverted = await revertToBackup(backupName);
+    const notes = revertNotes(reverted);
     // The rollback itself succeeded; a failed refresh only means the page is
     // still showing pre-rollback values. Say that instead of "回滚失败".
     if (reverted.skipped) {
@@ -179,14 +181,17 @@ async function revertFromBackup() {
       // survivor is not what "回滚到备份" means, so say what was left out.
       toast.warn(
         '已部分回滚',
-        `${backupName} · ${reverted.skipped} 在备份里有、设备上没有，未恢复`,
+        withNotes(`${backupName} · ${reverted.skipped} 在备份里有、设备上没有，未恢复`, notes),
       );
     } else if (reverted.result.joyoseWasRunning === true && reverted.result.joyoseRestarted === false) {
-      toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', backupName);
+      toast.warn(
+        '已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏',
+        withNotes(backupName, notes),
+      );
     } else if (reverted.refreshError) {
-      toast.warn('已回滚，但界面刷新失败', `${reverted.refreshError} · 请手动刷新`);
+      toast.warn('已回滚，但界面刷新失败', withNotes(`${reverted.refreshError} · 请手动刷新`, notes));
     } else {
-      toast.success('已回滚到备份', backupName);
+      toast.success('已回滚到备份', withNotes(backupName, notes));
     }
   } catch (err) {
     toast.fromError(err, '回滚失败');

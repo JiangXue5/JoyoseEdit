@@ -114,6 +114,7 @@ import { snapshotFromMaps } from '@/history/store';
 import type { ActiveBackend } from '@/db/schema';
 import {
   DOMAIN_GB_KEYS,
+  MAX_IMPORT_BYTES,
   applyImportPackage,
   pickCloudRowsForPreview,
   validateImportPackage,
@@ -281,6 +282,15 @@ async function copyExport() {
 function onFilePicked(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
+  // Check the size before reading: `readAsText` loads the whole file into the
+  // WebView first, and the package validator only runs afterwards. A 300 MB
+  // pick used to be read in full, then rejected.
+  if (file.size > MAX_IMPORT_BYTES) {
+    importError.value = `导入文件 ${Math.round(file.size / 1024 / 1024)} MB，超过上限 ${MAX_IMPORT_BYTES / 1024 / 1024} MB`;
+    pendingPackage.value = null;
+    (e.target as HTMLInputElement).value = '';
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => loadImportText(String(reader.result ?? ''));
   reader.onerror = () => {

@@ -261,6 +261,7 @@ import {
 } from '@/state/source';
 import { navigate } from '@/state/nav';
 import { toast } from '@/state/toast';
+import { revertNotes, withNotes } from './revertNotes';
 import { dialog } from '@/state/dialog';
 import * as bridge from '@/root/bridge';
 import PageHeader from './PageHeader.vue';
@@ -602,16 +603,17 @@ async function handleRevertLatest() {
   if (!ok) return;
   try {
     const r = await revertLatestBackup();
+    const notes = revertNotes(r);
     if (r.skipped) {
       // Only one of the two databases came back. Calling that "已回滚到备份"
       // would be a lie about a destructive operation, so name what was left out.
-      toast.warn('已部分回滚', `${r.from} · ${r.skipped} 在备份里有、设备上没有，未恢复`);
+      toast.warn('已部分回滚', withNotes(`${r.from} · ${r.skipped} 在备份里有、设备上没有，未恢复`, notes));
     } else if (r.result.joyoseWasRunning === true && r.result.joyoseRestarted === false) {
-      toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', r.from);
+      toast.warn('已回滚，但 Joyose 未能重新启动 —— 请手动重启它后再进游戏', withNotes(r.from, notes));
     } else if (r.refreshError) {
-      toast.warn('已回滚，但界面刷新失败', `${r.refreshError} · 请手动刷新`);
+      toast.warn('已回滚，但界面刷新失败', withNotes(`${r.refreshError} · 请手动刷新`, notes));
     } else {
-      toast.success('已回滚到备份', r.from);
+      toast.success('已回滚到备份', withNotes(r.from, notes));
     }
   } catch (err) {
     toast.fromError(err, '回滚失败');

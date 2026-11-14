@@ -722,7 +722,7 @@ async function saveJsonTargetLocked(
     // A timeout may still be running on the device; racing a restart against
     // it is worse than leaving the state alone.
     if (backupState.wasRunning && !TIMEOUT_RE.test(msg)) {
-      await bridge.restart().catch(() => null);
+      await reportRestartFailure(err, await bridge.restart().catch(() => null));
     }
     throw err;
   }
@@ -1004,23 +1004,29 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // Two independent pushes could leave SmartP written and teg untouched if
     // the second one failed — a combination that never existed on the phone,
     // reported to the user as a failed commit they would then retry.
+    // Keep the results, not just the stop flags: they carry what the write
+    // actually proved (digest vs. length, live re-check, label outcome), and
+    // the user is told when any of that was weaker than it looks.
+    const writeResults: Array<bridge.WriteResult | bridge.PairWriteResult> = [];
     if (wroteSmartp && wroteTeg) {
       const spCurrent = await bridge.sha256Hex(smartpBytes!);
       const tegCurrent = await bridge.sha256Hex(tegBytes!);
-      recordStop(
-        await bridge.pushPair(outSmartp!, outTeg!, {
-          smartpExpect: spCurrent,
-          tegExpect: tegCurrent,
-        }),
-      );
+      const pair = await bridge.pushPair(outSmartp!, outTeg!, {
+        smartpExpect: spCurrent,
+        tegExpect: tegCurrent,
+      });
+      writeResults.push(pair);
+      recordStop(pair);
     } else if (wroteSmartp) {
       const currentSha = await bridge.sha256Hex(smartpBytes!);
-      recordStop(
-        await bridge.push('smartp', outSmartp!, { expectCurrent: currentSha }),
-      );
+      const one = await bridge.push('smartp', outSmartp!, { expectCurrent: currentSha });
+      writeResults.push(one);
+      recordStop(one);
     } else if (wroteTeg) {
       const currentSha = await bridge.sha256Hex(tegBytes!);
-      recordStop(await bridge.push('teg', outTeg!, { expectCurrent: currentSha }));
+      const one = await bridge.push('teg', outTeg!, { expectCurrent: currentSha });
+      writeResults.push(one);
+      recordStop(one);
     }
     if (wroteSmartp) {
       // The row on disk is now what we just wrote. Keeping the pre-commit copy
@@ -1113,6 +1119,7 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
         joyoseStopped: stopConfirmed,
         joyoseWasRunning: wasRunning.length > 0 ? wasRunning.some(Boolean) : null,
         joyoseRestarted: restarted?.started ?? null,
+        warnings: writeWarnings(writeResults),
       }),
     };
   } catch (err) {
@@ -1127,10 +1134,59 @@ async function pushCore(opts: PushOptions = {}): Promise<CommitResult> {
     // racing a restart against it would interleave state we cannot see.
     const msg = (err as Error)?.message ?? String(err);
     if (backupWasRunning && !TIMEOUT_RE.test(msg)) {
-      await bridge.restart().catch(() => null);
+      await reportRestartFailure(err, await bridge.restart().catch(() => null));
     }
     throw err;
   }
+}
+
+/** Append "Joyose is still down" to a failure the user is about to read.
+ *
+ *  The backup stops Joyose, so an error between the stop and the write leaves
+ *  the service down. Attempting a restart is not enough: `.catch(() => null)`
+ *  threw the outcome away, and the user was told only "写入失败" while the game
+ *  silently lost its config. A field nobody renders is not a report, so the
+ *  consequence goes into the message. */
+async function reportRestartFailure(err: unknown, restarted: { started?: boolean } | null): Promise<void> {
+  if (restarted?.started === true) return;
+  if (!(err instanceof Error)) return;
+  if (err.message.includes('Joyose')) return;
+  err.message += restarted
+    ? '；Joyose 原本在运行，但重启后没有观察到进程，进游戏前请手动打开一次'
+    : '；Joyose 原本在运行，但重启失败，进游戏前请手动打开一次';
+}
+
+/** What the write actually proved, beyond "it returned ok".
+ *
+ *  `verifiedBy: 'length'` and `liveChecked: false` both mean the WebView could
+ *  not compute a SHA-256 — a real downgrade that used to be invisible, because
+ *  the helper's silence read as success. */
+function writeWarnings(
+  results: Array<{
+    verifiedBy?: string;
+    liveChecked?: boolean;
+    labelRestored?: string;
+    label?: { smartp?: string; teg?: string };
+  }>,
+): string[] {
+  const out: string[] = [];
+  let weakDigest = false;
+  let notRechecked = false;
+  let labelFailed = false;
+  for (const r of results) {
+    if (r.verifiedBy === 'length' || r.verifiedBy === 'none') weakDigest = true;
+    if (r.liveChecked === false) notRechecked = true;
+    const labels = r.label
+      ? [r.label.smartp, r.label.teg].filter(Boolean)
+      : r.labelRestored
+        ? [r.labelRestored]
+        : [];
+    if (labels.includes('failed')) labelFailed = true;
+  }
+  if (weakDigest) out.push('本次写入只按大小校验（WebView 无法计算 SHA-256）');
+  if (notRechecked) out.push('写入前没有复核设备上的库，若云端同时下发可能被覆盖');
+  if (labelFailed) out.push('SELinux 标签未能恢复，Joyose 可能读不到配置');
+  return out;
 }
 
 /** Re-apply the pending edits on top of whatever Joyose just wrote.

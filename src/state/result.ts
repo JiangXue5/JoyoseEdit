@@ -55,6 +55,11 @@ export interface OperationResult {
   /** Observed running again; null when no restart was attempted or it could
    *  not be determined. */
   joyoseRestarted: boolean | null;
+  /** Things that did not stop the operation but weakened it: a write verified
+   *  by length instead of digest, a label that could not be re-applied. Views
+   *  show these next to the success toast; an operation can be "done" and still
+   *  not be what the user assumes. */
+  warnings: string[];
 }
 
 export interface ResultInput {
@@ -65,6 +70,7 @@ export interface ResultInput {
   joyoseStopped?: boolean | null;
   joyoseWasRunning?: boolean | null;
   joyoseRestarted?: boolean | null;
+  warnings?: string[];
 }
 
 /** `ok` follows from the code: every "written*" code and the completed
@@ -81,6 +87,7 @@ export function makeResult(input: ResultInput): OperationResult {
     joyoseStopped: input.joyoseStopped ?? null,
     joyoseWasRunning: input.joyoseWasRunning ?? null,
     joyoseRestarted: input.joyoseRestarted ?? null,
+    warnings: input.warnings ?? [],
   };
 }
 

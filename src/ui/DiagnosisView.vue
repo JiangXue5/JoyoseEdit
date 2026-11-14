@@ -13,6 +13,18 @@
       <span>{{ error }}</span>
     </div>
 
+    <div v-if="stat?.pending" class="banner warn">
+      <strong>存在未完成的双库写入</strong>
+      <span>
+        设备上留着一次被中断的事务记录。下一次写入前会自动回滚到写入前的状态；
+        如果这条一直存在，说明回滚副本不足以证明原状，需要手动处理。
+      </span>
+    </div>
+    <div v-else-if="recoveryNote" class="banner">
+      <strong>已自动处理上次中断的写入</strong>
+      <span>{{ recoveryNote }}<template v-if="recoveryAt">（{{ recoveryAt }}）</template></span>
+    </div>
+
     <section class="panel">
       <div class="panel-header">
         <h2>系统与模块</h2>
@@ -175,6 +187,23 @@ const ruleCount = computed(() =>
   Object.values(state.rulesByModule).reduce((n, rows) => n + rows.length, 0),
 );
 
+/** What the helper did with the leftover transaction record, in plain words. */
+const recoveryNote = computed(() => {
+  const r = stat.value?.recovery;
+  if (!r) return '';
+  switch (r.kind) {
+    case 'rolled-back': return '两份数据库已回滚到写入前的状态，可以直接继续使用。';
+    case 'committed': return '两份数据库都已写入新内容，只是上次没来得及清理记录。';
+    case 'discarded': return '写入还没开始就中断了，未改动任何数据库。';
+    default: return '';
+  }
+});
+
+const recoveryAt = computed(() => {
+  const at = stat.value?.recovery?.at;
+  return at ? new Date(at * 1000).toLocaleString() : '';
+});
+
 const visionLabel = computed(() => {
   if (!vision.value) return '未知';
   const frc = vision.value.frc_support === 'true';
@@ -253,6 +282,8 @@ function buildReport(): string {
   lines.push(`云控配置 ${configCount.value} 行 / 规则 ${ruleCount.value} 行 / 解析告警 ${state.parseIssues.length}`);
   lines.push(`teg：${teg.value ? (teg.value.frozen ? '已冻结' : '未冻结') : '未知'}　备份 ${stat.value?.backup_count ?? 0} / 历史 ${stat.value?.history_count ?? 0}`);
   lines.push(`厂商开关：${visionLabel.value}`);
+  if (stat.value?.pending) lines.push('未完成写入：存在残留事务记录');
+  else if (recoveryNote.value) lines.push(`上次中断的写入：${recoveryNote.value}`);
   lines.push('能力矩阵：');
   for (const c of CAPABILITIES) {
     lines.push(`  - ${c.label}：${VERIFICATION_LABEL[c.verification]}（${c.evidence}）`);
